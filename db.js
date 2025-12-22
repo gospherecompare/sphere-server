@@ -2,8 +2,8 @@ const { Pool } = require("pg");
 
 const pool = new Pool({
   user: "postgres",
-  host: "smartarenadb.cf680y204k54.ap-south-1.rds.amazonaws.com",
-  database: "smartarenadb",
+  host: "database-1.czkao8mcuua1.ap-south-1.rds.amazonaws.com",
+  database: "testdb",
   password: "Srinivasarena25",
   port: 5432,
   ssl: { rejectUnauthorized: false },

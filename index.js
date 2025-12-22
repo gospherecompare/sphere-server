@@ -12,7 +12,18 @@ const SECRET = process.env.JWT_SECRET || "your_super_secret_key";
 const PORT = process.env.PORT || 5000;
 
 const app = express();
-app.use(cors());
+const cors = require("cors");
+
+app.use(
+  cors({
+    origin: [
+      "http://localhost:3000",
+      "https://staging.djtuon05dhkkl.amplifyapp.com/", // 👈 YOUR AMPLIFY DOMAIN
+    ],
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 const upload = multer({ storage: multer.memoryStorage() });
