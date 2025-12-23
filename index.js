@@ -12,19 +12,20 @@ const SECRET = process.env.JWT_SECRET || "your_super_secret_key";
 const PORT = process.env.PORT || 5000;
 
 const app = express();
-const cors = require("cors");
+
+app.set("trust proxy", 1);
 
 app.use(
   cors({
-    origin: [
-      "http://localhost:3000",
-      "https://staging.djtuon05dhkkl.amplifyapp.com/", // 👈 YOUR AMPLIFY DOMAIN
-    ],
-    methods: ["GET", "POST", "PUT", "DELETE"],
-    credentials: true,
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
 app.use(express.json());
+
+// important for preflight
 
 const upload = multer({ storage: multer.memoryStorage() });
 

@@ -1,16 +1,16 @@
 const { Pool } = require("pg");
+require("dotenv").config();
 
 const pool = new Pool({
-  user: "postgres",
-  host: "database-1.czkao8mcuua1.ap-south-1.rds.amazonaws.com",
-  database: "testdb",
-  password: "Srinivasarena25",
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASSWORD,
   port: 5432,
+  max: 2,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
   ssl: { rejectUnauthorized: false },
-});
-
-pool.on("connect", () => {
-  console.log("✅ PostgreSQL connected");
 });
 
 async function waitForConnection(retries = 5, delayMs = 5000) {
@@ -29,7 +29,7 @@ async function waitForConnection(retries = 5, delayMs = 5000) {
 
 const db = {
   query: (text, params) => pool.query(text, params),
-  connect: () => pool.connect(), // IMPORTANT
+  connect: () => pool.connect(),
   waitForConnection,
 };
 
