@@ -3,14 +3,27 @@ require("dotenv").config();
 
 const pool = new Pool({
   user: process.env.DB_USER,
-  host: process.env.DB_HOST,
+  host: process.env.DB_HOST || "localhost",
   database: process.env.DB_NAME,
   password: process.env.DB_PASSWORD,
-  port: 5432,
-  max: 2,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-  ssl: { rejectUnauthorized: false },
+  port: parseInt(process.env.DB_PORT, 10) || 5432,
+  // pool sizing and timeouts can be tuned via env
+  max: parseInt(process.env.DB_POOL_MAX, 10) || 10,
+  idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS, 10) || 30000,
+  connectionTimeoutMillis:
+    parseInt(process.env.DB_CONN_TIMEOUT_MS, 10) || 10000,
+  // enable SSL only when explicitly requested (useful for cloud DBs)
+  ssl:
+    process.env.DB_SSL === "true"
+      ? {
+          rejectUnauthorized:
+            process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false",
+        }
+      : false,
+});
+
+pool.on("error", (err) => {
+  console.error("Unexpected error on idle PostgreSQL client", err);
 });
 
 async function waitForConnection(retries = 5, delayMs = 5000) {

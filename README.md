@@ -33,3 +33,5 @@ Test routes
 - `GET /` — healthcheck
 - `GET /db` — runs `SELECT NOW()` against PostgreSQL
 - `POST /echo` — echoes JSON body
+
+check any error like if smartphone category is render in other category ? and whlie loading any problem

@@ -9,6 +9,9 @@ const { client, db } = require("./db");
 const multer = require("multer");
 const { sendRegistrationMail } = require("./utils/mailer");
 const { authenticateCustomer, authenticate } = require("./middleware/auth");
+const helmet = require("helmet");
+const xss = require("xss-clean");
+const { clean: xssClean } = require("xss-clean/lib/xss");
 
 const SECRET = process.env.JWT_SECRET || "smartarena_secret_key_25";
 const PORT = process.env.PORT || 5000;
@@ -22,10 +25,56 @@ app.use(
     origin: ["http://localhost:3000", "http://localhost:5173"],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-  })
+  }),
 );
 
-app.use(express.json());
+// Security middlewares
+app.disable("x-powered-by");
+app.use(helmet());
+// Limit JSON body size to mitigate large payload abuse
+app.use(express.json({ limit: "10kb" }));
+// Parse URL-encoded bodies (for form submissions)
+app.use(express.urlencoded({ extended: true }));
+// Apply XSS sanitization after body and query parsers. Use the underlying
+// `clean` function and avoid reassigning `req.query` if it's getter-only.
+app.use(function xssSafe(req, res, next) {
+  try {
+    if (req.body) req.body = xssClean(req.body);
+  } catch (err) {
+    // ignore malformed body sanitization errors
+  }
+
+  if (req.query && typeof req.query === "object") {
+    try {
+      // try to replace whole query object
+      req.query = xssClean(req.query);
+    } catch (err) {
+      // if replacing fails (getter-only), sanitize in-place
+      try {
+        const cleaned = xssClean(req.query);
+        for (const k of Object.keys(cleaned)) {
+          try {
+            req.query[k] = cleaned[k];
+          } catch (e) {
+            /* skip */
+          }
+        }
+      } catch (e) {
+        // give up silently
+      }
+    }
+  }
+
+  try {
+    if (req.params) req.params = xssClean(req.params);
+  } catch (err) {
+    // ignore
+  }
+
+  next();
+});
+
+// Note: rate-limiting removed — no express-rate-limit middleware applied.
 
 // important for preflight
 
@@ -97,7 +146,7 @@ async function runMigrations() {
         ) {
           console.warn(
             "Migration warning: duplicate pg_type detected, skipping:",
-            err.detail || err.message
+            err.detail || err.message,
           );
           return;
         }
@@ -114,11 +163,18 @@ async function runMigrations() {
         logo TEXT,
         category TEXT,
         status TEXT,
+        description TEXT,
         created_at TIMESTAMP DEFAULT now()
       );
     `);
 
-    // categories - simple taxonomy table used by admin UI
+    // Add description column if it doesn't exist (ALTER TABLE method)
+    await safeQuery(`
+      ALTER TABLE brands
+      ADD COLUMN IF NOT EXISTS description TEXT;
+    `);
+
+    // categories
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS categories (
         id SERIAL PRIMARY KEY,
@@ -126,7 +182,8 @@ async function runMigrations() {
         product_type TEXT UNIQUE,
         description TEXT,
         created_at TIMESTAMP DEFAULT now()
-      );`);
+      );
+    `);
 
     // online_stores - stores used for variant store prices and links
     await safeQuery(`
@@ -282,9 +339,13 @@ async function runMigrations() {
         software JSONB,
         features JSONB,
         warranty JSONB,
+        meta JSONB,
         created_at TIMESTAMP DEFAULT now()
       );
     `);
+
+    // Ensure `meta` column exists for existing installations
+    await safeQuery(`ALTER TABLE laptop ADD COLUMN IF NOT EXISTS meta JSONB;`);
 
     //12) networking (depends on products)
     await safeQuery(`
@@ -357,12 +418,48 @@ async function runMigrations() {
       CREATE TABLE IF NOT EXISTS product_ratings (
         id SERIAL PRIMARY KEY,
         product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-        user_id INT NOT NULL REFERENCES "user"(id),
+        user_id INT NOT NULL REFERENCES Customers(id),
         overall_rating INT CHECK (overall_rating BETWEEN 1 AND 5),
         review TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE (product_id, user_id)
       );
+      `);
+    // Ensure the foreign key for product_ratings.user_id references the customers table
+
+    // trnding products
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS product_views (
+        id SERIAL PRIMARY KEY,
+        product_id INT REFERENCES products(id) ON DELETE CASCADE,
+        viewed_at TIMESTAMP DEFAULT now()
+      );
+      `);
+    //compared products table (cascade deletes to avoid FK blocks)
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS product_comparisons (
+        id SERIAL PRIMARY KEY,
+        product_id INT REFERENCES products(id) ON DELETE CASCADE,
+        compared_with INT REFERENCES products(id) ON DELETE CASCADE,
+        compared_at TIMESTAMP DEFAULT now()
+      );
+      `);
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS wishlist (
+        id SERIAL PRIMARY KEY,
+        customer_id INT NOT NULL
+          REFERENCES customers(id)
+          ON DELETE CASCADE,
+      
+        product_id INT NOT NULL
+          REFERENCES products(id)
+          ON DELETE CASCADE,
+      
+        created_at TIMESTAMP DEFAULT now(),
+      
+        UNIQUE (customer_id, product_id)
+      );
+      
       `);
 
     console.log("✅ Migrations to   completed");
@@ -402,7 +499,7 @@ app.post("/api/auth/register", async (req, res) => {
         (user_name, first_name, last_name, phone, gender, email, password, role)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        RETURNING id, email, role`,
-      [user_name, first_name, last_name, phone, gender, email, hashed, role]
+      [user_name, first_name, last_name, phone, gender, email, hashed, role],
     );
 
     res.status(201).json({
@@ -441,7 +538,7 @@ app.post("/api/auth/login", async (req, res) => {
         username: user.user_name,
       },
       SECRET,
-      { expiresIn: "1h" }
+      { expiresIn: "1h" },
     );
 
     res.json({
@@ -456,6 +553,171 @@ app.post("/api/auth/login", async (req, res) => {
     });
   } catch (err) {
     console.error("Login error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---- ADMIN Profile Endpoints ---- */
+app.get("/api/auth/profile", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const result = await db.query('SELECT * FROM "user" WHERE id = $1', [
+      userId,
+    ]);
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const user = result.rows[0];
+
+    res.json({
+      success: true,
+      message: "Admin profile retrieved successfully",
+      user: {
+        id: user.id,
+        username: user.user_name,
+        email: user.email,
+        phone: user.phone || "",
+        first_name: user.first_name || "",
+        last_name: user.last_name || "",
+        gender: user.gender || "",
+        role: user.role || "",
+      },
+    });
+  } catch (err) {
+    console.error("Get admin profile error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---- UPDATE Admin Profile ---- */
+app.put("/api/auth/profile", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { email, phone, first_name, last_name, gender } = req.body;
+
+    // Validate required fields
+    if (!email) {
+      return res.status(400).json({
+        message: "Email is required",
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ message: "Invalid email address" });
+    }
+
+    // Check if email already exists for another user
+    const emailCheck = await db.query(
+      'SELECT id FROM "user" WHERE email = $1 AND id != $2',
+      [email, userId],
+    );
+
+    if (emailCheck.rows.length > 0) {
+      return res.status(400).json({ message: "Email already in use" });
+    }
+
+    // Update admin profile
+    const result = await db.query(
+      `UPDATE "user" 
+       SET email = $1, phone = $2, first_name = $3, last_name = $4, gender = $5
+       WHERE id = $6
+       RETURNING id, user_name, email, phone, first_name, last_name, gender, role`,
+      [
+        email,
+        phone || null,
+        first_name || null,
+        last_name || null,
+        gender || null,
+        userId,
+      ],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const updatedUser = result.rows[0];
+
+    res.json({
+      success: true,
+      message: "Profile updated successfully",
+      user: {
+        id: updatedUser.id,
+        username: updatedUser.user_name,
+        email: updatedUser.email,
+        phone: updatedUser.phone || "",
+        first_name: updatedUser.first_name || "",
+        last_name: updatedUser.last_name || "",
+        gender: updatedUser.gender || "",
+        role: updatedUser.role || "",
+      },
+    });
+  } catch (err) {
+    console.error("Update admin profile error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---- CHANGE Admin Password ---- */
+app.post("/api/auth/change-password", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { currentPassword, newPassword } = req.body;
+
+    // Validate inputs
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        message: "Current password and new password are required",
+      });
+    }
+
+    // Fetch user
+    const userResult = await db.query(
+      'SELECT password FROM "user" WHERE id = $1',
+      [userId],
+    );
+
+    if (!userResult.rows.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const user = userResult.rows[0];
+
+    // Verify current password
+    const passwordMatch = await bcrypt.compare(currentPassword, user.password);
+
+    if (!passwordMatch) {
+      return res.status(401).json({ message: "Current password is incorrect" });
+    }
+
+    // Check if new password is same as current
+    const samePassword = await bcrypt.compare(newPassword, user.password);
+    if (samePassword) {
+      return res.status(400).json({
+        message: "New password must be different from current password",
+      });
+    }
+
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update password
+    await db.query('UPDATE "user" SET password = $1 WHERE id = $2', [
+      hashedPassword,
+      userId,
+    ]);
+
+    res.json({
+      success: true,
+      message: "Password changed successfully",
+    });
+  } catch (err) {
+    console.error("Change admin password error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -511,7 +773,7 @@ app.post("/api/auth/customer/register", async (req, res) => {
     // Check uniqueness against Customers table
     const exists = await db.query(
       `SELECT id FROM Customers WHERE email = $1 OR username = $2`,
-      [email, username]
+      [email, username],
     );
 
     if (exists.rows.length > 0) {
@@ -528,7 +790,7 @@ app.post("/api/auth/customer/register", async (req, res) => {
       `INSERT INTO Customers
        (f_name, l_name, username, email, password, city, country, state, zip_code)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       RETURNING id, f_name, l_name, username, email, created_at`,
+       RETURNING id, f_name, l_name, username, email, city, country, state, zip_code`,
       [
         f_name,
         l_name,
@@ -539,13 +801,28 @@ app.post("/api/auth/customer/register", async (req, res) => {
         country || null,
         state || null,
         zip_code || null,
-      ]
+      ],
     );
 
-    // 5️⃣ Success response
+    const customer = result.rows[0];
+
+    // 5️⃣ Generate JWT token for automatic login
+    const token = jwt.sign(
+      {
+        id: customer.id,
+        email: customer.email,
+        username: customer.username,
+        type: "customer",
+      },
+      SECRET,
+      { expiresIn: "7d" },
+    );
+
+    // 6️⃣ Success response with token and user data
     res.status(201).json({
-      message: "Customer registered successfully",
-      customer: result.rows[0],
+      message: "Customer registered successfully. Automatically logged in.",
+      token,
+      user: customer,
     });
   } catch (err) {
     console.error("Customer register error:", err);
@@ -563,7 +840,7 @@ app.get("/api/auth/check-username", async (req, res) => {
 
     const result = await db.query(
       `SELECT id FROM Customers WHERE username = $1 LIMIT 1`,
-      [q]
+      [q],
     );
     return res.json({ available: result.rows.length === 0 });
   } catch (err) {
@@ -584,7 +861,7 @@ app.get("/api/auth/check-email", async (req, res) => {
 
     const result = await db.query(
       `SELECT id FROM Customers WHERE email = $1 LIMIT 1`,
-      [q]
+      [q],
     );
     return res.json({ available: result.rows.length === 0 });
   } catch (err) {
@@ -610,12 +887,13 @@ app.post("/api/auth/customer/login", async (req, res) => {
 
     const token = jwt.sign(
       {
+        id: customer.id,
         email: customer.email,
-        role: customer.role,
-        username: customer.user_name,
+        username: customer.username,
+        type: "customer",
       },
       SECRET,
-      { expiresIn: "7d" }
+      { expiresIn: "7d" },
     );
 
     res.json({
@@ -623,9 +901,14 @@ app.post("/api/auth/customer/login", async (req, res) => {
       token,
       user: {
         id: customer.id,
+        f_name: customer.f_name,
+        l_name: customer.l_name,
+        username: customer.username,
         email: customer.email,
-        role: customer.role,
-        username: customer.user_name,
+        city: customer.city,
+        country: customer.country,
+        state: customer.state,
+        zip_code: customer.zip_code,
       },
     });
   } catch (err) {
@@ -634,104 +917,433 @@ app.post("/api/auth/customer/login", async (req, res) => {
   }
 });
 
-/*--- ratings smartphones  ---*/
+/* ---- GET User Profile ---- */
+app.get("/api/auth/user-profile", authenticateCustomer, async (req, res) => {
+  try {
+    const customerId = req.customer.id;
+
+    const result = await db.query("SELECT * FROM customers WHERE id = $1", [
+      customerId,
+    ]);
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const customer = result.rows[0];
+
+    res.json({
+      message: "User profile retrieved successfully",
+      user: {
+        id: customer.id,
+        f_name: customer.f_name,
+        l_name: customer.l_name,
+        username: customer.username,
+        email: customer.email,
+        phone: customer.phone || "",
+        city: customer.city || "",
+        state: customer.state || "",
+        country: customer.country || "",
+        zip_code: customer.zip_code || "",
+      },
+    });
+  } catch (err) {
+    console.error("Get profile error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---- UPDATE User Profile ---- */
+app.put("/api/auth/update-profile", authenticateCustomer, async (req, res) => {
+  try {
+    const customerId = req.customer.id;
+    const { f_name, l_name, email, phone, city, state, country, zip_code } =
+      req.body;
+
+    // Validate required fields
+    if (!f_name || !l_name || !email) {
+      return res.status(400).json({
+        message: "First name, last name, and email are required",
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ message: "Invalid email address" });
+    }
+
+    // Check if email already exists for another user
+    const emailCheck = await db.query(
+      "SELECT id FROM customers WHERE email = $1 AND id != $2",
+      [email, customerId],
+    );
+
+    if (emailCheck.rows.length > 0) {
+      return res.status(400).json({ message: "Email already in use" });
+    }
+
+    // Update customer profile
+    const result = await db.query(
+      `UPDATE customers 
+       SET f_name = $1, l_name = $2, email = $3, phone = $4, city = $5, state = $6, country = $7, zip_code = $8
+       WHERE id = $9
+       RETURNING id, f_name, l_name, username, email, phone, city, state, country, zip_code`,
+      [
+        f_name,
+        l_name,
+        email,
+        phone || null,
+        city || null,
+        state || null,
+        country || null,
+        zip_code || null,
+        customerId,
+      ],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const updatedCustomer = result.rows[0];
+
+    res.json({
+      message: "Profile updated successfully",
+      user: {
+        id: updatedCustomer.id,
+        f_name: updatedCustomer.f_name,
+        l_name: updatedCustomer.l_name,
+        username: updatedCustomer.username,
+        email: updatedCustomer.email,
+        phone: updatedCustomer.phone || "",
+        city: updatedCustomer.city || "",
+        state: updatedCustomer.state || "",
+        country: updatedCustomer.country || "",
+        zip_code: updatedCustomer.zip_code || "",
+      },
+    });
+  } catch (err) {
+    console.error("Update profile error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---- CHANGE Password ---- */
 app.post(
-  "/api/public/smartphone/:smartphoneId/rating",
+  "/api/auth/change-password",
   authenticateCustomer,
   async (req, res) => {
-    console.log(req.body);
     try {
-      const smartphoneId = Number(req.params.smartphoneId);
+      const customerId = req.customer.id;
+      const { currentPassword, newPassword } = req.body;
 
-      if (!smartphoneId)
-        return res.status(400).json({ message: "Invalid smartphone id" });
-
-      // Prefer authenticated customer info when available
-      const customer = req.customer || {};
-      const user_id =
-        customer.id || (req.body.user_id ? Number(req.body.user_id) : null);
-      const user_name = customer.username || req.body.user_name || null;
-
-      // Expect rating values in body
-      const { display, performance, camera, battery, design } = req.body;
-
-      if (!user_id || !user_name) {
-        return res
-          .status(400)
-          .json({ message: "user_id and user_name required" });
-      }
-
-      const ratings = [display, performance, camera, battery, design];
-      if (ratings.some((r) => typeof r !== "number" || r < 0 || r > 5)) {
+      // Validate inputs
+      if (!currentPassword || !newPassword) {
         return res.status(400).json({
-          message: "All ratings must be numbers between 0 and 5",
+          message: "Current password and new password are required",
         });
       }
 
-      // Calculate overall rating
-      const overallRating =
-        (display + performance + camera + battery + design) / 5;
+      // Validate new password strength
+      const passwordRegex =
+        /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
+      if (!passwordRegex.test(newPassword)) {
+        return res.status(400).json({
+          message:
+            "New password must be at least 8 characters with uppercase, lowercase, number, and special character",
+        });
+      }
+
+      // Fetch customer
+      const customerResult = await db.query(
+        "SELECT password FROM customers WHERE id = $1",
+        [customerId],
+      );
+
+      if (!customerResult.rows.length) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const customer = customerResult.rows[0];
+
+      // Verify current password
+      const passwordMatch = await bcrypt.compare(
+        currentPassword,
+        customer.password,
+      );
+
+      if (!passwordMatch) {
+        return res
+          .status(401)
+          .json({ message: "Current password is incorrect" });
+      }
+
+      // Check if new password is same as current
+      const samePassword = await bcrypt.compare(newPassword, customer.password);
+      if (samePassword) {
+        return res.status(400).json({
+          message: "New password must be different from current password",
+        });
+      }
+
+      // Hash new password
+      const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+      // Update password
+      await db.query("UPDATE customers SET password = $1 WHERE id = $2", [
+        hashedPassword,
+        customerId,
+      ]);
+
+      res.json({
+        message: "Password changed successfully",
+      });
+    } catch (err) {
+      console.error("Change password error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+/*--- ADMIN Customer Management ---*/
+app.get("/api/admin/customers", authenticate, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, f_name, l_name, username, email, phone, city, state, country, zip_code, created_at 
+       FROM Customers ORDER BY created_at DESC`,
+    );
+
+    res.json({
+      success: true,
+      message: "Customers retrieved successfully",
+      customers: result.rows,
+    });
+  } catch (err) {
+    console.error("Get customers error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/admin/customers/:id", authenticate, async (req, res) => {
+  try {
+    const customerId = req.params.id;
+
+    const result = await db.query(`SELECT * FROM Customers WHERE id = $1`, [
+      customerId,
+    ]);
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    res.json({
+      success: true,
+      customer: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Get customer error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/admin/customers/:id", authenticate, async (req, res) => {
+  try {
+    const customerId = req.params.id;
+    const { f_name, l_name, email, phone, city, state, country, zip_code } =
+      req.body;
+
+    // Validate required fields
+    if (!f_name || !l_name || !email) {
+      return res.status(400).json({
+        message: "First name, last name, and email are required",
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ message: "Invalid email address" });
+    }
+
+    // Check if email already exists for another user
+    const emailCheck = await db.query(
+      "SELECT id FROM Customers WHERE email = $1 AND id != $2",
+      [email, customerId],
+    );
+
+    if (emailCheck.rows.length > 0) {
+      return res.status(400).json({ message: "Email already in use" });
+    }
+
+    // Update customer
+    const result = await db.query(
+      `UPDATE Customers 
+       SET f_name = $1, l_name = $2, email = $3, phone = $4, city = $5, state = $6, country = $7, zip_code = $8
+       WHERE id = $9
+       RETURNING id, f_name, l_name, username, email, phone, city, state, country, zip_code`,
+      [
+        f_name,
+        l_name,
+        email,
+        phone || null,
+        city || null,
+        state || null,
+        country || null,
+        zip_code || null,
+        customerId,
+      ],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    res.json({
+      success: true,
+      message: "Customer updated successfully",
+      customer: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Update customer error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/admin/customers/:id", authenticate, async (req, res) => {
+  try {
+    const customerId = req.params.id;
+
+    const result = await db.query(
+      "DELETE FROM Customers WHERE id = $1 RETURNING id",
+      [customerId],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
+
+    res.json({
+      success: true,
+      message: "Customer deleted successfully",
+    });
+  } catch (err) {
+    console.error("Delete customer error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/*--- ratings smartphones  ---*/
+app.post(
+  "/api/public/products/:productId/ratings",
+  authenticateCustomer,
+  async (req, res) => {
+    try {
+      const productId = Number(req.params.productId);
+      const userId = req.customer.id;
+      const { overall, review } = req.body;
+
+      if (!productId) {
+        return res.status(400).json({ message: "Invalid product id" });
+      }
+
+      if (typeof overall !== "number" || overall < 1 || overall > 5) {
+        return res
+          .status(400)
+          .json({ message: "Rating must be between 1 and 5" });
+      }
 
       await db.query(
         `
-      INSERT INTO smartphone_ratings 
-        (smartphone_id, user_id, user_name, display, performance, camera, battery, design, overall_rating)
-      VALUES
-        ($1, $2, $3, $4, $5, $6, $7, $8, $9);
-      `,
-        [
-          smartphoneId,
-          user_id,
-          user_name,
-          display,
-          performance,
-          camera,
-          battery,
-          design,
-          overallRating,
-        ]
+        INSERT INTO product_ratings (product_id, user_id, overall_rating, review)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (product_id, user_id)
+        DO UPDATE SET
+          overall_rating = EXCLUDED.overall_rating,
+          review = EXCLUDED.review,
+          created_at = CURRENT_TIMESTAMP
+        `,
+        [productId, userId, Math.round(overall), review || null],
       );
 
       res.status(201).json({
         message: "Rating submitted successfully",
-        overallRating: Number(overallRating.toFixed(1)),
       });
     } catch (err) {
       console.error("POST rating error:", err);
       res.status(500).json({ error: "Internal server error" });
     }
-  }
+  },
 );
 
-app.get("/api/public/smartphone/:smartphoneId/rating", async (req, res) => {
-  try {
-    const smartphoneId = Number(req.params.smartphoneId);
-    if (!smartphoneId)
-      return res.status(400).json({ message: "Invalid smartphone id" });
+app.get("/api/brand", async (req, res) => {
+  const result = await db.query(`SELECT * FROM brands`);
+  res.json(result.rows);
+});
 
-    const result = await db.query(
-      `
-      SELECT
-        ROUND(AVG(overall_rating), 1) AS "averageRating",
-        COUNT(*) AS "totalRatings",
-        ROUND(AVG(display), 1) AS display,
-        ROUND(AVG(performance), 1) AS performance,
-        ROUND(AVG(camera), 1) AS camera,
-        ROUND(AVG(battery), 1) AS battery,
-        ROUND(AVG(design), 1) AS design
-      FROM smartphone_ratings 
-      WHERE smartphone_id = $1;
-      `,
-      [smartphoneId]
+app.get("/api/public/products/:productId/ratings", async (req, res) => {
+  try {
+    const productId = Number(req.params.productId);
+    if (!productId) {
+      return res.status(400).json({ message: "Invalid product id" });
+    }
+
+    // Optional customer authentication: if token provided and valid, identify customer id
+    let requestingCustomerId = null;
+    try {
+      const authHeader = req.headers.authorization;
+      const token = authHeader && authHeader.split(" ")[1];
+      if (token) {
+        const decoded = jwt.verify(token, SECRET);
+        if (decoded && decoded.type === "customer") {
+          requestingCustomerId = decoded.id;
+        }
+      }
+    } catch (e) {
+      // ignore token errors for public endpoint
+      requestingCustomerId = null;
+    }
+
+    // Aggregate average and total
+    const agg = await db.query(
+      `SELECT ROUND(AVG(overall_rating)::numeric, 1) AS average_rating, COUNT(*) AS total_ratings
+       FROM product_ratings WHERE product_id = $1`,
+      [productId],
     );
 
+    // Fetch individual reviews with reviewer info
+    const reviewsRes = await db.query(
+      `SELECT pr.id, pr.user_id, pr.overall_rating, pr.review, pr.created_at,
+              c.f_name, c.l_name, c.username
+       FROM product_ratings pr
+       LEFT JOIN customers c ON pr.user_id = c.id
+       WHERE pr.product_id = $1
+       ORDER BY pr.created_at DESC`,
+      [productId],
+    );
+
+    const reviews = reviewsRes.rows.map((r) => ({
+      id: r.id,
+      user_id: r.user_id,
+      name: r.f_name || r.username || null,
+      username: r.username || null,
+      overall_rating: r.overall_rating,
+      review: r.review,
+      created_at: r.created_at,
+      is_user_review: requestingCustomerId
+        ? Number(r.user_id) === Number(requestingCustomerId)
+        : false,
+    }));
+
     res.json({
-      smartphoneId,
-      ...result.rows[0],
+      productId,
+      averageRating: agg.rows[0].average_rating || 0,
+      totalRatings: Number(agg.rows[0].total_ratings || 0),
+      reviews,
     });
   } catch (err) {
-    console.error("Public GET rating error:", err);
-    res.status(500).json({ error: err.message });
+    console.error("GET ratings error:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -762,40 +1374,39 @@ app.put(
       const overallRating =
         (display + performance + camera + battery + design) / 5;
 
+      // Resolve product_id
+      const sres = await db.query(
+        "SELECT product_id FROM smartphones WHERE id = $1 LIMIT 1",
+        [smartphoneId],
+      );
+      n;
+      if (!sres.rows.length) {
+        return res.status(404).json({ message: "Smartphone not found" });
+      }
+      const productId = sres.rows[0].product_id;
+
+      // For admin/private update, accept overall rating and review
+      const overall =
+        Math.round(
+          ((display + performance + camera + battery + design) / 5) * 10,
+        ) / 10;
+
       const result = await db.query(
         `
-        UPDATE smartphone_ratings 
-        SET
-          display = $1,
-          performance = $2,
-          camera = $3,
-          battery = $4,
-          design = $5,
-          overall_rating = $6
+        UPDATE product_ratings
+        SET overall_rating = $1, review = $2, created_at = CURRENT_TIMESTAMP
         WHERE id = (
-          SELECT id
-          FROM smartphone_ratings 
-          WHERE smartphone_id = $7
-          ORDER BY created_at DESC
-          LIMIT 1
+          SELECT id FROM product_ratings WHERE product_id = $3 ORDER BY created_at DESC LIMIT 1
         )
         RETURNING *;
         `,
-        [
-          display,
-          performance,
-          camera,
-          battery,
-          design,
-          Number(overallRating.toFixed(2)),
-          smartphoneId,
-        ]
+        [overall, req.body.review || null, productId],
       );
 
       if (result.rowCount === 0) {
-        return res.status(404).json({
-          message: "No rating found to update for this smartphone",
-        });
+        return res
+          .status(404)
+          .json({ message: "No rating found to update for this product" });
       }
 
       res.json({
@@ -806,15 +1417,65 @@ app.put(
       console.error("PUT rating error:", err);
       res.status(500).json({ error: "Internal server error" });
     }
-  }
+  },
 );
 
-app.delete("/api/private/smartphone/:smartphoneId/rating", async (req, res) => {
-  await db.query(`DELETE FROM smartphone_ratings  WHERE smartphone_id=$1`, [
-    req.params.smartphoneId,
-  ]);
+app.delete(
+  "/api/private/smartphone/:smartphoneId/rating",
+  authenticate,
+  async (req, res) => {
+    try {
+      const smartphoneId = Number(req.params.smartphoneId);
+      if (!smartphoneId)
+        return res.status(400).json({ message: "Invalid smartphone id" });
 
-  res.json({ message: "All ratings deleted" });
+      const sres = await db.query(
+        "SELECT product_id FROM smartphones WHERE id = $1 LIMIT 1",
+        [smartphoneId],
+      );
+      if (!sres.rows.length)
+        return res.status(404).json({ message: "Smartphone not found" });
+
+      const productId = sres.rows[0].product_id;
+      await db.query(`DELETE FROM product_ratings WHERE product_id = $1`, [
+        productId,
+      ]);
+
+      res.json({ message: "All ratings deleted" });
+    } catch (err) {
+      console.error("DELETE ratings error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// Delete a single review (only by the owning customer)
+app.delete("/api/reviews/:id", authenticateCustomer, async (req, res) => {
+  try {
+    const reviewId = Number(req.params.id);
+    if (!reviewId)
+      return res.status(400).json({ message: "Invalid review id" });
+
+    const result = await db.query(
+      "SELECT user_id, product_id FROM product_ratings WHERE id = $1",
+      [reviewId],
+    );
+    if (!result.rows.length)
+      return res.status(404).json({ message: "Review not found" });
+
+    const review = result.rows[0];
+    if (Number(review.user_id) !== Number(req.customer.id)) {
+      return res
+        .status(403)
+        .json({ message: "Not allowed to delete this review" });
+    }
+
+    await db.query("DELETE FROM product_ratings WHERE id = $1", [reviewId]);
+    res.json({ message: "Review deleted successfully" });
+  } catch (err) {
+    console.error("DELETE review error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 /* -----------------------
@@ -837,7 +1498,7 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
       VALUES ($1, 'smartphone', $2)
       RETURNING id
       `,
-      [product.name, product.brand_id]
+      [product.name, product.brand_id],
     );
 
     const productId = productRes.rows[0].id;
@@ -879,20 +1540,21 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
         smartphone.sensors === null
           ? null
           : JSON.stringify(smartphone.sensors || []),
-      ]
+      ],
     );
 
     const smartphoneId = smartphoneRes.rows[0].id;
 
     /* ---------- 3. INSERT PRODUCT IMAGES ---------- */
-    for (const url of images) {
+    for (let i = 0; i < images.length; i++) {
+      const url = images[i];
       await client.query(
         `
-        INSERT INTO product_images (product_id, image_url)
-        VALUES ($1, $2)
+        INSERT INTO product_images (product_id, image_url, position)
+        VALUES ($1, $2, $3)
         ON CONFLICT DO NOTHING
         `,
-        [productId, url]
+        [productId, url, i + 1],
       );
     }
 
@@ -919,7 +1581,7 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
         DO UPDATE SET base_price = EXCLUDED.base_price, attributes = EXCLUDED.attributes
         RETURNING id
         `,
-        [productId, variantKey, JSON.stringify(attrsObj), v.base_price || null]
+        [productId, variantKey, JSON.stringify(attrsObj), v.base_price || null],
       );
 
       const variantId = variantRes.rows[0].id;
@@ -942,7 +1604,7 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
             sp.price || null,
             sp.url || null,
             sp.offer_text || null,
-          ]
+          ],
         );
       }
     }
@@ -991,7 +1653,7 @@ app.post("/api/products", authenticate, async (req, res) => {
       VALUES ($1,$2,$3)
       RETURNING *
       `,
-      [name, product_type, brand_id]
+      [name, product_type, brand_id],
     );
 
     res.status(201).json({
@@ -1145,9 +1807,50 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         s.sensors,
         s.created_at,
 
-        COALESCE(pub.is_published, false) AS is_published
+        COALESCE(pub.is_published, false) AS is_published,
+
+        /* ---------- Images ---------- */
+        COALESCE(
+          (
+            SELECT json_agg(pi.image_url)
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+          ),
+          '[]'::json
+        ) AS images,
+
+        /* ---------- Variants + Store Prices ---------- */
+        COALESCE(
+          json_agg(
+            DISTINCT jsonb_build_object(
+              'variant_id', v.id,
+              'variant_key', v.variant_key,
+              'attributes', v.attributes,
+              'base_price', v.base_price,
+              'store_prices', (
+                SELECT COALESCE(
+                  json_agg(
+                    jsonb_build_object(
+                      'id', sp.id,
+                      'store_name', sp.store_name,
+                      'price', sp.price,
+                      'url', sp.url,
+                      'offer_text', sp.offer_text,
+                      'delivery_info', sp.delivery_info
+                    )
+                  ),
+                  '[]'::json
+                )
+                FROM variant_store_prices sp
+                WHERE sp.variant_id = v.id
+              )
+            )
+          ) FILTER (WHERE v.id IS NOT NULL),
+          '[]'::json
+        ) AS variants
 
       FROM products p
+
       INNER JOIN smartphones s
         ON s.product_id = p.id
 
@@ -1157,9 +1860,19 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
       LEFT JOIN product_publish pub
         ON pub.product_id = p.id
 
+      LEFT JOIN product_variants v
+        ON v.product_id = p.id
+
       WHERE p.product_type = 'smartphone'
 
-      ORDER BY p.id DESC
+      GROUP BY
+        p.id, b.name,
+        s.category, s.model, s.launch_date,
+        s.colors, s.build_design, s.display, s.performance,
+        s.camera, s.battery, s.connectivity_network,
+        s.ports, s.audio, s.multimedia, s.sensors, s.created_at, pub.is_published
+
+      ORDER BY p.id DESC;
     `);
 
     res.json({ smartphones: result.rows });
@@ -1181,59 +1894,106 @@ app.get("/api/smartphone/:id", async (req, res) => {
     // Try to find by internal smartphones.id OR by product_id (product's id)
     const sres = await db.query(
       "SELECT * FROM smartphones WHERE id = $1 OR product_id = $1 LIMIT 1",
-      [sid]
+      [sid],
     );
     if (!sres.rows.length) {
       // If the id wasn't numeric or no match by numeric id, also try matching by model or product id string
       if (isNaN(sid)) {
         const sres2 = await db.query(
           "SELECT * FROM smartphones WHERE model = $1 OR brand = $1 LIMIT 1",
-          [rawId]
+          [rawId],
         );
         if (!sres2.rows.length)
           return res.status(404).json({ message: "Not found" });
         const smartphone = sres2.rows[0];
         const productId = smartphone.product_id;
+        // Fetch product name from products table (ensure response includes product name)
+        const prodRes2 = await db.query(
+          "SELECT name FROM products WHERE id = $1 LIMIT 1",
+          [productId],
+        );
+        const productName2 = prodRes2.rows[0] ? prodRes2.rows[0].name : null;
         const variantsRes = await db.query(
           "SELECT * FROM product_variants WHERE product_id = $1 ORDER BY id ASC",
-          [productId]
+          [productId],
         );
 
         const variants = [];
         for (const v of variantsRes.rows) {
           const stores = await db.query(
             "SELECT * FROM variant_store_prices  WHERE variant_id = $1 ORDER BY id ASC",
-            [v.id]
+            [v.id],
           );
           const ram = v.attributes ? v.attributes.ram || null : null;
           const storage = v.attributes ? v.attributes.storage || null : null;
           variants.push({ ...v, ram, storage, store_prices: stores.rows });
         }
 
-        return res.json({ data: { ...smartphone, variants } });
+        return res.json({
+          data: { ...smartphone, name: productName2, variants },
+        });
       }
       return res.status(404).json({ message: "Not found" });
     }
 
     const smartphone = sres.rows[0];
     const productId = smartphone.product_id;
+    // Fetch product name from products table and include in response
+    const prodRes = await db.query(
+      "SELECT name, brand_id FROM products WHERE id = $1 LIMIT 1",
+      [productId],
+    );
+    const productName = prodRes.rows[0] ? prodRes.rows[0].name : null;
+    const productBrandId = prodRes.rows[0] ? prodRes.rows[0].brand_id : null;
     const variantsRes = await db.query(
       "SELECT * FROM product_variants WHERE product_id = $1 ORDER BY id ASC",
-      [productId]
+      [productId],
     );
 
     const variants = [];
     for (const v of variantsRes.rows) {
       const stores = await db.query(
         "SELECT * FROM variant_store_prices  WHERE variant_id = $1 ORDER BY id ASC",
-        [v.id]
+        [v.id],
       );
       const ram = v.attributes ? v.attributes.ram || null : null;
       const storage = v.attributes ? v.attributes.storage || null : null;
       variants.push({ ...v, ram, storage, store_prices: stores.rows });
     }
 
-    return res.json({ data: { ...smartphone, variants } });
+    // Sanitize response (remove internal ids)
+    const sanitize = (smartphoneObj, variantsArr) => {
+      const { id, product_id, ...rest } = smartphoneObj || {};
+      // sanitize colors
+      let colors = rest.colors;
+      if (Array.isArray(colors)) {
+        colors = colors.map((c) => {
+          if (c && typeof c === "object") {
+            const { id: _cid, ...rc } = c;
+            return rc;
+          }
+          return c;
+        });
+      }
+
+      const sanitizedVariants = (variantsArr || []).map((v) => {
+        const { id: _vid, product_id: _vpid, store_prices, ...rv } = v || {};
+        const sanitizedStorePrices = Array.isArray(store_prices)
+          ? store_prices.map((sp) => {
+              const { id: _spid, variant_id: _vref, ...rsp } = sp || {};
+              return rsp;
+            })
+          : store_prices;
+        return { ...rv, store_prices: sanitizedStorePrices };
+      });
+
+      return { ...rest, colors, variants: sanitizedVariants };
+    };
+
+    const sanitized = sanitize(smartphone, variants);
+    sanitized.name = productName;
+
+    return res.json({ data: sanitized });
   } catch (err) {
     console.error("GET /api/smartphone/:id error:", err);
     return res.status(500).json({ error: err.message });
@@ -1259,7 +2019,7 @@ app.post("/api/laptops", authenticate, async (req, res) => {
       VALUES ($1, 'laptop', $2)
       RETURNING id
       `,
-      [product.name, product.brand_id]
+      [product.name, product.brand_id],
     );
     const productId = productRes.rows[0].id;
 
@@ -1268,12 +2028,12 @@ app.post("/api/laptops", authenticate, async (req, res) => {
       `
       INSERT INTO laptop (
         product_id, cpu, display, memory, storage, battery,
-        connectivity, physical, software, features, warranty
+        connectivity, physical, software, features, warranty, meta
       )
       VALUES (
         $1,
         $2::jsonb,$3::jsonb,$4::jsonb,$5::jsonb,$6::jsonb,
-        $7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb
+        $7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12::jsonb
       )
       `,
       [
@@ -1288,15 +2048,23 @@ app.post("/api/laptops", authenticate, async (req, res) => {
         JSON.stringify(laptop.software || {}),
         JSON.stringify(laptop.features || []),
         JSON.stringify(laptop.warranty || {}),
-      ]
+        JSON.stringify({
+          category: laptop.category || null,
+          brand: laptop.brand || null,
+          model: laptop.model || null,
+          launch_date: laptop.launch_date || null,
+          colors: laptop.colors || [],
+        }),
+      ],
     );
 
     /* 3️⃣ Images */
-    for (const url of images) {
+    for (let i = 0; i < images.length; i++) {
+      const url = images[i];
       await client.query(
-        `INSERT INTO product_images (product_id, image_url)
-         VALUES ($1,$2)`,
-        [productId, url]
+        `INSERT INTO product_images (product_id, image_url, position)
+         VALUES ($1,$2,$3)`,
+        [productId, url, i + 1],
       );
     }
 
@@ -1316,7 +2084,7 @@ app.post("/api/laptops", authenticate, async (req, res) => {
           variantKey,
           JSON.stringify({ ram: v.ram, storage: v.storage }),
           v.base_price || null,
-        ]
+        ],
       );
 
       const variantId = variantRes.rows[0].id;
@@ -1334,7 +2102,7 @@ app.post("/api/laptops", authenticate, async (req, res) => {
             s.price || null,
             s.url || null,
             s.offer_text || null,
-          ]
+          ],
         );
       }
     }
@@ -1343,7 +2111,7 @@ app.post("/api/laptops", authenticate, async (req, res) => {
     await client.query(
       `INSERT INTO product_publish (product_id, is_published)
        VALUES ($1,false)`,
-      [productId]
+      [productId],
     );
 
     await client.query("COMMIT");
@@ -1473,6 +2241,246 @@ app.get("/api/laptops", async (req, res) => {
   }
 });
 
+// Get laptop by id (accepts internal laptop.id or product_id)
+app.get("/api/laptops/:id", authenticate, async (req, res) => {
+  try {
+    const rawId = req.params.id;
+    const lid = Number(rawId);
+    if (!rawId || rawId.trim() === "")
+      return res.status(400).json({ message: "Invalid id" });
+
+    const lres = await db.query(
+      "SELECT * FROM laptop WHERE product_id = $1 LIMIT 1",
+      [lid],
+    );
+
+    if (!lres.rows.length) {
+      return res.status(404).json({ message: "Not found" });
+    }
+
+    const laptop = lres.rows[0];
+    const productId = laptop.product_id;
+
+    // product name
+    const prodRes = await db.query(
+      "SELECT name, brand_id FROM products WHERE id = $1 LIMIT 1",
+      [productId],
+    );
+    const productName = prodRes.rows[0] ? prodRes.rows[0].name : null;
+    const productBrandId = prodRes.rows[0] ? prodRes.rows[0].brand_id : null;
+
+    // images
+    const imagesRes = await db.query(
+      "SELECT image_url FROM product_images WHERE product_id = $1 ORDER BY position ASC",
+      [productId],
+    );
+    const images = imagesRes.rows.map((r) => r.image_url);
+
+    // variants + store prices
+    const variantsRes = await db.query(
+      "SELECT * FROM product_variants WHERE product_id = $1 ORDER BY id ASC",
+      [productId],
+    );
+
+    const variants = [];
+    for (const v of variantsRes.rows) {
+      const stores = await db.query(
+        "SELECT * FROM variant_store_prices WHERE variant_id = $1 ORDER BY id ASC",
+        [v.id],
+      );
+      const ram = v.attributes ? v.attributes.ram || null : null;
+      const storage = v.attributes ? v.attributes.storage || null : null;
+      variants.push({ ...v, ram, storage, stores: stores.rows });
+    }
+
+    // publish info
+    const pubRes = await db.query(
+      "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
+      [productId],
+    );
+    const published = pubRes.rows[0] ? pubRes.rows[0].is_published : false;
+
+    // Prepare sanitized response
+    const sanitize = (lobj, variantsArr) => {
+      const { id, product_id, meta, ...rest } = lobj || {};
+      const metaObj = meta || {};
+      return { ...rest, ...metaObj, variants: variantsArr || [] };
+    };
+
+    const sanitized = sanitize(laptop, variants);
+    sanitized.name = productName;
+
+    return res.json({
+      product: { name: productName },
+      laptop: sanitized,
+      images,
+      variants,
+      published,
+    });
+  } catch (err) {
+    console.error("GET /api/laptops/:id error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Update laptop (product, laptop jsonb, images, variants, publish)
+app.put("/api/laptops/:id", authenticate, async (req, res) => {
+  const client = await db.connect();
+  try {
+    if (req.user.role !== "admin")
+      return res.status(403).json({ message: "Admin access required" });
+
+    const rawId = req.params.id;
+    const lid = Number(rawId);
+    if (!rawId || rawId.trim() === "")
+      return res.status(400).json({ message: "Invalid id" });
+
+    const lres = await db.query(
+      "SELECT * FROM laptop WHERE product_id = $1 LIMIT 1",
+      [lid],
+    );
+    if (!lres.rows.length)
+      return res.status(404).json({ message: "Not found" });
+
+    const laptopRow = lres.rows[0];
+    const productId = laptopRow.product_id;
+
+    const {
+      product = {},
+      laptop = {},
+      images = [],
+      variants = [],
+      published,
+    } = req.body;
+
+    await client.query("BEGIN");
+
+    // Update product
+    if (product.name || product.brand_id !== undefined) {
+      await client.query(
+        "UPDATE products SET name = $1, brand_id = $2 WHERE id = $3",
+        [product.name || null, product.brand_id || null, productId],
+      );
+    }
+
+    // Update laptop JSONB fields and meta
+    await client.query(
+      `
+      UPDATE laptop SET
+        cpu = $1::jsonb,
+        display = $2::jsonb,
+        memory = $3::jsonb,
+        storage = $4::jsonb,
+        battery = $5::jsonb,
+        connectivity = $6::jsonb,
+        physical = $7::jsonb,
+        software = $8::jsonb,
+        features = $9::jsonb,
+        warranty = $10::jsonb,
+        meta = $11::jsonb
+      WHERE product_id = $12
+      `,
+      [
+        JSON.stringify(laptop.cpu || {}),
+        JSON.stringify(laptop.display || {}),
+        JSON.stringify(laptop.memory || {}),
+        JSON.stringify(laptop.storage || {}),
+        JSON.stringify(laptop.battery || {}),
+        JSON.stringify(laptop.connectivity || {}),
+        JSON.stringify(laptop.physical || {}),
+        JSON.stringify(laptop.software || {}),
+        JSON.stringify(laptop.features || []),
+        JSON.stringify(laptop.warranty || {}),
+        JSON.stringify({
+          category: laptop.category || null,
+          brand: laptop.brand || null,
+          model: laptop.model || null,
+          launch_date: laptop.launch_date || null,
+          colors: laptop.colors || [],
+        }),
+        productId,
+      ],
+    );
+
+    // Replace images: delete existing and insert new
+    await client.query("DELETE FROM product_images WHERE product_id = $1", [
+      productId,
+    ]);
+    for (let i = 0; i < (images || []).length; i++) {
+      await client.query(
+        "INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)",
+        [productId, images[i], i + 1],
+      );
+    }
+
+    // Replace variants: delete existing variant store prices and variants, then insert new ones
+    const oldVarRes = await client.query(
+      "SELECT id FROM product_variants WHERE product_id = $1",
+      [productId],
+    );
+    for (const v of oldVarRes.rows) {
+      await client.query(
+        "DELETE FROM variant_store_prices WHERE variant_id = $1",
+        [v.id],
+      );
+    }
+    await client.query("DELETE FROM product_variants WHERE product_id = $1", [
+      productId,
+    ]);
+
+    for (const v of variants || []) {
+      const variantKey = `${v.ram || ""}_${v.storage || ""}`;
+      const variantRes = await client.query(
+        `INSERT INTO product_variants (product_id, variant_key, attributes, base_price) VALUES ($1,$2,$3::jsonb,$4) RETURNING id`,
+        [
+          productId,
+          variantKey,
+          JSON.stringify({ ram: v.ram, storage: v.storage }),
+          v.base_price || null,
+        ],
+      );
+      const variantId = variantRes.rows[0].id;
+      for (const s of v.stores || []) {
+        await client.query(
+          `INSERT INTO variant_store_prices (variant_id, store_name, price, url, offer_text, delivery_info) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [
+            variantId,
+            s.store_name || null,
+            s.price || null,
+            s.url || null,
+            s.offer_text || null,
+            s.delivery_info || null,
+          ],
+        );
+      }
+    }
+
+    // Update publish state
+    if (published !== undefined) {
+      const up = await client.query(
+        "UPDATE product_publish SET is_published = $1 WHERE product_id = $2",
+        [published, productId],
+      );
+      if (up.rowCount === 0) {
+        await client.query(
+          "INSERT INTO product_publish (product_id, is_published) VALUES ($1,$2)",
+          [productId, published],
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({ message: "Laptop updated", product_id: productId });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("PUT /api/laptops/:id error:", err);
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/api/homeappliances", authenticate, async (req, res) => {
   const client = await db.connect();
   const toJSON = (v) => (v === undefined ? null : JSON.stringify(v));
@@ -1493,7 +2501,7 @@ app.post("/api/homeappliances", authenticate, async (req, res) => {
       VALUES ($1,$2,'home_appliance')
       RETURNING id
       `,
-      [product.name, product.brand_id]
+      [product.name, product.brand_id],
     );
 
     const productId = productRes.rows[0].id;
@@ -1529,14 +2537,15 @@ app.post("/api/homeappliances", authenticate, async (req, res) => {
         toJSON(home_appliance.performance),
         toJSON(home_appliance.physical_details),
         toJSON(home_appliance.warranty),
-      ]
+      ],
     );
 
     /* ---------- 3️⃣ Images ---------- */
-    for (const url of images) {
+    for (let i = 0; i < images.length; i++) {
+      const url = images[i];
       await client.query(
-        `INSERT INTO product_images (product_id, image_url) VALUES ($1,$2)`,
-        [productId, url]
+        `INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)`,
+        [productId, url, i + 1],
       );
     }
 
@@ -1553,7 +2562,7 @@ app.post("/api/homeappliances", authenticate, async (req, res) => {
         VALUES ($1,$2,$3::jsonb,$4)
         RETURNING id
         `,
-        [productId, v.variant_key, JSON.stringify(v), v.base_price]
+        [productId, v.variant_key, JSON.stringify(v), v.base_price],
       );
 
       const variantId = variantRes.rows[0].id;
@@ -1565,7 +2574,7 @@ app.post("/api/homeappliances", authenticate, async (req, res) => {
             (variant_id, store_name, price, url, offer_text)
           VALUES ($1,$2,$3,$4,$5)
           `,
-          [variantId, s.store_name, s.price, s.url, s.offer_text || null]
+          [variantId, s.store_name, s.price, s.url, s.offer_text || null],
         );
       }
     }
@@ -1574,7 +2583,7 @@ app.post("/api/homeappliances", authenticate, async (req, res) => {
     await client.query(
       `INSERT INTO product_publish (product_id, is_published)
        VALUES ($1,false)`,
-      [productId]
+      [productId],
     );
 
     await client.query("COMMIT");
@@ -1712,7 +2721,7 @@ app.post("/api/networking", authenticate, async (req, res) => {
       VALUES ($1,$2,'networking')
       RETURNING id
       `,
-      [product.name, product.brand_id]
+      [product.name, product.brand_id],
     );
 
     const productId = productRes.rows[0].id;
@@ -1750,15 +2759,16 @@ app.post("/api/networking", authenticate, async (req, res) => {
         toJSON(networking.connectivity),
         toJSON(networking.physical_details),
         toJSON(networking.warranty),
-      ]
+      ],
     );
 
     /* ---------- 3️⃣ Images ---------- */
-    for (const url of images) {
+    for (let i = 0; i < images.length; i++) {
+      const url = images[i];
       await client.query(
-        `INSERT INTO product_images (product_id, image_url)
-         VALUES ($1,$2)`,
-        [productId, url]
+        `INSERT INTO product_images (product_id, image_url, position)
+         VALUES ($1,$2,$3)`,
+        [productId, url, i + 1],
       );
     }
 
@@ -1775,7 +2785,7 @@ app.post("/api/networking", authenticate, async (req, res) => {
         VALUES ($1,$2,$3::jsonb,$4)
         RETURNING id
         `,
-        [productId, v.variant_key, JSON.stringify(v), v.base_price]
+        [productId, v.variant_key, JSON.stringify(v), v.base_price],
       );
 
       const variantId = variantRes.rows[0].id;
@@ -1787,7 +2797,7 @@ app.post("/api/networking", authenticate, async (req, res) => {
             (variant_id, store_name, price, url, offer_text)
           VALUES ($1,$2,$3,$4,$5)
           `,
-          [variantId, s.store_name, s.price, s.url, s.offer_text || null]
+          [variantId, s.store_name, s.price, s.url, s.offer_text || null],
         );
       }
     }
@@ -1796,7 +2806,7 @@ app.post("/api/networking", authenticate, async (req, res) => {
     await client.query(
       `INSERT INTO product_publish (product_id, is_published)
        VALUES ($1,false)`,
-      [productId]
+      [productId],
     );
 
     await client.query("COMMIT");
@@ -1942,11 +2952,24 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    const sid = Number(req.params.id);
-    if (!sid || Number.isNaN(sid)) {
+    // Resolve the smartphone record by either internal id or product_id
+    const rawId = req.params.id;
+    const parsedId = Number(rawId);
+    if (Number.isNaN(parsedId) || parsedId <= 0) {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Invalid id" });
     }
+
+    const findRes = await client.query(
+      "SELECT id, product_id FROM smartphones WHERE id = $1 OR product_id = $1 LIMIT 1",
+      [parsedId],
+    );
+    if (!findRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Smartphone not found" });
+    }
+
+    const sid = findRes.rows[0].id; // internal smartphone id
 
     const n = normalizeBodyKeys(req.body || {});
     const name = n.name || req.body.name;
@@ -1957,17 +2980,16 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 
     /* ---------- UPDATE SMARTPHONE (PARENT) ---------- */
     const updatePhoneSQL = `
-      UPDATE smartphones  SET
-        name=$1, category=$2, brand=$3, model=$4, launch_date=$5,
-        images=$6, colors=$7, build_design=$8, display=$9, performance=$10,
-        camera=$11, battery=$12, connectivity_network=$13, ports=$14,
-        audio=$15, multimedia=$16, sensors=$17
-      WHERE id=$18
+      UPDATE smartphones SET
+        category=$1, brand=$2, model=$3, launch_date=$4,
+        images=$5, colors=$6, build_design=$7, display=$8, performance=$9,
+        camera=$10, battery=$11, connectivity_network=$12, ports=$13,
+        audio=$14, multimedia=$15, sensors=$16
+      WHERE id=$17
       RETURNING *;
     `;
 
     const phoneRes = await client.query(updatePhoneSQL, [
-      name,
       req.body.category || null,
       req.body.brand || null,
       req.body.model || null,
@@ -1990,6 +3012,15 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     if (!phoneRes.rows.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "Smartphone not found" });
+    }
+
+    // Update product name in products table (product name stored on products)
+    const productId = phoneRes.rows[0].product_id || null;
+    if (productId && name) {
+      await client.query(`UPDATE products SET name = $1 WHERE id = $2`, [
+        name,
+        productId,
+      ]);
     }
 
     /* ---------- UPSERT VARIANTS ---------- */
@@ -2019,6 +3050,10 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
         INSERT INTO product_variants 
           (product_id, variant_key, attributes, base_price)
         VALUES ($1, $2, $3, $4)
+        ON CONFLICT (product_id, variant_key)
+        DO UPDATE SET
+          attributes = EXCLUDED.attributes,
+          base_price = EXCLUDED.base_price
         RETURNING id;
       `;
 
@@ -2080,6 +3115,11 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
         INSERT INTO variant_store_prices 
           (variant_id, store_name, price, url, offer_text)
         VALUES ($1,$2,$3,$4,$5)
+        ON CONFLICT (variant_id, store_name)
+        DO UPDATE SET
+          price = EXCLUDED.price,
+          url = EXCLUDED.url,
+          offer_text = EXCLUDED.offer_text
         RETURNING id;
       `;
 
@@ -2131,6 +3171,37 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       }
     }
 
+    // If client provided `published` flag, reflect it in product_publish table
+    if (req.body.published !== undefined) {
+      try {
+        const productId = phoneRes.rows[0].product_id || null;
+        if (productId) {
+          await client.query(
+            `
+            INSERT INTO product_publish (product_id, is_published, published_by)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (product_id)
+            DO UPDATE SET
+              is_published = EXCLUDED.is_published,
+              published_by = EXCLUDED.published_by,
+              updated_at = now();
+            `,
+            [
+              productId,
+              req.body.published,
+              req.user && req.user.id ? req.user.id : null,
+            ],
+          );
+        }
+      } catch (pubErr) {
+        console.error(
+          "Failed to update product_publish for smartphone:",
+          pubErr,
+        );
+        // don't fail the whole update for publish tracking issues
+      }
+    }
+
     await client.query("COMMIT");
     return res.json({
       message: "Smartphone updated successfully",
@@ -2151,16 +3222,17 @@ app.delete("/api/smartphone/:id", authenticate, async (req, res) => {
   console.log(req.params.id);
   try {
     const sid = Number(req.params.id);
-    if (!sid || Number.isNaN(sid)) {
+    if (Number.isNaN(sid) || sid <= 0) {
       return res.status(400).json({ message: "Invalid id" });
     }
 
     await client.query("BEGIN");
 
     // resolve product_id from smartphone
+    // Accept either internal smartphones.id or the linked products.id (product_id)
     const sres = await client.query(
-      "SELECT product_id FROM smartphones WHERE id = $1",
-      [sid]
+      "SELECT product_id FROM smartphones WHERE id = $1 OR product_id = $1 LIMIT 1",
+      [sid],
     );
     if (!sres.rows.length) {
       await client.query("ROLLBACK");
@@ -2172,7 +3244,7 @@ app.delete("/api/smartphone/:id", authenticate, async (req, res) => {
     // check publish status from product_publish table
     const pub = await client.query(
       "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
-      [productId]
+      [productId],
     );
 
     if (pub.rows.length && pub.rows[0].is_published) {
@@ -2186,6 +3258,12 @@ app.delete("/api/smartphone/:id", authenticate, async (req, res) => {
     await client.query("DELETE FROM product_publish WHERE product_id = $1", [
       productId,
     ]);
+
+    // delete any product comparisons referencing this product (either side)
+    await client.query(
+      "DELETE FROM product_comparisons WHERE product_id = $1 OR compared_with = $1",
+      [productId],
+    );
 
     // delete the product (cascades to smartphones, product_variants, product_images via FK ON DELETE CASCADE)
     await client.query("DELETE FROM products WHERE id = $1", [productId]);
@@ -2295,6 +3373,220 @@ app.get("/api/homeappliance", authenticate, async (req, res) => {
   }
 });
 
+// Get single home appliance by id (accepts product_id)
+app.get("/api/home-appliances/:id", authenticate, async (req, res) => {
+  try {
+    const rawId = req.params.id;
+    const pid = Number(rawId);
+    if (!rawId || rawId.trim() === "")
+      return res.status(400).json({ message: "Invalid id" });
+
+    const har = await db.query(
+      "SELECT * FROM home_appliance WHERE product_id = $1 LIMIT 1",
+      [pid],
+    );
+    if (!har.rows.length) return res.status(404).json({ message: "Not found" });
+
+    const home = har.rows[0];
+    const productId = home.product_id;
+
+    const prodRes = await db.query(
+      "SELECT name, brand_id FROM products WHERE id = $1 LIMIT 1",
+      [productId],
+    );
+    const productName = prodRes.rows[0] ? prodRes.rows[0].name : null;
+    const productBrandId = prodRes.rows[0] ? prodRes.rows[0].brand_id : null;
+
+    const imagesRes = await db.query(
+      "SELECT image_url FROM product_images WHERE product_id = $1 ORDER BY position ASC",
+      [productId],
+    );
+    const images = imagesRes.rows.map((r) => r.image_url);
+
+    const variantsRes = await db.query(
+      "SELECT * FROM product_variants WHERE product_id = $1 ORDER BY id ASC",
+      [productId],
+    );
+
+    const variants = [];
+    for (const v of variantsRes.rows) {
+      const stores = await db.query(
+        "SELECT * FROM variant_store_prices WHERE variant_id = $1 ORDER BY id ASC",
+        [v.id],
+      );
+      variants.push({ ...v, stores: stores.rows });
+    }
+
+    const pubRes = await db.query(
+      "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
+      [productId],
+    );
+    const published = pubRes.rows[0] ? pubRes.rows[0].is_published : false;
+
+    return res.json({
+      product: { name: productName, brand_id: productBrandId },
+      home_appliance: home,
+      images,
+      variants,
+      published,
+    });
+  } catch (err) {
+    console.error("GET /api/home-appliances/:id error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Update home appliance (product, home_appliance jsonb, images, variants, publish)
+app.put("/api/home-appliances/:id", authenticate, async (req, res) => {
+  const client = await db.connect();
+  try {
+    if (req.user.role !== "admin")
+      return res.status(403).json({ message: "Admin access required" });
+
+    const rawId = req.params.id;
+    const pid = Number(rawId);
+    if (!rawId || rawId.trim() === "")
+      return res.status(400).json({ message: "Invalid id" });
+
+    const har = await db.query(
+      "SELECT * FROM home_appliance WHERE product_id = $1 LIMIT 1",
+      [pid],
+    );
+    if (!har.rows.length) return res.status(404).json({ message: "Not found" });
+
+    const productId = har.rows[0].product_id;
+
+    const {
+      product = {},
+      home_appliance = {},
+      images = [],
+      variants = [],
+      published,
+    } = req.body;
+
+    await client.query("BEGIN");
+
+    // Update product
+    if (product.name || product.brand_id !== undefined) {
+      await client.query(
+        "UPDATE products SET name = $1, brand_id = $2 WHERE id = $3",
+        [product.name || null, product.brand_id || null, productId],
+      );
+    }
+
+    const toJSON = (v) => (v === undefined ? null : JSON.stringify(v));
+
+    // Update home_appliance JSONB fields
+    await client.query(
+      `
+      UPDATE home_appliance SET
+        appliance_type = $1,
+        model_number = $2,
+        release_year = $3,
+        country_of_origin = $4,
+        specifications = $5::jsonb,
+        features = $6::jsonb,
+        performance = $7::jsonb,
+        physical_details = $8::jsonb,
+        warranty = $9::jsonb
+      WHERE product_id = $10
+      `,
+      [
+        home_appliance.appliance_type || null,
+        home_appliance.model_number || null,
+        home_appliance.release_year || null,
+        home_appliance.country_of_origin || null,
+        toJSON(home_appliance.specifications),
+        toJSON(home_appliance.features),
+        toJSON(home_appliance.performance),
+        toJSON(home_appliance.physical_details),
+        toJSON(home_appliance.warranty),
+        productId,
+      ],
+    );
+
+    // Replace images
+    await client.query("DELETE FROM product_images WHERE product_id = $1", [
+      productId,
+    ]);
+    for (let i = 0; i < (images || []).length; i++) {
+      await client.query(
+        "INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)",
+        [productId, images[i], i + 1],
+      );
+    }
+
+    // Replace variants
+    const oldVarRes = await client.query(
+      "SELECT id FROM product_variants WHERE product_id = $1",
+      [productId],
+    );
+    for (const v of oldVarRes.rows) {
+      await client.query(
+        "DELETE FROM variant_store_prices WHERE variant_id = $1",
+        [v.id],
+      );
+    }
+    await client.query("DELETE FROM product_variants WHERE product_id = $1", [
+      productId,
+    ]);
+
+    for (const v of variants || []) {
+      const variantKey = v.variant_key || `${v.ram || ""}_${v.storage || ""}`;
+      const variantRes = await client.query(
+        `INSERT INTO product_variants (product_id, variant_key, attributes, base_price) VALUES ($1,$2,$3::jsonb,$4) RETURNING id`,
+        [
+          productId,
+          variantKey,
+          JSON.stringify(v.attributes || { ram: v.ram, storage: v.storage }),
+          v.base_price || null,
+        ],
+      );
+      const variantId = variantRes.rows[0].id;
+      for (const s of v.stores || []) {
+        await client.query(
+          `INSERT INTO variant_store_prices (variant_id, store_name, price, url, offer_text, delivery_info) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [
+            variantId,
+            s.store_name || null,
+            s.price || null,
+            s.url || null,
+            s.offer_text || null,
+            s.delivery_info || null,
+          ],
+        );
+      }
+    }
+
+    // Update publish state
+    if (published !== undefined) {
+      const up = await client.query(
+        "UPDATE product_publish SET is_published = $1 WHERE product_id = $2",
+        [published, productId],
+      );
+      if (up.rowCount === 0) {
+        await client.query(
+          "INSERT INTO product_publish (product_id, is_published) VALUES ($1,$2)",
+          [productId, published],
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({
+      message: "Home appliance updated",
+      product_id: productId,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("PUT /api/home-appliances/:id error:", err);
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 /* -----------------------
   Ram/Storage/Long API
 ------------------------*/
@@ -2303,7 +3595,7 @@ app.get("/api/homeappliance", authenticate, async (req, res) => {
 app.get("/api/ram-storage-config", authenticate, async (req, res) => {
   try {
     const r = await db.query(
-      "SELECT * FROM ram_storage_long  ORDER BY id DESC"
+      "SELECT * FROM ram_storage_long  ORDER BY id DESC",
     );
     return res.json({ data: r.rows });
   } catch (err) {
@@ -2332,7 +3624,7 @@ app.post("/api/ram-storage-config", authenticate, async (req, res) => {
     // Check if the same ram+storage combination already exists
     const exists = await db.query(
       `SELECT id FROM ram_storage_long WHERE ram = $1 AND storage = $2 LIMIT 1`,
-      [ramVal, storageVal]
+      [ramVal, storageVal],
     );
     if (exists.rows.length > 0) {
       return res.status(409).json({
@@ -2343,7 +3635,7 @@ app.post("/api/ram-storage-config", authenticate, async (req, res) => {
 
     const r = await db.query(
       `INSERT INTO ram_storage_long (ram, storage, long) VALUES ($1, $2, $3) RETURNING *`,
-      [ramVal, storageVal, longVal]
+      [ramVal, storageVal, longVal],
     );
 
     return res.status(201).json({ message: "Spec created", data: r.rows[0] });
@@ -2375,7 +3667,7 @@ app.put("/api/ram-storage-config/:id", authenticate, async (req, res) => {
     // Check duplicate combination on other rows
     const dup = await db.query(
       `SELECT id FROM ram_storage_long WHERE ram = $1 AND storage = $2 AND id <> $3 LIMIT 1`,
-      [ramVal, storageVal, id]
+      [ramVal, storageVal, id],
     );
     if (dup.rows.length > 0) {
       return res.status(409).json({
@@ -2386,7 +3678,7 @@ app.put("/api/ram-storage-config/:id", authenticate, async (req, res) => {
 
     const result = await db.query(
       `UPDATE ram_storage_long SET ram = $1, storage = $2, long = $3 WHERE id = $4 RETURNING *`,
-      [ramVal, storageVal, longVal, id]
+      [ramVal, storageVal, longVal, id],
     );
 
     if (result.rowCount === 0)
@@ -2431,6 +3723,17 @@ app.get("/api/categories", authenticate, async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+// Public categories endpoint (no authentication) - useful for public site
+app.get("/api/category", async (req, res) => {
+  try {
+    const r = await db.query("SELECT * FROM categories ORDER BY id DESC");
+    return res.json({ data: r.rows });
+  } catch (err) {
+    console.error("GET /api/category error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
 // Create category (authenticated)
 app.post("/api/categories", authenticate, async (req, res) => {
   console.log(req.body);
@@ -2444,14 +3747,14 @@ app.post("/api/categories", authenticate, async (req, res) => {
 
     const exists = await db.query(
       "SELECT id FROM categories WHERE name = $1 OR product_type = $2 LIMIT 1",
-      [nameVal, typeVal]
+      [nameVal, typeVal],
     );
     if (exists.rows.length > 0)
       return res.status(409).json({ message: "Category already exists" });
 
     const r = await db.query(
       `INSERT INTO categories (name, product_type, description) VALUES ($1,$2,$3) RETURNING *`,
-      [nameVal, typeVal, descVal]
+      [nameVal, typeVal, descVal],
     );
     return res.status(201).json({ data: r.rows[0] });
   } catch (err) {
@@ -2475,7 +3778,7 @@ app.put("/api/categories/:id", authenticate, async (req, res) => {
 
     const dup = await db.query(
       "SELECT id FROM categories WHERE (name = $1 OR product_type = $2) AND id <> $3 LIMIT 1",
-      [nameVal, typeVal, id]
+      [nameVal, typeVal, id],
     );
     if (dup.rows.length > 0)
       return res
@@ -2484,7 +3787,7 @@ app.put("/api/categories/:id", authenticate, async (req, res) => {
 
     const r = await db.query(
       `UPDATE categories SET name=$1, product_type=$2, description=$3 WHERE id=$4 RETURNING *`,
-      [nameVal, typeVal, descVal, id]
+      [nameVal, typeVal, descVal, id],
     );
     if (r.rowCount === 0)
       return res.status(404).json({ message: "Category not found" });
@@ -2515,6 +3818,20 @@ app.delete("/api/categories/:id", authenticate, async (req, res) => {
   Online Stores CRUD
 ------------------------*/
 // Get all online stores (public)
+app.get("/api/public/online-stores", async (req, res) => {
+  try {
+    const r = await db.query("SELECT * FROM online_stores ORDER BY id DESC");
+    const sanitized = (r.rows || []).map((row) => {
+      const { created_at, createdAt, ...rest } = row || {};
+      return rest;
+    });
+    return res.json({ data: sanitized });
+  } catch (err) {
+    console.error("GET /api/public/online-stores error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/online-stores", authenticate, async (req, res) => {
   try {
     const r = await db.query("SELECT * FROM online_stores ORDER BY id DESC");
@@ -2534,7 +3851,7 @@ app.post("/api/online-stores", authenticate, async (req, res) => {
 
     const r = await db.query(
       `INSERT INTO online_stores (name, logo,status) VALUES ($1,$2,$3) RETURNING *`,
-      [String(name).trim(), logo || null, status || "active"]
+      [String(name).trim(), logo || null, status || "active"],
     );
     return res.status(201).json({ data: r.rows[0] });
   } catch (err) {
@@ -2554,7 +3871,7 @@ app.put("/api/online-stores/:id", authenticate, async (req, res) => {
 
     const r = await db.query(
       `UPDATE online_stores SET name=$1, logo=$2,  status=$3 WHERE id=$4 RETURNING *`,
-      [String(name).trim(), logo || null, status || "active", id]
+      [String(name).trim(), logo || null, status || "active", id],
     );
     if (r.rowCount === 0)
       return res.status(404).json({ message: "Store not found" });
@@ -2592,7 +3909,7 @@ app.patch("/api/online-stores/:id/status", authenticate, async (req, res) => {
 
     const r = await db.query(
       "UPDATE online_stores SET status = $1 WHERE id = $2 RETURNING *",
-      [status, id]
+      [status, id],
     );
     if (r.rowCount === 0)
       return res.status(404).json({ message: "Store not found" });
@@ -2631,7 +3948,7 @@ app.delete("/api/variant/:id", authenticate, async (req, res) => {
 
     const result = await db.query(
       "DELETE FROM product_variants WHERE id = $1 RETURNING product_id;",
-      [vid]
+      [vid],
     );
     if (!result.rows.length)
       return res.status(404).json({ message: "Variant not found" });
@@ -2655,7 +3972,7 @@ app.delete("/api/storeprice/:id", authenticate, async (req, res) => {
 
     const result = await db.query(
       "DELETE FROM variant_store_prices  WHERE id = $1 RETURNING variant_id;",
-      [pid]
+      [pid],
     );
     if (!result.rows.length)
       return res.status(404).json({ message: "Store price not found" });
@@ -2680,7 +3997,7 @@ app.delete("/api/storeprice/:id", authenticate, async (req, res) => {
 app.get("/api/publish/status", async (req, res) => {
   try {
     const r = await db.query(
-      "SELECT * FROM smartphone_publish  ORDER BY smartphone_id DESC"
+      "SELECT * FROM smartphone_publish  ORDER BY smartphone_id DESC",
     );
     return res.json({ publish: r.rows });
   } catch (err) {
@@ -2724,7 +4041,7 @@ app.patch("/api/products/:id/publish", authenticate, async (req, res) => {
         updated_at = now()
       RETURNING *;
       `,
-      [productId, is_published, req.user.id]
+      [productId, is_published, req.user.id],
     );
 
     return res.json({
@@ -2748,9 +4065,29 @@ app.get("/api/brands", async (req, res) => {
   try {
     const result = await db.query(`
       SELECT
+        id,
+        name,
+        logo,
+        description
+      FROM brands
+      ORDER BY name ASC
+    `);
+
+    res.json({ brands: result.rows });
+  } catch (err) {
+    console.error("GET /api/brands error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/brand", authenticate, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
         b.id,
         b.name,
         b.logo,
+        b.description,
         COUNT(pp.product_id) AS published_products
       FROM brands b
       LEFT JOIN products p
@@ -2774,20 +4111,27 @@ app.get("/api/brands", async (req, res) => {
 ------------------------*/
 app.post("/api/brands", authenticate, async (req, res) => {
   try {
-    const { name, logo, category, status } = req.body;
+    const { name, logo, category, status, description } = req.body;
     if (!name) {
       return res.status(400).json({ message: "Brand name required" });
     }
 
     const r = await db.query(
       `
-      INSERT INTO brands (name, logo, category, status)
-      VALUES ($1,$2,$3,$4)
+      INSERT INTO brands (name, logo, category, status, description)
+      VALUES ($1,$2,$3,$4,$5)
       ON CONFLICT (name) DO UPDATE
-      SET logo = EXCLUDED.logo
+      SET logo = EXCLUDED.logo,
+          description = EXCLUDED.description
       RETURNING *;
       `,
-      [name, logo || null, category || null, status || "active"]
+      [
+        name,
+        logo || null,
+        category || null,
+        status || "active",
+        description || null,
+      ],
     );
 
     res.json({ message: "Brand saved", data: r.rows[0] });
@@ -2802,12 +4146,18 @@ app.put("/api/brands/:id", authenticate, async (req, res) => {
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ message: "Invalid brand id" });
 
-    const { name, logo, category, status } = req.body;
+    const { name, logo, category, status, description } = req.body;
     const updates = [];
     const values = [];
     let idx = 1;
 
-    for (const [k, v] of Object.entries({ name, logo, category, status })) {
+    for (const [k, v] of Object.entries({
+      name,
+      logo,
+      category,
+      status,
+      description,
+    })) {
       if (v !== undefined) {
         updates.push(`${k} = $${idx++}`);
         values.push(v);
@@ -2822,7 +4172,7 @@ app.put("/api/brands/:id", authenticate, async (req, res) => {
 
     const r = await db.query(
       `UPDATE brands SET ${updates.join(", ")} WHERE id = $${idx} RETURNING *`,
-      values
+      values,
     );
 
     if (!r.rows.length) {
@@ -2943,8 +4293,561 @@ app.get(
       console.error("GET /api/reports/recent-publish-activity error:", err);
       return res.status(500).json({ error: err.message });
     }
-  }
+  },
 );
+
+// Record a product view (public)
+
+app.post("/api/public/product/:id/view", async (req, res) => {
+  const rawId = req.params.id;
+  const productId = Number(rawId);
+
+  if (!rawId || !Number.isInteger(productId) || productId <= 0) {
+    console.warn("Invalid product id in view request:", rawId);
+    return res.status(400).json({ message: "Invalid product id" });
+  }
+
+  console.log("Recording view for product id:", productId);
+  try {
+    await db.query(`INSERT INTO product_views (product_id) VALUES ($1)`, [
+      productId,
+    ]);
+    return res.json({ message: "View recorded" });
+  } catch (err) {
+    console.error("Error recording product view:", err);
+    return res.status(500).json({ message: "Failed to record view" });
+  }
+});
+
+app.get("/api/public/trending-products", async (req, res) => {
+  const result = await db.query(`
+    SELECT 
+      p.id,
+      p.name,
+      COUNT(v.id) AS views
+    FROM product_views v
+    JOIN products p ON p.id = v.product_id
+    WHERE v.viewed_at >= now() - INTERVAL '7 days'
+    GROUP BY p.id
+    ORDER BY views DESC
+    LIMIT 10;
+  `);
+
+  res.json({ trending: result.rows });
+});
+
+// Trending Smartphones (variant-based: storage)
+app.get("/api/public/trending/smartphones", async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        p.id AS product_id,
+        v.id AS variant_id,
+        p.name,
+        b.name AS brand,
+        s.model,
+
+        v.attributes->>'ram' AS ram,
+        v.attributes->>'storage' AS storage,
+        v.base_price,
+
+        -- ✅ product image
+        (
+          SELECT pi.image_url
+          FROM product_images pi
+          WHERE pi.product_id = p.id
+          ORDER BY pi.position ASC
+          LIMIT 1
+        ) AS image_url,
+
+        COUNT(pv.id) AS views
+
+      FROM product_views pv
+      INNER JOIN products p
+        ON p.id = pv.product_id
+      INNER JOIN smartphones s
+        ON s.product_id = p.id
+      INNER JOIN product_variants v
+        ON v.product_id = p.id
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+
+      WHERE p.product_type = 'smartphone'
+
+      GROUP BY
+        p.id,
+        v.id,
+        b.name,
+        s.model,
+        v.attributes,
+        v.base_price
+
+      ORDER BY views DESC
+      LIMIT 20;
+    `);
+
+    res.json({
+      success: true,
+      trending: result.rows,
+    });
+  } catch (err) {
+    console.error("Trending smartphones (variant) error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch trending smartphones",
+    });
+  }
+});
+
+// Trending Laptops
+app.get("/api/public/trending/laptops", async (req, res) => {
+  try {
+    const result = await db.query(`
+      WITH top_products AS (
+        SELECT p.id AS product_id, COUNT(v.id) AS views
+        FROM product_views v
+        JOIN products p ON p.id = v.product_id
+        WHERE v.viewed_at >= now() - INTERVAL '7 days'
+          AND p.product_type = 'laptop'
+        GROUP BY p.id
+        ORDER BY views DESC
+        LIMIT 12
+      )
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        b.name AS brand,
+        p.name AS model,
+        (
+          SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
+          FROM product_ratings r
+          WHERE r.product_id = p.id
+        ) AS rating,
+        (
+          SELECT MIN(sp.price)
+          FROM product_variants v
+          LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
+          WHERE v.product_id = p.id AND sp.price IS NOT NULL
+        ) AS price,
+        (
+          SELECT COALESCE(v.attributes->>'storage', v.attributes->>'storage_size', '')
+          FROM product_variants v
+          WHERE v.product_id = p.id
+          ORDER BY v.id ASC
+          LIMIT 1
+        ) AS storage,
+        COALESCE(pi.image_url, NULL) AS image,
+        tp.views
+      FROM top_products tp
+      JOIN products p ON p.id = tp.product_id
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN laptop l ON l.product_id = p.id
+      LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.position = 1
+      ORDER BY tp.views DESC, price ASC NULLS LAST
+      LIMIT 50;
+    `);
+
+    return res.json({ trending: result.rows });
+  } catch (err) {
+    console.error("GET /api/public/trending/laptops error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Trending Home Appliances
+app.get("/api/public/trending/appliances", async (req, res) => {
+  try {
+    const result = await db.query(`
+      WITH top_products AS (
+        SELECT p.id AS product_id, COUNT(v.id) AS views
+        FROM product_views v
+        JOIN products p ON p.id = v.product_id
+        WHERE v.viewed_at >= now() - INTERVAL '7 days'
+          AND p.product_type = 'home_appliance'
+        GROUP BY p.id
+        ORDER BY views DESC
+        LIMIT 12
+      )
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        b.name AS brand,
+        ha.model_number AS model,
+        (
+          SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
+          FROM product_ratings r
+          WHERE r.product_id = p.id
+        ) AS rating,
+        (
+          SELECT MIN(sp.price)
+          FROM product_variants v
+          LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
+          WHERE v.product_id = p.id AND sp.price IS NOT NULL
+        ) AS price,
+        COALESCE(pi.image_url, NULL) AS image,
+        tp.views
+      FROM top_products tp
+      JOIN products p ON p.id = tp.product_id
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN home_appliance ha ON ha.product_id = p.id
+      LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.position = 1
+      ORDER BY tp.views DESC, price ASC NULLS LAST
+      LIMIT 50;
+    `);
+
+    return res.json({ trending: result.rows });
+  } catch (err) {
+    console.error("GET /api/public/trending/appliances error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Trending Networking
+app.get("/api/public/trending/networking", async (req, res) => {
+  try {
+    const result = await db.query(`
+      WITH top_products AS (
+        SELECT p.id AS product_id, COUNT(v.id) AS views
+        FROM product_views v
+        JOIN products p ON p.id = v.product_id
+        WHERE v.viewed_at >= now() - INTERVAL '7 days'
+          AND p.product_type = 'networking'
+        GROUP BY p.id
+        ORDER BY views DESC
+        LIMIT 12
+      )
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        b.name AS brand,
+        n.model_number AS model,
+        (
+          SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
+          FROM product_ratings r
+          WHERE r.product_id = p.id
+        ) AS rating,
+        (
+          SELECT MIN(sp.price)
+          FROM product_variants v
+          LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
+          WHERE v.product_id = p.id AND sp.price IS NOT NULL
+        ) AS price,
+        COALESCE(pi.image_url, NULL) AS image,
+        tp.views
+      FROM top_products tp
+      JOIN products p ON p.id = tp.product_id
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN networking n ON n.product_id = p.id
+      LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.position = 1
+      ORDER BY tp.views DESC, price ASC NULLS LAST
+      LIMIT 50;
+    `);
+
+    return res.json({ trending: result.rows });
+  } catch (err) {
+    console.error("GET /api/public/trending/networking error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// New Launches - Smartphones
+app.get("/api/public/new/smartphones", async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        b.name AS brand,
+        s.model AS model,
+        s.launch_date,
+        (
+          SELECT MIN(sp.price)
+          FROM product_variants v
+          LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
+          WHERE v.product_id = p.id AND sp.price IS NOT NULL
+        ) AS price
+      FROM products p
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN smartphones s ON s.product_id = p.id
+      INNER JOIN product_publish pub ON pub.product_id = p.id AND pub.is_published = true
+      WHERE p.product_type = 'smartphone'
+      ORDER BY COALESCE(s.launch_date, p.created_at) DESC
+      LIMIT 20;
+    `);
+
+    return res.json({ new: result.rows });
+  } catch (err) {
+    console.error("GET /api/public/new/smartphones error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// New Launches - Laptops
+app.get("/api/public/new/laptops", async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        b.name AS brand,
+        l.created_at AS launch_date,
+        (
+          SELECT MIN(sp.price)
+          FROM product_variants v
+          LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
+          WHERE v.product_id = p.id AND sp.price IS NOT NULL
+        ) AS price
+      FROM products p
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN laptop l ON l.product_id = p.id
+      INNER JOIN product_publish pub ON pub.product_id = p.id AND pub.is_published = true
+      WHERE p.product_type = 'laptop'
+      ORDER BY COALESCE(l.created_at, p.created_at) DESC
+      LIMIT 20;
+    `);
+
+    return res.json({ new: result.rows });
+  } catch (err) {
+    console.error("GET /api/public/new/laptops error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// New Launches - Home Appliances
+app.get("/api/public/new/appliances", async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        b.name AS brand,
+        ha.release_year AS launch_date,
+        (
+          SELECT MIN(sp.price)
+          FROM product_variants v
+          LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
+          WHERE v.product_id = p.id AND sp.price IS NOT NULL
+        ) AS price
+      FROM products p
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN home_appliance ha ON ha.product_id = p.id
+      INNER JOIN product_publish pub ON pub.product_id = p.id AND pub.is_published = true
+      WHERE p.product_type = 'home_appliance'
+      ORDER BY COALESCE(ha.release_year::text, p.created_at::text) DESC
+      LIMIT 20;
+    `);
+
+    return res.json({ new: result.rows });
+  } catch (err) {
+    console.error("GET /api/public/new/appliances error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// New Launches - Networking
+app.get("/api/public/new/networking", async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        b.name AS brand,
+        n.created_at AS launch_date,
+        (
+          SELECT MIN(sp.price)
+          FROM product_variants v
+          LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
+          WHERE v.product_id = p.id AND sp.price IS NOT NULL
+        ) AS price
+      FROM products p
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN networking n ON n.product_id = p.id
+      INNER JOIN product_publish pub ON pub.product_id = p.id AND pub.is_published = true
+      WHERE p.product_type = 'networking'
+      ORDER BY COALESCE(n.created_at, p.created_at) DESC
+      LIMIT 20;
+    `);
+
+    return res.json({ new: result.rows });
+  } catch (err) {
+    console.error("GET /api/public/new/networking error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Trending All Types (smartphones, laptops, networking, appliances, etc.)
+app.get("/api/public/trending/all", async (req, res) => {
+  try {
+    const result = await db.query(`
+      WITH top_products AS (
+        SELECT p.id AS product_id, COUNT(v.id) AS views
+        FROM product_views v
+        JOIN products p ON p.id = v.product_id
+        WHERE v.viewed_at >= now() - INTERVAL '7 days'
+        GROUP BY p.id
+        ORDER BY views DESC
+        LIMIT 50
+      )
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        p.product_type,
+        b.name AS brand,
+        COALESCE(s.model, ha.model_number, n.model_number, p.name) AS model,
+        (
+          SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
+          FROM product_ratings r
+          WHERE r.product_id = p.id
+        ) AS rating,
+        (
+          SELECT MIN(sp.price)
+          FROM product_variants v
+          LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
+          WHERE v.product_id = p.id AND sp.price IS NOT NULL
+        ) AS price,
+        tp.views
+      FROM top_products tp
+      JOIN products p ON p.id = tp.product_id
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN smartphones s ON s.product_id = p.id
+      LEFT JOIN home_appliance ha ON ha.product_id = p.id
+      LEFT JOIN networking n ON n.product_id = p.id
+      ORDER BY tp.views DESC, price ASC NULLS LAST;
+    `);
+
+    return res.json({ trending: result.rows });
+  } catch (err) {
+    console.error("GET /api/public/trending/all error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/public/trending/smartphones", async (req, res) => {
+  const result = await db.query(`
+    SELECT
+      p.id,
+      p.name,
+      p.slug,
+      b.name AS brand,
+      COUNT(v.id) AS views,
+      s.display_size,
+      s.processor,
+      (
+        SELECT MIN(price)
+        FROM product_variants pv
+        WHERE pv.product_id = p.id
+      ) AS starting_price
+    FROM product_views v
+    JOIN products p ON p.id = v.product_id
+    JOIN smartphones s ON s.product_id = p.id
+    LEFT JOIN brands b ON b.id = p.brand_id
+    WHERE
+      p.product_type = 'smartphone'
+      AND v.viewed_at >= NOW() - INTERVAL '7 days'
+    GROUP BY p.id, s.id, b.name
+    ORDER BY views DESC
+    LIMIT 10;
+  `);
+
+  res.json(result.rows);
+});
+
+app.post("/api/public/compare", async (req, res) => {
+  try {
+    // Support two payload shapes:
+    // 1) { products: [1,2,3] } -> record pairwise comparisons (existing behavior)
+    // 2) { left_product_id: 1, right_product_id: 2, product_type: 'smartphone' }
+    const body = req.body || {};
+    console.log("Comparison payload:", body);
+
+    if (body.left_product_id && body.right_product_id) {
+      const left = Number(body.left_product_id);
+      const right = Number(body.right_product_id);
+      if (
+        !Number.isInteger(left) ||
+        !Number.isInteger(right) ||
+        left <= 0 ||
+        right <= 0
+      ) {
+        return res.status(400).json({ message: "Invalid product ids" });
+      }
+
+      // normalize order so A vs B == B vs A
+      const [l, r] = [left, right].sort((a, b) => a - b);
+
+      try {
+        await db.query(
+          `INSERT INTO product_comparisons (product_id, compared_with)
+           VALUES ($1, $2)`,
+          [l, r],
+        );
+        return res.json({ message: "Comparison recorded" });
+      } catch (err) {
+        console.error("POST /api/public/compare insert failed:", err);
+        return res.status(500).json({ message: "Failed to record comparison" });
+      }
+    }
+
+    // Backwards-compatible: accept { products: [1,2,3...] }
+    const raw = Array.isArray(body.products) ? body.products : [];
+    // sanitize and normalize product ids
+    const nums = raw
+      .map((n) => Number(n))
+      .filter((n) => Number.isInteger(n) && n > 0);
+    const unique = Array.from(new Set(nums));
+
+    if (unique.length < 2 || unique.length > 4) {
+      return res.status(400).json({
+        message: "Select minimum 2 and maximum 4 valid products",
+      });
+    }
+
+    for (let i = 0; i < unique.length; i++) {
+      for (let j = i + 1; j < unique.length; j++) {
+        await db.query(
+          `INSERT INTO product_comparisons (product_id, compared_with)
+           VALUES ($1, $2)`,
+          [unique[i], unique[j]],
+        );
+      }
+    }
+
+    return res.json({ message: "Comparison recorded" });
+  } catch (err) {
+    console.error("POST /api/public/compare error:", err);
+    return res.status(500).json({ message: "Failed to record comparison" });
+  }
+});
+
+app.get("/api/public/trending/most-compared", async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        p1.id AS product_id,
+        p1.name AS product_name,
+        p2.id AS compared_product_id,
+        p2.name AS compared_product_name,
+        COUNT(pc.id) AS compare_count
+      FROM product_comparisons pc
+      JOIN products p1 ON p1.id = pc.product_id
+      JOIN products p2 ON p2.id = pc.compared_with
+      WHERE pc.compared_at >= now() - INTERVAL '7 days'
+      GROUP BY p1.id, p1.name, p2.id, p2.name
+      ORDER BY compare_count DESC
+      LIMIT 10;
+    `);
+
+    res.json({
+      mostCompared: result.rows,
+    });
+  } catch (err) {
+    console.error("Most compared error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 // Get variants for a smartphone
 app.get("/api/smartphone/:id/variants", async (req, res) => {
@@ -2954,14 +4857,14 @@ app.get("/api/smartphone/:id/variants", async (req, res) => {
     // Resolve product_id from smartphone id then fetch product_variants
     const sres = await db.query(
       "SELECT product_id FROM smartphones WHERE id = $1",
-      [sid]
+      [sid],
     );
     if (!sres.rows.length)
       return res.status(404).json({ message: "Smartphone not found" });
     const productId = sres.rows[0].product_id;
     const r = await db.query(
       "SELECT * FROM product_variants WHERE product_id = $1 ORDER BY id ASC",
-      [productId]
+      [productId],
     );
     return res.json(r.rows);
   } catch (err) {
@@ -2977,7 +4880,7 @@ app.get("/api/variant/:id/store-prices", async (req, res) => {
     if (!vid) return res.status(400).json({ message: "Invalid id" });
     const r = await db.query(
       "SELECT * FROM variant_store_prices  WHERE variant_id = $1 ORDER BY id ASC",
-      [vid]
+      [vid],
     );
     return res.json(r.rows);
   } catch (err) {
@@ -2986,8 +4889,85 @@ app.get("/api/variant/:id/store-prices", async (req, res) => {
   }
 });
 
+// PUBLIC: Get smartphone/product details by ID (no auth required)
+app.get("/api/public/product/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid id" });
+
+    console.log(`Fetching public product ${id}`);
+
+    // Fetch product with all details
+    const pRes = await db.query(
+      `SELECT p.id, p.name, p.product_type, b.name AS brand, b.id AS brand_id
+       FROM products p
+       LEFT JOIN brands b ON b.id = p.brand_id
+       WHERE p.id = $1 LIMIT 1`,
+      [id],
+    );
+
+    if (!pRes.rows.length) {
+      console.log(`Product ${id} not found`);
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    const product = pRes.rows[0];
+
+    // Fetch product images
+    const imgRes = await db.query(
+      `SELECT image_url FROM product_images WHERE product_id = $1 ORDER BY position ASC`,
+      [id],
+    );
+
+    // Fetch product variants
+    const varRes = await db.query(
+      `SELECT id, variant_key, attributes->>'ram' AS ram, attributes->>'storage' AS storage, base_price
+       FROM product_variants WHERE product_id = $1 ORDER BY id ASC`,
+      [id],
+    );
+
+    // For smartphones, fetch smartphone details
+    let smartphoneDetails = null;
+    if (product.product_type === "smartphone") {
+      const smRes = await db.query(
+        `SELECT * FROM smartphones WHERE product_id = $1 LIMIT 1`,
+        [id],
+      );
+      if (smRes.rows.length) {
+        smartphoneDetails = smRes.rows[0];
+      }
+    }
+
+    // Merge all into a single flat object for compatibility with mapSingle
+    const computedSlug = product.name
+      ? String(product.name)
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/(^-|-$)/g, "")
+      : `product-${product.id}`;
+
+    const responseData = {
+      id: product.id,
+      name: product.name,
+      slug: computedSlug,
+      product_type: product.product_type,
+      brand: product.brand,
+      brand_id: product.brand_id,
+      images: imgRes.rows.map((r) => r.image_url),
+      variants: varRes,
+      ...smartphoneDetails,
+      // Include the smartphone object as well for backward compatibility
+      smartphone: smartphoneDetails,
+    };
+
+    res.json(responseData);
+  } catch (err) {
+    console.error("GET /api/public/product/:id error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Simple global search endpoint with suggestions
-// In your server routes (e.g., server.js or routes/search.js)
 app.get("/api/search", async (req, res) => {
   try {
     const q = (req.query.q || "").trim();
@@ -2995,31 +4975,21 @@ app.get("/api/search", async (req, res) => {
 
     const term = `%${q}%`;
 
-    // Search products by name, model, and brand with image
+    // Search products by name and brand with image (simplified query)
     const products = await db.query(
-      `SELECT 
+      `SELECT DISTINCT
         p.id, 
         p.name, 
         p.product_type,
         b.name AS brand_name,
-        pi.image_url
+        (SELECT image_url FROM product_images WHERE product_id = p.id AND position = 1 LIMIT 1) AS image_url
        FROM products p
        LEFT JOIN brands b ON b.id = p.brand_id
-       LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
        WHERE p.name ILIKE $1 
           OR b.name ILIKE $1
-          OR EXISTS (
-            SELECT 1 FROM smartphones s 
-            WHERE s.product_id = p.id AND s.model ILIKE $1
-          )
-          OR EXISTS (
-            SELECT 1 FROM home_appliances ha 
-            WHERE ha.product_id = p.id AND ha.model_number ILIKE $1
-          )
-       GROUP BY p.id, p.name, p.product_type, b.name, pi.image_url
        ORDER BY p.name ASC
        LIMIT 10`,
-      [term]
+      [term],
     );
 
     // Search brands only
@@ -3028,7 +4998,7 @@ app.get("/api/search", async (req, res) => {
        WHERE name ILIKE $1
        ORDER BY name ASC
        LIMIT 6`,
-      [term]
+      [term],
     );
 
     const results = [];
@@ -3048,10 +5018,10 @@ app.get("/api/search", async (req, res) => {
     // Add brands to results (avoid duplicates)
     for (const b of brands.rows) {
       const brandExists = results.some(
-        (item) => item.type === "brand" && item.name === b.name
+        (item) => item.type === "brand" && item.name === b.name,
       );
       const productExists = results.some(
-        (item) => item.type === "product" && item.brand_name === b.name
+        (item) => item.type === "product" && item.brand_name === b.name,
       );
 
       if (!brandExists && !productExists) {
@@ -3070,6 +5040,148 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
+// Wishlist
+app.post("/api/wishlist", authenticateCustomer, async (req, res) => {
+  const customerId = req.customer.id;
+  const { product_id } = req.body;
+
+  console.log(
+    `Customer ${customerId} adding product ${product_id} to wishlist`,
+  );
+
+  if (!product_id) {
+    return res.status(400).json({ message: "Product id required" });
+  }
+
+  try {
+    await db.query(
+      `
+      INSERT INTO wishlist (customer_id, product_id)
+      VALUES ($1, $2)
+      ON CONFLICT (customer_id, product_id) DO NOTHING
+      `,
+      [customerId, product_id],
+    );
+
+    // Return the newly added wishlist item with product summary so client can append it
+    const result = await db.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name,
+        p.product_type,
+        b.name AS brand_name,
+        COALESCE(
+          (
+            SELECT json_agg(pi.image_url)
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+          ),
+          '[]'::json
+        ) AS images,
+        (
+          SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
+          FROM product_ratings r
+          WHERE r.product_id = p.id
+        ) AS rating,
+        (
+          SELECT MIN(v.base_price)
+          FROM product_variants v
+          WHERE v.product_id = p.id
+        ) AS base_price
+      FROM products p
+      LEFT JOIN brands b ON b.id = p.brand_id
+      WHERE p.id = $1
+      `,
+      [product_id],
+    );
+
+    const item = result.rows[0] || { product_id: product_id };
+    res.json({ item });
+  } catch (err) {
+    console.error("POST /api/wishlist error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete(
+  "/api/wishlist/:productId",
+  authenticateCustomer,
+  async (req, res) => {
+    const customerId = req.customer.id;
+    const productId = Number(req.params.productId);
+
+    await db.query(
+      `
+      DELETE FROM wishlist
+      WHERE customer_id = $1
+        AND product_id = $2
+      `,
+      [customerId, productId],
+    );
+
+    res.json({ message: "Removed from wishlist" });
+  },
+);
+
+app.get("/api/wishlist", authenticateCustomer, async (req, res) => {
+  const customerId = req.customer.id;
+
+  const result = await db.query(
+    `
+    SELECT
+      p.id AS product_id,
+      p.name,
+      p.product_type,
+      b.name AS brand_name,
+
+      /* Images */
+      COALESCE(
+        (
+          SELECT json_agg(pi.image_url)
+          FROM product_images pi
+          WHERE pi.product_id = p.id
+        ),
+        '[]'::json
+      ) AS images,
+
+      /* Rating */
+      (
+        SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
+        FROM product_ratings r
+        WHERE r.product_id = p.id
+      ) AS rating,
+
+      /* When was this item added to wishlist (latest) */
+      MAX(w.created_at) AS added_at,
+
+      /* Variants */
+      COALESCE(
+        json_agg(
+          DISTINCT jsonb_build_object(
+            'variant_id', v.id,
+            'variant_key', v.variant_key,
+            'base_price', v.base_price
+          )
+        ) FILTER (WHERE v.id IS NOT NULL),
+        '[]'::json
+      ) AS variants
+
+    FROM wishlist w
+    JOIN products p ON p.id = w.product_id
+    LEFT JOIN brands b ON b.id = p.brand_id
+    LEFT JOIN product_variants v ON v.product_id = p.id
+
+    WHERE w.customer_id = $1
+    GROUP BY p.id, b.name
+    ORDER BY added_at DESC;
+  `,
+    [customerId],
+  );
+
+  res.json({ wishlist: result.rows });
+});
+
 /* -----------------------
   Start server
 ------------------------*/
@@ -3079,7 +5191,7 @@ async function start() {
     try {
       await db.waitForConnection(
         Number(process.env.DB_CONN_RETRIES) || 5,
-        Number(process.env.DB_CONN_RETRY_DELAY_MS) || 5000
+        Number(process.env.DB_CONN_RETRY_DELAY_MS) || 5000,
       );
     } catch (err) {
       console.error("DB not reachable after retries:", err);
