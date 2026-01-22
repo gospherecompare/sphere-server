@@ -5204,7 +5204,7 @@ async function start() {
     process.exit(1);
   }
 
-  app.listen(PORT, async () => {
+  app.listen(PORT,'127.0.0.1', async () => {
     console.log(`🚀 Server running at http://localhost:${PORT}`);
     try {
       const r = await db.query("SELECT now()");
