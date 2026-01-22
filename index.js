@@ -1031,7 +1031,7 @@ app.put("/api/auth/update-profile", authenticateCustomer, async (req, res) => {
 
 /* ---- CHANGE Password ---- */
 app.post(
-  "/api/auth/change-password",
+  "/api/change-password",
   authenticateCustomer,
   async (req, res) => {
     try {
