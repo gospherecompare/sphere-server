@@ -22,7 +22,11 @@ app.set("trust proxy", 1);
 
 app.use(
   cors({
-    origin: ["http://localhost:3000", "http://localhost:5173","https://main.d2jgd4xy0rohx4.amplifyapp.com"],
+    origin: [
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "https://main.d2jgd4xy0rohx4.amplifyapp.com",
+    ],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
@@ -179,10 +183,17 @@ async function runMigrations() {
       CREATE TABLE IF NOT EXISTS categories (
         id SERIAL PRIMARY KEY,
         name TEXT UNIQUE NOT NULL,
-        product_type TEXT UNIQUE,
+        product_type TEXT,
         description TEXT,
         created_at TIMESTAMP DEFAULT now()
       );
+    `);
+
+    // Ensure there is no unique constraint on product_type (allow multiple
+    // categories per product type). Drop the constraint if it exists.
+    await safeQuery(`
+      ALTER TABLE categories
+      DROP CONSTRAINT IF EXISTS categories_product_type_key;
     `);
 
     // online_stores - stores used for variant store prices and links
@@ -382,19 +393,7 @@ async function runMigrations() {
     // Ensure legacy `long` column is renamed to `product_type` if present,
     // then create the table with `product_type` column.
     await safeQuery(`
-      DO $$
-      BEGIN
-        IF EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'ram_storage_long' AND column_name = 'long'
-        ) AND NOT EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'ram_storage_long' AND column_name = 'product_type'
-        ) THEN
-          ALTER TABLE ram_storage_long RENAME COLUMN "long" TO product_type;
-        END IF;
-      END
-      $$;
+      
 
       CREATE TABLE IF NOT EXISTS ram_storage_long (
         id SERIAL PRIMARY KEY,
@@ -1046,81 +1045,75 @@ app.put("/api/auth/update-profile", authenticateCustomer, async (req, res) => {
 });
 
 /* ---- CHANGE Password ---- */
-app.post(
-  "/api/change-password",
-  authenticateCustomer,
-  async (req, res) => {
-    try {
-      const customerId = req.customer.id;
-      const { currentPassword, newPassword } = req.body;
+app.post("/api/change-password", authenticateCustomer, async (req, res) => {
+  try {
+    const customerId = req.customer.id;
+    const { currentPassword, newPassword } = req.body;
 
-      // Validate inputs
-      if (!currentPassword || !newPassword) {
-        return res.status(400).json({
-          message: "Current password and new password are required",
-        });
-      }
-
-      // Validate new password strength
-      const passwordRegex =
-        /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
-      if (!passwordRegex.test(newPassword)) {
-        return res.status(400).json({
-          message:
-            "New password must be at least 8 characters with uppercase, lowercase, number, and special character",
-        });
-      }
-
-      // Fetch customer
-      const customerResult = await db.query(
-        "SELECT password FROM customers WHERE id = $1",
-        [customerId],
-      );
-
-      if (!customerResult.rows.length) {
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      const customer = customerResult.rows[0];
-
-      // Verify current password
-      const passwordMatch = await bcrypt.compare(
-        currentPassword,
-        customer.password,
-      );
-
-      if (!passwordMatch) {
-        return res
-          .status(401)
-          .json({ message: "Current password is incorrect" });
-      }
-
-      // Check if new password is same as current
-      const samePassword = await bcrypt.compare(newPassword, customer.password);
-      if (samePassword) {
-        return res.status(400).json({
-          message: "New password must be different from current password",
-        });
-      }
-
-      // Hash new password
-      const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-      // Update password
-      await db.query("UPDATE customers SET password = $1 WHERE id = $2", [
-        hashedPassword,
-        customerId,
-      ]);
-
-      res.json({
-        message: "Password changed successfully",
+    // Validate inputs
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        message: "Current password and new password are required",
       });
-    } catch (err) {
-      console.error("Change password error:", err);
-      res.status(500).json({ error: err.message });
     }
-  },
-);
+
+    // Validate new password strength
+    const passwordRegex =
+      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
+    if (!passwordRegex.test(newPassword)) {
+      return res.status(400).json({
+        message:
+          "New password must be at least 8 characters with uppercase, lowercase, number, and special character",
+      });
+    }
+
+    // Fetch customer
+    const customerResult = await db.query(
+      "SELECT password FROM customers WHERE id = $1",
+      [customerId],
+    );
+
+    if (!customerResult.rows.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const customer = customerResult.rows[0];
+
+    // Verify current password
+    const passwordMatch = await bcrypt.compare(
+      currentPassword,
+      customer.password,
+    );
+
+    if (!passwordMatch) {
+      return res.status(401).json({ message: "Current password is incorrect" });
+    }
+
+    // Check if new password is same as current
+    const samePassword = await bcrypt.compare(newPassword, customer.password);
+    if (samePassword) {
+      return res.status(400).json({
+        message: "New password must be different from current password",
+      });
+    }
+
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update password
+    await db.query("UPDATE customers SET password = $1 WHERE id = $2", [
+      hashedPassword,
+      customerId,
+    ]);
+
+    res.json({
+      message: "Password changed successfully",
+    });
+  } catch (err) {
+    console.error("Change password error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /*--- ADMIN Customer Management ---*/
 app.get("/api/admin/customers", authenticate, async (req, res) => {
@@ -3625,9 +3618,13 @@ app.post("/api/ram-storage-config", authenticate, async (req, res) => {
   console.log(req.body);
   try {
     const { ram, storage } = req.body;
-    // accept multiple possible keys from client: 'long', 'long_term_storage', or 'description'
-    const long_term_storage =
-      req.body.long || req.body.long_term_storage || req.body.description || "";
+    // accept multiple possible keys from client: 'product_type', 'long', or 'description'
+    const product_type =
+      req.body.product_type ||
+      req.body.long ||
+      req.body.long_term_storage ||
+      req.body.description ||
+      null;
 
     if (!ram || !storage) {
       return res.status(400).json({ message: "ram and storage are required" });
@@ -3635,7 +3632,7 @@ app.post("/api/ram-storage-config", authenticate, async (req, res) => {
 
     const ramVal = String(ram).trim();
     const storageVal = String(storage).trim();
-    const longVal = String(long_term_storage).trim();
+    const productTypeVal = product_type ? String(product_type).trim() : null;
 
     // Check if the same ram+storage combination already exists
     const exists = await db.query(
@@ -3650,8 +3647,8 @@ app.post("/api/ram-storage-config", authenticate, async (req, res) => {
     }
 
     const r = await db.query(
-      `INSERT INTO ram_storage_long (ram, storage, long) VALUES ($1, $2, $3) RETURNING *`,
-      [ramVal, storageVal, longVal],
+      `INSERT INTO ram_storage_long (ram, storage, product_type) VALUES ($1, $2, $3) RETURNING *`,
+      [ramVal, storageVal, productTypeVal],
     );
 
     return res.status(201).json({ message: "Spec created", data: r.rows[0] });
@@ -3669,8 +3666,12 @@ app.put("/api/ram-storage-config/:id", authenticate, async (req, res) => {
       return res.status(400).json({ message: "Invalid id" });
 
     const { ram, storage } = req.body;
-    const long_term_storage =
-      req.body.long || req.body.long_term_storage || req.body.description || "";
+    const product_type =
+      req.body.product_type ||
+      req.body.long ||
+      req.body.long_term_storage ||
+      req.body.description ||
+      null;
 
     if (!ram || !storage) {
       return res.status(400).json({ message: "ram and storage are required" });
@@ -3678,7 +3679,7 @@ app.put("/api/ram-storage-config/:id", authenticate, async (req, res) => {
 
     const ramVal = String(ram).trim();
     const storageVal = String(storage).trim();
-    const longVal = String(long_term_storage).trim();
+    const productTypeVal = product_type ? String(product_type).trim() : null;
 
     // Check duplicate combination on other rows
     const dup = await db.query(
@@ -3693,8 +3694,8 @@ app.put("/api/ram-storage-config/:id", authenticate, async (req, res) => {
     }
 
     const result = await db.query(
-      `UPDATE ram_storage_long SET ram = $1, storage = $2, long = $3 WHERE id = $4 RETURNING *`,
-      [ramVal, storageVal, longVal, id],
+      `UPDATE ram_storage_long SET ram = $1, storage = $2, product_type = $3 WHERE id = $4 RETURNING *`,
+      [ramVal, storageVal, productTypeVal, id],
     );
 
     if (result.rowCount === 0)
@@ -3761,9 +3762,11 @@ app.post("/api/categories", authenticate, async (req, res) => {
     const typeVal = type ? String(type).trim() : null;
     const descVal = description ? String(description).trim() : null;
 
+    // Only treat duplicate by name (case-insensitive). Multiple categories
+    // can share the same product_type.
     const exists = await db.query(
-      "SELECT id FROM categories WHERE name = $1 OR product_type = $2 LIMIT 1",
-      [nameVal, typeVal],
+      "SELECT id FROM categories WHERE LOWER(name) = LOWER($1) LIMIT 1",
+      [nameVal],
     );
     if (exists.rows.length > 0)
       return res.status(409).json({ message: "Category already exists" });
@@ -3792,9 +3795,10 @@ app.put("/api/categories/:id", authenticate, async (req, res) => {
     const typeVal = type ? String(type).trim() : null;
     const descVal = description ? String(description).trim() : null;
 
+    // Only check for another category with the same name (case-insensitive)
     const dup = await db.query(
-      "SELECT id FROM categories WHERE (name = $1 OR product_type = $2) AND id <> $3 LIMIT 1",
-      [nameVal, typeVal, id],
+      "SELECT id FROM categories WHERE LOWER(name) = LOWER($1) AND id <> $2 LIMIT 1",
+      [nameVal, id],
     );
     if (dup.rows.length > 0)
       return res
@@ -5295,7 +5299,7 @@ async function start() {
     process.exit(1);
   }
 
-  app.listen(PORT,'127.0.0.1', async () => {
+  app.listen(PORT, "127.0.0.1", async () => {
     console.log(`🚀 Server running at http://localhost:${PORT}`);
     try {
       const r = await db.query("SELECT now()");
