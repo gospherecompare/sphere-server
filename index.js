@@ -379,12 +379,28 @@ async function runMigrations() {
       `);
 
     // 12) ram_storage_long
+    // Ensure legacy `long` column is renamed to `product_type` if present,
+    // then create the table with `product_type` column.
     await safeQuery(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'ram_storage_long' AND column_name = 'long'
+        ) AND NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'ram_storage_long' AND column_name = 'product_type'
+        ) THEN
+          ALTER TABLE ram_storage_long RENAME COLUMN "long" TO product_type;
+        END IF;
+      END
+      $$;
+
       CREATE TABLE IF NOT EXISTS ram_storage_long (
         id SERIAL PRIMARY KEY,
         ram TEXT,
         storage TEXT,
-        long TEXT, --- add type here later
+        product_type TEXT,
         created_at TIMESTAMP DEFAULT now()
       );
     `);
@@ -5185,6 +5201,81 @@ app.get("/api/wishlist", authenticateCustomer, async (req, res) => {
 /* -----------------------
   Start server
 ------------------------*/
+/* -----------------------
+  RAM & Storage Config API
+------------------------*/
+// List configs
+app.get("/api/ram-storage-config", authenticate, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, ram, storage, product_type, created_at FROM ram_storage_long ORDER BY id DESC`,
+    );
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("Get ram-storage-config error:", err);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// Create config
+app.post("/api/ram-storage-config", authenticate, async (req, res) => {
+  try {
+    const { ram, storage } = req.body || {};
+    const product_type = req.body.product_type || req.body.long || null;
+
+    if (!ram || !storage) {
+      return res.status(400).json({ message: "ram and storage are required" });
+    }
+
+    const result = await db.query(
+      `INSERT INTO ram_storage_long (ram, storage, product_type) VALUES ($1,$2,$3) RETURNING id, ram, storage, product_type, created_at`,
+      [ram, storage, product_type],
+    );
+
+    return res.status(201).json({ data: result.rows[0] });
+  } catch (err) {
+    console.error("Create ram-storage-config error:", err);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// Update config
+app.put("/api/ram-storage-config/:id", authenticate, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { ram, storage } = req.body || {};
+    const product_type = req.body.product_type || req.body.long || null;
+
+    const existing = await db.query(
+      `SELECT id FROM ram_storage_long WHERE id = $1`,
+      [id],
+    );
+    if (!existing.rows.length)
+      return res.status(404).json({ message: "Not found" });
+
+    const result = await db.query(
+      `UPDATE ram_storage_long SET ram = $1, storage = $2, product_type = $3 WHERE id = $4 RETURNING id, ram, storage, product_type, created_at`,
+      [ram || null, storage || null, product_type, id],
+    );
+
+    return res.json({ data: result.rows[0] });
+  } catch (err) {
+    console.error("Update ram-storage-config error:", err);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// Delete config
+app.delete("/api/ram-storage-config/:id", authenticate, async (req, res) => {
+  try {
+    const id = req.params.id;
+    await db.query(`DELETE FROM ram_storage_long WHERE id = $1`, [id]);
+    return res.json({ message: "Deleted" });
+  } catch (err) {
+    console.error("Delete ram-storage-config error:", err);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+});
 async function start() {
   try {
     // Wait for DB to be reachable before running migrations
