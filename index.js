@@ -22,7 +22,7 @@ app.set("trust proxy", 1);
 
 app.use(
   cors({
-    origin: ["http://localhost:3000", "http://localhost:5173"],
+    origin: ["http://localhost:3000", "http://localhost:5173","https://main.d2jgd4xy0rohx4.amplifyapp.com"],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
@@ -1047,7 +1047,7 @@ app.put("/api/auth/update-profile", authenticateCustomer, async (req, res) => {
 
 /* ---- CHANGE Password ---- */
 app.post(
-  "/api/auth/change-password",
+  "/api/change-password",
   authenticateCustomer,
   async (req, res) => {
     try {
@@ -5295,7 +5295,7 @@ async function start() {
     process.exit(1);
   }
 
-  app.listen(PORT, async () => {
+  app.listen(PORT,'127.0.0.1', async () => {
     console.log(`🚀 Server running at http://localhost:${PORT}`);
     try {
       const r = await db.query("SELECT now()");
