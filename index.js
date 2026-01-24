@@ -4077,6 +4077,7 @@ app.patch("/api/products/:id/publish", authenticate, async (req, res) => {
 /* -----------------------
   CSV / XLSX Export & Import -  
 ------------------------*/
+// Mount import routers
 // Export (CSV) - authenticated
 /* -----------------------
   Brands (categories)
@@ -5280,6 +5281,12 @@ app.delete("/api/ram-storage-config/:id", authenticate, async (req, res) => {
     return res.status(500).json({ message: "Internal server error" });
   }
 });
+
+const importSmartphonesRouter = require("./routes/importSmartphones");
+const importLaptopsRouter = require("./routes/importLaptop");
+app.use("/api/import", authenticate, importSmartphonesRouter);
+app.use("/api/import", authenticate, importLaptopsRouter);
+
 async function start() {
   try {
     // Wait for DB to be reachable before running migrations
