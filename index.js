@@ -270,13 +270,36 @@ async function runMigrations() {
         performance JSONB,
         camera JSONB,
         battery JSONB,
-        connectivity_network JSONB,
+        connectivity JSONB,
+        network JSONB,
         ports JSONB,
         audio JSONB,
         multimedia JSONB,
         sensors JSONB,
         created_at TIMESTAMP DEFAULT now()
       );
+    `);
+
+    // Ensure new `connectivity` and `network` columns exist for existing installations
+    await safeQuery(
+      `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS connectivity JSONB;`,
+    );
+    await safeQuery(
+      `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS network JSONB;`,
+    );
+
+    // If older `connectivity_network` column exists, copy its data into `connectivity` (preserve existing connectivity)
+    await safeQuery(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name='smartphones' AND column_name='connectivity_network'
+        ) THEN
+          UPDATE smartphones SET connectivity = connectivity_network WHERE connectivity IS NULL;
+          -- optionally preserve the original column; no drop performed automatically
+        END IF;
+      END$$;
     `);
 
     // 6) smartphone_variants (depends on smartphones)
@@ -314,6 +337,27 @@ async function runMigrations() {
         created_at TIMESTAMP DEFAULT now()
       );
     `);
+
+    await safeQuery(
+      `CREATE TABLE IF NOT EXISTS product_sphere_ratings (
+        id SERIAL PRIMARY KEY,
+        product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+      
+        design JSONB,
+        display JSONB,
+        performance JSONB,
+        camera JSONB,
+        battery JSONB,
+        connectivity JSONB,
+        network JSONB,
+      
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      
+        UNIQUE(product_id)
+      );
+      `,
+    );
 
     // 9) smartphone_ratings (depends on smartphones and Customers)
 
@@ -1518,13 +1562,13 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
       INSERT INTO smartphones (
         product_id, category, brand, model, launch_date,
         images, colors, build_design, display, performance,
-        camera, battery, connectivity_network,
+        camera, battery, connectivity, network,
         ports, audio, multimedia, sensors
       )
       VALUES (
         $1,$2,$3,$4,$5,
         $6,$7,$8,$9,$10,
-        $11,$12,$13,$14,$15,$16,$17
+        $11,$12,$13,$14,$15,$16,$17,$18
       )
       RETURNING id
       `,
@@ -1541,7 +1585,8 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
         JSON.stringify(smartphone.performance || {}),
         JSON.stringify(smartphone.camera || {}),
         JSON.stringify(smartphone.battery || {}),
-        JSON.stringify(smartphone.connectivity_network || {}),
+        JSON.stringify(smartphone.connectivity || {}),
+        JSON.stringify(smartphone.network || {}),
         JSON.stringify(smartphone.ports || {}),
         JSON.stringify(smartphone.audio || {}),
         JSON.stringify(smartphone.multimedia || {}),
@@ -1553,6 +1598,40 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
     );
 
     const smartphoneId = smartphoneRes.rows[0].id;
+
+    // ---------- 2.b UPSERT SPHERE RATINGS (per-section JSON objects) ----------
+    try {
+      const upsertRes = await client.query(
+        `INSERT INTO product_sphere_ratings
+          (product_id, design, display, performance, camera, battery, connectivity, network)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (product_id) DO UPDATE SET
+           design = EXCLUDED.design,
+           display = EXCLUDED.display,
+           performance = EXCLUDED.performance,
+           camera = EXCLUDED.camera,
+           battery = EXCLUDED.battery,
+           connectivity = EXCLUDED.connectivity,
+           network = EXCLUDED.network,
+           updated_at = CURRENT_TIMESTAMP
+        `,
+        [
+          productId,
+          JSON.stringify(smartphone.build_design?.sphere_rating || null),
+          JSON.stringify(smartphone.display?.sphere_rating || null),
+          JSON.stringify(smartphone.performance?.sphere_rating || null),
+          JSON.stringify(smartphone.camera?.sphere_rating || null),
+          JSON.stringify(smartphone.battery?.sphere_rating || null),
+          JSON.stringify(smartphone.connectivity?.sphere_rating || null),
+          JSON.stringify(smartphone.network?.sphere_rating || null),
+        ],
+      );
+    } catch (esr) {
+      console.error(
+        "Sphere ratings upsert error (create):",
+        esr.message || esr,
+      );
+    }
 
     /* ---------- 3. INSERT PRODUCT IMAGES ---------- */
     for (let i = 0; i < images.length; i++) {
@@ -1701,7 +1780,8 @@ app.get("/api/smartphones", async (req, res) => {
         s.performance,
         s.camera,
         s.battery,
-        s.connectivity_network,
+        s.connectivity,
+        s.network,
         s.ports,
         s.audio,
         s.multimedia,
@@ -1776,7 +1856,7 @@ app.get("/api/smartphones", async (req, res) => {
         p.id, b.name,
         s.category, s.model, s.launch_date,
         s.colors, s.build_design, s.display, s.performance,
-        s.camera, s.battery, s.connectivity_network,
+        s.camera, s.battery, s.connectivity, s.network,
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at
 
       ORDER BY p.id DESC;
@@ -1809,7 +1889,8 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         s.performance,
         s.camera,
         s.battery,
-        s.connectivity_network,
+        s.connectivity,
+        s.network,
         s.ports,
         s.audio,
         s.multimedia,
@@ -1878,7 +1959,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         p.id, b.name,
         s.category, s.model, s.launch_date,
         s.colors, s.build_design, s.display, s.performance,
-        s.camera, s.battery, s.connectivity_network,
+        s.camera, s.battery, s.connectivity, s.network,
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at, pub.is_published
 
       ORDER BY p.id DESC;
@@ -2992,9 +3073,9 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       UPDATE smartphones SET
         category=$1, brand=$2, model=$3, launch_date=$4,
         images=$5, colors=$6, build_design=$7, display=$8, performance=$9,
-        camera=$10, battery=$11, connectivity_network=$12, ports=$13,
-        audio=$14, multimedia=$15, sensors=$16
-      WHERE id=$17
+        camera=$10, battery=$11, connectivity=$12, network=$13, ports=$14,
+        audio=$15, multimedia=$16, sensors=$17
+      WHERE id=$18
       RETURNING *;
     `;
 
@@ -3010,7 +3091,8 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       JSON.stringify(req.body.performance || {}),
       JSON.stringify(req.body.camera || {}),
       JSON.stringify(req.body.battery || {}),
-      JSON.stringify(req.body.connectivity_network || {}),
+      JSON.stringify(req.body.connectivity || {}),
+      JSON.stringify(req.body.network || {}),
       JSON.stringify(req.body.ports || {}),
       JSON.stringify(req.body.audio || {}),
       JSON.stringify(req.body.multimedia || {}),
@@ -3211,6 +3293,43 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       }
     }
 
+    // ---------- UPDATE SPHERE RATINGS (if provided in request body) ----------
+    try {
+      const productId = phoneRes.rows[0].product_id || null;
+      if (productId) {
+        await client.query(
+          `INSERT INTO product_sphere_ratings
+            (product_id, design, display, performance, camera, battery, connectivity, network)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           ON CONFLICT (product_id) DO UPDATE SET
+             design = COALESCE(EXCLUDED.design, product_sphere_ratings.design),
+             display = COALESCE(EXCLUDED.display, product_sphere_ratings.display),
+             performance = COALESCE(EXCLUDED.performance, product_sphere_ratings.performance),
+             camera = COALESCE(EXCLUDED.camera, product_sphere_ratings.camera),
+             battery = COALESCE(EXCLUDED.battery, product_sphere_ratings.battery),
+             connectivity = COALESCE(EXCLUDED.connectivity, product_sphere_ratings.connectivity),
+             network = COALESCE(EXCLUDED.network, product_sphere_ratings.network),
+             updated_at = CURRENT_TIMESTAMP
+          `,
+          [
+            productId,
+            JSON.stringify(req.body.build_design?.sphere_rating || null),
+            JSON.stringify(req.body.display?.sphere_rating || null),
+            JSON.stringify(req.body.performance?.sphere_rating || null),
+            JSON.stringify(req.body.camera?.sphere_rating || null),
+            JSON.stringify(req.body.battery?.sphere_rating || null),
+            JSON.stringify(req.body.connectivity?.sphere_rating || null),
+            JSON.stringify(req.body.network?.sphere_rating || null),
+          ],
+        );
+      }
+    } catch (srup) {
+      console.error(
+        "Sphere ratings upsert error (update):",
+        srup.message || srup,
+      );
+    }
+
     await client.query("COMMIT");
     return res.json({
       message: "Smartphone updated successfully",
@@ -3271,6 +3390,12 @@ app.delete("/api/smartphone/:id", authenticate, async (req, res) => {
     // delete any product comparisons referencing this product (either side)
     await client.query(
       "DELETE FROM product_comparisons WHERE product_id = $1 OR compared_with = $1",
+      [productId],
+    );
+
+    // delete any sphere ratings associated with this product
+    await client.query(
+      "DELETE FROM product_sphere_ratings WHERE product_id = $1",
       [productId],
     );
 

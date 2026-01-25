@@ -7,12 +7,29 @@ const { authenticate } = require("../middleware/auth");
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
+/* -------------------------
+  Helpers
+-------------------------- */
+
 function parseDateForImport(val) {
   if (!val) return null;
   const d = new Date(val);
   if (isNaN(d)) return null;
-  return d.toISOString().split("T")[0]; // DATE safe
+  return d.toISOString().split("T")[0];
 }
+
+function safeJSONParse(raw, column) {
+  if (!raw) return null;
+  try {
+    return typeof raw === "object" ? raw : JSON.parse(String(raw));
+  } catch {
+    throw new Error(`Invalid JSON in column: ${column}`);
+  }
+}
+
+/* -------------------------
+  IMPORT SMARTPHONES
+-------------------------- */
 
 router.post(
   "/smartphones",
@@ -25,6 +42,7 @@ router.post(
 
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.load(req.file.buffer);
+
     const sheet =
       workbook.getWorksheet("smartphones_import") || workbook.worksheets[0];
 
@@ -32,9 +50,11 @@ router.post(
       return res.status(400).json({ message: "Worksheet not found" });
     }
 
-    const headerRow = sheet.getRow(1);
+    /* -------------------------
+      Header mapping
+    -------------------------- */
     const headers = {};
-    headerRow.eachCell((cell, col) => {
+    sheet.getRow(1).eachCell((cell, col) => {
       headers[String(cell.value).trim().toLowerCase()] = col;
     });
 
@@ -45,20 +65,11 @@ router.post(
       return v?.text ?? v;
     };
 
-    const parseJSON = (row, key, def) => {
-      const raw = getCell(row, key);
-      if (!raw) return def;
-      try {
-        return typeof raw === "object" ? raw : JSON.parse(String(raw));
-      } catch {
-        throw new Error(`Invalid JSON in column ${key}`);
-      }
-    };
-
-    let inserted = 0,
-      skipped = 0,
-      failed = 0;
-    const results = [];
+    let inserted = 0;
+    let skipped = 0;
+    let failed = 0;
+    const report = [];
+    const missingValues = new Set();
 
     const client = await db.connect();
 
@@ -69,93 +80,181 @@ router.post(
         try {
           await client.query("BEGIN");
 
+          /* -------------------------
+            Required fields
+          -------------------------- */
           const product_name = String(
             getCell(row, "product_name") || "",
           ).trim();
           const brand_name = String(getCell(row, "brand_name") || "").trim();
           const category = String(getCell(row, "category") || "").trim();
           const model = String(getCell(row, "model") || "").trim();
-          const modelKey = model.replace(/\s+/g, "").toLowerCase();
 
-          if (!product_name || !brand_name || !model) {
-            throw new Error("Missing required fields");
+          const missingFields = [];
+          if (!product_name) missingFields.push("product_name");
+          if (!brand_name) missingFields.push("brand_name");
+          if (!model) missingFields.push("model");
+
+          if (missingFields.length) {
+            missingFields.forEach((f) => missingValues.add(f));
+            await client.query("ROLLBACK");
+            skipped++;
+            report.push({
+              row: i,
+              status: "MISSING_FIELD",
+              fields: missingFields,
+            });
+            continue;
           }
 
-          // --- Brand ---
+          /* -------------------------
+            Brand
+          -------------------------- */
           const brandRes = await client.query(
             "SELECT id FROM brands WHERE LOWER(name)=LOWER($1)",
             [brand_name],
           );
-          if (!brandRes.rowCount) throw new Error("Brand not found");
+          if (!brandRes.rowCount) {
+            missingValues.add(brand_name);
+            await client.query("ROLLBACK");
+            skipped++;
+            report.push({ row: i, status: "MISSING_BRAND", brand: brand_name });
+            continue;
+          }
           const brand_id = brandRes.rows[0].id;
 
-          // --- Existing product check (NAME UNIQUE) ---
-          let productId = null;
-
-          const byName = await client.query(
+          /* -------------------------
+            Product
+          -------------------------- */
+          let productId;
+          const productCheck = await client.query(
             "SELECT id FROM products WHERE LOWER(name)=LOWER($1)",
             [product_name],
           );
-          if (byName.rowCount) {
-            productId = byName.rows[0].id;
-          }
 
-          // --- Insert product if new ---
-          if (!productId) {
+          if (productCheck.rowCount) {
+            productId = productCheck.rows[0].id;
+          } else {
             const pRes = await client.query(
               `INSERT INTO products (name, product_type, brand_id)
-               VALUES ($1,'smartphone',$2) RETURNING id`,
+               VALUES ($1,'smartphone',$2)
+               RETURNING id`,
               [product_name, brand_id],
             );
             productId = pRes.rows[0].id;
           }
 
-          // --- Smartphone exists check (MODEL) ---
-          const sCheck = await client.query(
+          /* -------------------------
+            Parse JSON fields (used for rating extraction)
+          -------------------------- */
+          const images =
+            safeJSONParse(getCell(row, "images_json"), "images_json") || [];
+
+          const build_design =
+            safeJSONParse(
+              getCell(row, "build_design_json"),
+              "build_design_json",
+            ) || {};
+
+          const display =
+            safeJSONParse(getCell(row, "display_json"), "display_json") || {};
+
+          const performance =
+            safeJSONParse(
+              getCell(row, "performance_json"),
+              "performance_json",
+            ) || {};
+
+          const camera =
+            safeJSONParse(getCell(row, "camera_json"), "camera_json") || {};
+
+          const battery =
+            safeJSONParse(getCell(row, "battery_json"), "battery_json") || {};
+
+          const connectivity =
+            safeJSONParse(
+              getCell(row, "connectivity_json"),
+              "connectivity_json",
+            ) || {};
+
+          const network =
+            safeJSONParse(getCell(row, "network_json"), "network_json") || {};
+
+          // connectivity and network are stored separately
+
+          /* -------------------------
+            Smartphone exists?
+          -------------------------- */
+          const modelKey = model.replace(/\s+/g, "").toLowerCase();
+          const phoneCheck = await client.query(
             `SELECT id FROM smartphones
              WHERE product_id=$1 OR REPLACE(LOWER(model),' ','')=$2`,
             [productId, modelKey],
           );
 
-          if (!sCheck.rowCount) {
-            // --- JSON fields ---
-            const images = parseJSON(row, "images_json", []);
-            const colors = parseJSON(row, "colors_json", []);
-            const build_design = parseJSON(row, "build_design_json", {});
-            const display = parseJSON(row, "display_json", {});
-            const performance = parseJSON(row, "performance_json", {});
-            const camera = parseJSON(row, "camera_json", {});
-            const battery = parseJSON(row, "battery_json", {});
-            const ports = parseJSON(row, "ports_json", {});
-            const audio = parseJSON(row, "audio_json", {});
-            const multimedia = parseJSON(row, "multimedia_json", {});
+          if (!phoneCheck.rowCount) {
+            /* -------------------------
+              JSON columns
+            -------------------------- */
 
-            // --- Connectivity merge (Option A) ---
-            const connectivity = parseJSON(row, "connectivity_json", {});
-            const network = parseJSON(row, "network_json", {});
-            const connectivity_network = {
-              ...connectivity,
-              network,
-            };
+            const images =
+              safeJSONParse(getCell(row, "images_json"), "images_json") || [];
 
-            // --- Sensors TEXT → JSONB ---
+            if (!Array.isArray(images)) {
+              throw new Error("images_json must be a JSON ARRAY");
+            }
+
+            const build_design =
+              safeJSONParse(
+                getCell(row, "build_design_json"),
+                "build_design_json",
+              ) || {};
+
+            const display =
+              safeJSONParse(getCell(row, "display_json"), "display_json") || {};
+
+            const performance =
+              safeJSONParse(
+                getCell(row, "performance_json"),
+                "performance_json",
+              ) || {};
+
+            const camera =
+              safeJSONParse(getCell(row, "camera_json"), "camera_json") || {};
+
+            const battery =
+              safeJSONParse(getCell(row, "battery_json"), "battery_json") || {};
+
+            const connectivity =
+              safeJSONParse(
+                getCell(row, "connectivity_json"),
+                "connectivity_json",
+              ) || {};
+
+            const network =
+              safeJSONParse(getCell(row, "network_json"), "network_json") || {};
+
+            // connectivity and network are stored separately
+
             const sensorsRaw = getCell(row, "sensors");
             const sensors = sensorsRaw
               ? JSON.stringify(
                   String(sensorsRaw)
-                    .split(",")
+                    .split("|")
                     .map((s) => s.trim()),
                 )
               : null;
 
+            /* -------------------------
+              Insert smartphone
+            -------------------------- */
             await client.query(
               `INSERT INTO smartphones
                (product_id, category, brand, model, launch_date,
-                images, colors, build_design, display, performance,
-                camera, battery, connectivity_network, ports,
-                audio, multimedia, sensors)
+                images, build_design, display, performance,
+                camera, battery, connectivity, network, sensors)
                VALUES
-               ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+               ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
               [
                 productId,
                 category,
@@ -163,31 +262,89 @@ router.post(
                 model,
                 parseDateForImport(getCell(row, "launch_date")),
                 JSON.stringify(images),
-                JSON.stringify(colors),
                 JSON.stringify(build_design),
                 JSON.stringify(display),
                 JSON.stringify(performance),
                 JSON.stringify(camera),
                 JSON.stringify(battery),
-                JSON.stringify(connectivity_network),
-                JSON.stringify(ports),
-                JSON.stringify(audio),
-                JSON.stringify(multimedia),
+                JSON.stringify(connectivity),
+                JSON.stringify(network),
                 sensors,
               ],
             );
+
+            /* -------------------------
+              Product images table
+            -------------------------- */
+            for (let p = 0; p < images.length; p++) {
+              await client.query(
+                `INSERT INTO product_images
+                 (product_id, image_url, position)
+                 VALUES ($1,$2,$3)
+                 ON CONFLICT DO NOTHING`,
+                [productId, images[p], p + 1],
+              );
+            }
+
+            // Upsert per-section sphere ratings if present in parsed JSONs
+            try {
+              await client.query(
+                `INSERT INTO product_sphere_ratings
+                  (product_id, design, display, performance, camera, battery, connectivity, network)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                 ON CONFLICT (product_id) DO UPDATE SET
+                   design = COALESCE(EXCLUDED.design, product_sphere_ratings.design),
+                   display = COALESCE(EXCLUDED.display, product_sphere_ratings.display),
+                   performance = COALESCE(EXCLUDED.performance, product_sphere_ratings.performance),
+                   camera = COALESCE(EXCLUDED.camera, product_sphere_ratings.camera),
+                   battery = COALESCE(EXCLUDED.battery, product_sphere_ratings.battery),
+                   connectivity = COALESCE(EXCLUDED.connectivity, product_sphere_ratings.connectivity),
+                   network = COALESCE(EXCLUDED.network, product_sphere_ratings.network),
+                   updated_at = CURRENT_TIMESTAMP
+                `,
+                [
+                  productId,
+                  JSON.stringify(build_design?.sphere_rating || null),
+                  JSON.stringify(display?.sphere_rating || null),
+                  JSON.stringify(performance?.sphere_rating || null),
+                  JSON.stringify(camera?.sphere_rating || null),
+                  JSON.stringify(battery?.sphere_rating || null),
+                  JSON.stringify(connectivity?.sphere_rating || null),
+                  JSON.stringify(network?.sphere_rating || null),
+                ],
+              );
+            } catch (uir) {
+              console.error(
+                "Import sphere ratings upsert error:",
+                uir.message || uir,
+              );
+            }
           }
 
-          // --- Variants (MANDATORY) ---
-          const variants = parseJSON(row, "variants_json", []);
+          /* -------------------------
+            Variants (MANDATORY)
+          -------------------------- */
+          const variants = safeJSONParse(
+            getCell(row, "variants_json"),
+            "variants_json",
+          );
+
           if (!Array.isArray(variants) || !variants.length) {
-            throw new Error("variants_json required");
+            missingValues.add("variants_json");
+            await client.query("ROLLBACK");
+            skipped++;
+            report.push({
+              row: i,
+              status: "MISSING_FIELD",
+              fields: ["variants_json"],
+            });
+            continue;
           }
 
           let variantInserted = false;
 
           for (const v of variants) {
-            const key =
+            const variantKey =
               v.variant_key || `${v.ram || "na"}_${v.storage || "na"}`;
 
             const vRes = await client.query(
@@ -198,45 +355,31 @@ router.post(
                RETURNING id`,
               [
                 productId,
-                key,
-                JSON.stringify(
-                  v.attributes || { ram: v.ram, storage: v.storage },
-                ),
-                v.base_price || null,
+                variantKey,
+                JSON.stringify({ ram: v.ram, storage: v.storage }),
+                v.price || null,
               ],
             );
 
             if (vRes.rowCount) {
               variantInserted = true;
-              const variantId = vRes.rows[0].id;
-
-              for (const sp of v.stores || []) {
-                await client.query(
-                  `INSERT INTO variant_store_prices
-                   (variant_id, store_name, price, url)
-                   VALUES ($1,$2,$3,$4)
-                   ON CONFLICT (variant_id, store_name)
-                   DO UPDATE SET price=EXCLUDED.price, url=EXCLUDED.url`,
-                  [variantId, sp.store_name, sp.price || null, sp.url || null],
-                );
-              }
             }
           }
 
           if (!variantInserted) {
             await client.query("ROLLBACK");
             skipped++;
-            results.push({ row: i, status: "SKIPPED" });
+            report.push({ row: i, status: "SKIPPED" });
             continue;
           }
 
           await client.query("COMMIT");
           inserted++;
-          results.push({ row: i, status: "INSERTED" });
+          report.push({ row: i, status: "INSERTED" });
         } catch (err) {
           await client.query("ROLLBACK");
           failed++;
-          results.push({ row: i, status: "FAILED", error: err.message });
+          report.push({ row: i, status: "FAILED", error: err.message });
         }
       }
 
@@ -247,7 +390,8 @@ router.post(
           skipped,
           failed,
         },
-        rows: results,
+        rows: report,
+        missing: Array.from(missingValues),
       });
     } finally {
       client.release();
