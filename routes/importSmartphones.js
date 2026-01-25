@@ -182,6 +182,16 @@ router.post(
 
           // connectivity and network are stored separately
 
+          const ports =
+            safeJSONParse(getCell(row, "ports_json"), "ports_json") || {};
+
+          const audio =
+            safeJSONParse(getCell(row, "audio_json"), "audio_json") || {};
+
+          const multimedia =
+            safeJSONParse(getCell(row, "multimedia_json"), "multimedia_json") ||
+            {};
+
           /* -------------------------
             Smartphone exists?
           -------------------------- */
@@ -236,6 +246,18 @@ router.post(
 
             // connectivity and network are stored separately
 
+            const ports =
+              safeJSONParse(getCell(row, "ports_json"), "ports_json") || {};
+
+            const audio =
+              safeJSONParse(getCell(row, "audio_json"), "audio_json") || {};
+
+            const multimedia =
+              safeJSONParse(
+                getCell(row, "multimedia_json"),
+                "multimedia_json",
+              ) || {};
+
             const sensorsRaw = getCell(row, "sensors");
             const sensors = sensorsRaw
               ? JSON.stringify(
@@ -252,9 +274,9 @@ router.post(
               `INSERT INTO smartphones
                (product_id, category, brand, model, launch_date,
                 images, build_design, display, performance,
-                camera, battery, connectivity, network, sensors)
+                camera, battery, connectivity, network, ports, audio, multimedia, sensors)
                VALUES
-               ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+               ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
               [
                 productId,
                 category,
@@ -269,6 +291,9 @@ router.post(
                 JSON.stringify(battery),
                 JSON.stringify(connectivity),
                 JSON.stringify(network),
+                JSON.stringify(ports),
+                JSON.stringify(audio),
+                JSON.stringify(multimedia),
                 sensors,
               ],
             );
