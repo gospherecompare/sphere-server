@@ -18,13 +18,44 @@ function parseDateForImport(val) {
   return d.toISOString().split("T")[0];
 }
 
-function safeJSONParse(raw, column) {
-  if (!raw) return null;
+function safeJSONParse(raw, column, row) {
+  if (raw === null || raw === undefined || raw === "") return null;
   try {
     return typeof raw === "object" ? raw : JSON.parse(String(raw));
-  } catch {
-    throw new Error(`Invalid JSON in column: ${column}`);
+  } catch (err) {
+    // try a forgiving fallback: replace single quotes with double quotes
+    try {
+      const alt = String(raw)
+        .replace(/\u2018|\u2019|\u201C|\u201D/g, '"')
+        .replace(/'/g, '"');
+      return JSON.parse(alt);
+    } catch (err2) {
+      console.warn(
+        `Row ${row || "?"}: Invalid JSON in column: ${column} - ${err.message}`,
+      );
+      return null;
+    }
   }
+}
+
+function parseSensors(raw, row) {
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (Array.isArray(raw))
+    return JSON.stringify(raw.map((s) => String(s).trim()));
+  if (typeof raw === "object") return JSON.stringify(raw);
+  const str = String(raw).trim();
+  try {
+    const parsed = JSON.parse(str);
+    if (Array.isArray(parsed))
+      return JSON.stringify(parsed.map((s) => String(s).trim()));
+  } catch (e) {
+    // not JSON array, continue
+  }
+  const parts = str
+    .split(/[|,;]+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  return parts.length ? JSON.stringify(parts) : null;
 }
 
 /* -------------------------
@@ -77,8 +108,10 @@ router.post(
       for (let i = 2; i <= sheet.rowCount; i++) {
         const row = sheet.getRow(i);
 
+        let inTransaction = false;
         try {
           await client.query("BEGIN");
+          inTransaction = true;
 
           /* -------------------------
             Required fields
@@ -108,12 +141,19 @@ router.post(
           }
 
           /* -------------------------
-            Brand
+            Brand (lenient match)
           -------------------------- */
-          const brandRes = await client.query(
+          let brandRes = await client.query(
             "SELECT id FROM brands WHERE LOWER(name)=LOWER($1)",
             [brand_name],
           );
+          if (!brandRes.rowCount) {
+            // try partial match to avoid strict failures
+            brandRes = await client.query(
+              "SELECT id FROM brands WHERE LOWER(name) LIKE $1 LIMIT 1",
+              [`%${brand_name.toLowerCase()}%`],
+            );
+          }
           if (!brandRes.rowCount) {
             missingValues.add(brand_name);
             await client.query("ROLLBACK");
@@ -145,52 +185,52 @@ router.post(
           }
 
           /* -------------------------
-            Parse JSON fields (used for rating extraction)
+            Parse JSON fields (tolerant)
           -------------------------- */
-          const images =
-            safeJSONParse(getCell(row, "images_json"), "images_json") || [];
-
+          let images = safeJSONParse(
+            getCell(row, "images_json"),
+            "images_json",
+            i,
+          );
           const build_design =
             safeJSONParse(
               getCell(row, "build_design_json"),
               "build_design_json",
+              i,
             ) || {};
-
           const display =
-            safeJSONParse(getCell(row, "display_json"), "display_json") || {};
-
+            safeJSONParse(getCell(row, "display_json"), "display_json", i) ||
+            {};
           const performance =
             safeJSONParse(
               getCell(row, "performance_json"),
               "performance_json",
+              i,
             ) || {};
-
           const camera =
-            safeJSONParse(getCell(row, "camera_json"), "camera_json") || {};
-
+            safeJSONParse(getCell(row, "camera_json"), "camera_json", i) || {};
           const battery =
-            safeJSONParse(getCell(row, "battery_json"), "battery_json") || {};
-
+            safeJSONParse(getCell(row, "battery_json"), "battery_json", i) ||
+            {};
           const connectivity =
             safeJSONParse(
               getCell(row, "connectivity_json"),
               "connectivity_json",
+              i,
             ) || {};
-
           const network =
-            safeJSONParse(getCell(row, "network_json"), "network_json") || {};
-
-          // connectivity and network are stored separately
-
-          const ports =
-            safeJSONParse(getCell(row, "ports_json"), "ports_json") || {};
-
-          const audio =
-            safeJSONParse(getCell(row, "audio_json"), "audio_json") || {};
-
-          const multimedia =
-            safeJSONParse(getCell(row, "multimedia_json"), "multimedia_json") ||
+            safeJSONParse(getCell(row, "network_json"), "network_json", i) ||
             {};
+          const ports =
+            safeJSONParse(getCell(row, "ports_json"), "ports_json", i) || {};
+          const audio =
+            safeJSONParse(getCell(row, "audio_json"), "audio_json", i) || {};
+          const multimedia =
+            safeJSONParse(
+              getCell(row, "multimedia_json"),
+              "multimedia_json",
+              i,
+            ) || {};
 
           /* -------------------------
             Smartphone exists?
@@ -202,73 +242,24 @@ router.post(
             [productId, modelKey],
           );
 
+          let createdPhone = false;
+
           if (!phoneCheck.rowCount) {
             /* -------------------------
-              JSON columns
+              Validate/normalise parsed JSON columns and sensors
             -------------------------- */
-
-            const images =
-              safeJSONParse(getCell(row, "images_json"), "images_json") || [];
-
             if (!Array.isArray(images)) {
-              throw new Error("images_json must be a JSON ARRAY");
+              console.warn(
+                `Row ${i}: images_json is not an array; coercing to []`,
+              );
+              images = Array.isArray(images) ? images : [];
             }
 
-            const build_design =
-              safeJSONParse(
-                getCell(row, "build_design_json"),
-                "build_design_json",
-              ) || {};
-
-            const display =
-              safeJSONParse(getCell(row, "display_json"), "display_json") || {};
-
-            const performance =
-              safeJSONParse(
-                getCell(row, "performance_json"),
-                "performance_json",
-              ) || {};
-
-            const camera =
-              safeJSONParse(getCell(row, "camera_json"), "camera_json") || {};
-
-            const battery =
-              safeJSONParse(getCell(row, "battery_json"), "battery_json") || {};
-
-            const connectivity =
-              safeJSONParse(
-                getCell(row, "connectivity_json"),
-                "connectivity_json",
-              ) || {};
-
-            const network =
-              safeJSONParse(getCell(row, "network_json"), "network_json") || {};
-
-            // connectivity and network are stored separately
-
-            const ports =
-              safeJSONParse(getCell(row, "ports_json"), "ports_json") || {};
-
-            const audio =
-              safeJSONParse(getCell(row, "audio_json"), "audio_json") || {};
-
-            const multimedia =
-              safeJSONParse(
-                getCell(row, "multimedia_json"),
-                "multimedia_json",
-              ) || {};
-
             const sensorsRaw = getCell(row, "sensors");
-            const sensors = sensorsRaw
-              ? JSON.stringify(
-                  String(sensorsRaw)
-                    .split("|")
-                    .map((s) => s.trim()),
-                )
-              : null;
+            const sensors = parseSensors(sensorsRaw, i);
 
             /* -------------------------
-              Insert smartphone
+              Insert smartphone (core)
             -------------------------- */
             await client.query(
               `INSERT INTO smartphones
@@ -297,6 +288,16 @@ router.post(
                 sensors,
               ],
             );
+
+            createdPhone = true;
+
+            // commit core product+smartphone so variant failures won't rollback this
+            await client.query("COMMIT");
+            inTransaction = false;
+
+            if (createdPhone) {
+              inserted++;
+            }
 
             /* -------------------------
               Product images table
@@ -344,65 +345,147 @@ router.post(
                 uir.message || uir,
               );
             }
+          } else {
+            // If phone already exists, commit the select-only transaction to clear state
+            await client.query("COMMIT");
+            inTransaction = false;
           }
-
           /* -------------------------
-            Variants (MANDATORY)
+            Variants (optional, non-fatal)
+            Process after smartphone/product committed, per-variant errors logged
           -------------------------- */
-          const variants = safeJSONParse(
-            getCell(row, "variants_json"),
-            "variants_json",
-          );
+          const variantsRaw =
+            getCell(row, "variants_json") ?? getCell(row, "variants");
+          const variantsHeaderExists =
+            headers["variants_json"] || headers["variants"];
+          const variantsColName = headers["variants_json"]
+            ? "variants_json"
+            : "variants";
+          let variants = safeJSONParse(variantsRaw, variantsColName, i);
+          const variantReport = { inserted: 0, failed: 0, errors: [] };
 
-          if (!Array.isArray(variants) || !variants.length) {
-            missingValues.add("variants_json");
-            await client.query("ROLLBACK");
-            skipped++;
-            report.push({
-              row: i,
-              status: "MISSING_FIELD",
-              fields: ["variants_json"],
-            });
-            continue;
+          // If parsed object wraps the array: { variants: [ ... ] }
+          if (
+            variants &&
+            typeof variants === "object" &&
+            !Array.isArray(variants) &&
+            Array.isArray(variants.variants)
+          ) {
+            variants = variants.variants;
           }
 
-          let variantInserted = false;
-
-          for (const v of variants) {
-            const variantKey =
-              v.variant_key || `${v.ram || "na"}_${v.storage || "na"}`;
-
-            const vRes = await client.query(
-              `INSERT INTO product_variants
-               (product_id, variant_key, attributes, base_price)
-               VALUES ($1,$2,$3,$4)
-               ON CONFLICT (product_id, variant_key) DO NOTHING
-               RETURNING id`,
-              [
-                productId,
-                variantKey,
-                JSON.stringify({ ram: v.ram, storage: v.storage }),
-                v.price || null,
-              ],
-            );
-
-            if (vRes.rowCount) {
-              variantInserted = true;
+          // If parsing failed but raw contains an array-like substring, try to extract it
+          if (
+            (!variants || !Array.isArray(variants)) &&
+            typeof variantsRaw === "string"
+          ) {
+            const arrMatch = variantsRaw.match(/\[([\s\S]*)\]/);
+            if (arrMatch) {
+              try {
+                const cand = arrMatch[0]
+                  .replace(/\u2018|\u2019|\u201C|\u201D/g, '"')
+                  .replace(/'/g, '"');
+                const parsedCand = JSON.parse(cand);
+                if (Array.isArray(parsedCand)) variants = parsedCand;
+              } catch (e) {
+                console.warn(
+                  `Row ${i}: failed to extract variants array from raw cell: ${e.message}`,
+                );
+              }
             }
           }
 
-          if (!variantInserted) {
-            await client.query("ROLLBACK");
-            skipped++;
-            report.push({ row: i, status: "SKIPPED" });
-            continue;
+          if (!Array.isArray(variants) || !variants.length) {
+            if (!variantsHeaderExists) {
+              missingValues.add("variants_json");
+            } else {
+              console.warn(
+                `Row ${i}: variants column present but could not parse variants array.`,
+              );
+            }
+            // do not rollback or skip; variants are optional for import stability
+          } else {
+            for (const v of variants) {
+              try {
+                const variantKey =
+                  v.variant_key || `${v.ram || "na"}_${v.storage || "na"}`;
+                const attributes = { ram: v.ram, storage: v.storage };
+                if (v.variant_id !== undefined && v.variant_id !== null) {
+                  attributes.external_variant_id = v.variant_id;
+                }
+                const basePrice = v.base_price ?? v.price ?? null;
+
+                const vRes = await client.query(
+                  `INSERT INTO product_variants
+                   (product_id, variant_key, attributes, base_price)
+                   VALUES ($1,$2,$3,$4)
+                   ON CONFLICT (product_id, variant_key) DO UPDATE SET
+                     attributes = COALESCE(EXCLUDED.attributes, product_variants.attributes),
+                     base_price = COALESCE(EXCLUDED.base_price, product_variants.base_price)
+                   RETURNING id`,
+                  [
+                    productId,
+                    variantKey,
+                    JSON.stringify(attributes),
+                    basePrice,
+                  ],
+                );
+
+                if (vRes.rowCount) {
+                  const variantId = vRes.rows[0].id;
+                  variantReport.inserted++;
+
+                  if (Array.isArray(v.store_prices) && v.store_prices.length) {
+                    for (const sp of v.store_prices) {
+                      try {
+                        const storeName =
+                          sp.store_name || sp.store || sp.name || null;
+                        if (!storeName) continue;
+                        await client.query(
+                          `INSERT INTO variant_store_prices
+                           (variant_id, store_name, price, url, offer_text, delivery_info)
+                           VALUES ($1,$2,$3,$4,$5,$6)
+                           ON CONFLICT (variant_id, store_name) DO UPDATE SET
+                             price = EXCLUDED.price,
+                             url = EXCLUDED.url,
+                             offer_text = EXCLUDED.offer_text,
+                             delivery_info = EXCLUDED.delivery_info`,
+                          [
+                            variantId,
+                            storeName,
+                            sp.price ?? null,
+                            sp.url ?? null,
+                            sp.offer_text ?? null,
+                            sp.delivery_info ?? null,
+                          ],
+                        );
+                      } catch (spErr) {
+                        variantReport.failed++;
+                        const msg = `Row ${i} variant ${variantKey} store_price error: ${spErr.message}`;
+                        variantReport.errors.push(msg);
+                        console.warn(msg);
+                      }
+                    }
+                  }
+                }
+              } catch (verr) {
+                variantReport.failed++;
+                const msg = `Row ${i} variant upsert error: ${verr.message}`;
+                variantReport.errors.push(msg);
+                console.warn(msg);
+              }
+            }
           }
 
-          await client.query("COMMIT");
-          inserted++;
-          report.push({ row: i, status: "INSERTED" });
+          // Finalize row report: consider phone insertion status
+          const rowStatus = createdPhone ? "INSERTED" : "EXISTS";
+          report.push({ row: i, status: rowStatus, variants: variantReport });
         } catch (err) {
-          await client.query("ROLLBACK");
+          try {
+            if (inTransaction) await client.query("ROLLBACK");
+          } catch (rbErr) {
+            console.error("Rollback error:", rbErr.message || rbErr);
+          }
           failed++;
           report.push({ row: i, status: "FAILED", error: err.message });
         }
