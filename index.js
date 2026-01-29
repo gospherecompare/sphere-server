@@ -3114,6 +3114,28 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       ]);
     }
 
+    // Replace product_images to reflect new images array (if provided)
+    try {
+      if (productId) {
+        await client.query("DELETE FROM product_images WHERE product_id = $1", [
+          productId,
+        ]);
+        const imgs = Array.isArray(req.body.images) ? req.body.images : [];
+        for (let i = 0; i < imgs.length; i++) {
+          await client.query(
+            "INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)",
+            [productId, imgs[i], i + 1],
+          );
+        }
+      }
+    } catch (piErr) {
+      console.error(
+        "Failed to replace product_images:",
+        piErr.message || piErr,
+      );
+      // non-fatal: continue without aborting the whole update
+    }
+
     /* ---------- UPSERT VARIANTS ---------- */
     if (Array.isArray(req.body.variants)) {
       // Ensure we have the product_id for this smartphone
@@ -5409,8 +5431,10 @@ app.delete("/api/ram-storage-config/:id", authenticate, async (req, res) => {
 
 const importSmartphonesRouter = require("./routes/importSmartphones");
 const importLaptopsRouter = require("./routes/importLaptop");
+const smartphonesReqRouter = require("./routes/smartphonesReq");
 app.use("/api/import", authenticate, importSmartphonesRouter);
 app.use("/api/import", authenticate, importLaptopsRouter);
+app.use("/api/smartphones", authenticate, smartphonesReqRouter);
 
 async function start() {
   try {
