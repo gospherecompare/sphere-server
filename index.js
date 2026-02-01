@@ -3039,6 +3039,46 @@ app.get("/api/networking", async (req, res) => {
 app.put("/api/smartphone/:id", authenticate, async (req, res) => {
   const client = await db.connect();
   console.log(req.body);
+  // Accept payloads that wrap a single smartphone inside { smartphones: [ { ... } ] }
+  if (
+    req.body &&
+    Array.isArray(req.body.smartphones) &&
+    req.body.smartphones.length > 0
+  ) {
+    const first = req.body.smartphones[0];
+
+    // deep-merge `first` into `req.body` but do not overwrite existing scalar values
+    const isPlainObject = (v) => v && typeof v === "object" && !Array.isArray(v);
+
+    const mergeInto = (target, source) => {
+      for (const key of Object.keys(source)) {
+        const srcVal = source[key];
+        const tgtVal = target[key];
+
+        if (tgtVal === undefined) {
+          // if target missing, copy entire value
+          target[key] = srcVal;
+          continue;
+        }
+
+        // if both are plain objects, recurse to preserve nested fields
+        if (isPlainObject(tgtVal) && isPlainObject(srcVal)) {
+          mergeInto(tgtVal, srcVal);
+          continue;
+        }
+
+        // if target is array and source is array, prefer source only if target is empty
+        if (Array.isArray(tgtVal) && Array.isArray(srcVal)) {
+          if (tgtVal.length === 0 && srcVal.length > 0) target[key] = srcVal;
+          continue;
+        }
+
+        // otherwise leave existing target value intact
+      }
+    };
+
+    mergeInto(req.body, first);
+  }
   try {
     await client.query("BEGIN");
 
@@ -3062,7 +3102,14 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     const sid = findRes.rows[0].id; // internal smartphone id
 
     const n = normalizeBodyKeys(req.body || {});
-    const name = n.name || req.body.name;
+    // Accept several name aliases: `name`, `product_name`, `productName`, or normalized variants
+    const name =
+      n.name ||
+      n.productname ||
+      req.body.name ||
+      req.body.product_name ||
+      req.body.productName ||
+      req.body.productName?.toString();
     if (!name) {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Name is required" });
