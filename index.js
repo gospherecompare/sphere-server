@@ -3048,7 +3048,8 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     const first = req.body.smartphones[0];
 
     // deep-merge `first` into `req.body` but do not overwrite existing scalar values
-    const isPlainObject = (v) => v && typeof v === "object" && !Array.isArray(v);
+    const isPlainObject = (v) =>
+      v && typeof v === "object" && !Array.isArray(v);
 
     const mergeInto = (target, source) => {
       for (const key of Object.keys(source)) {
