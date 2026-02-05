@@ -5044,8 +5044,22 @@ app.get("/api/public/trending/most-compared", async (req, res) => {
       SELECT
         p1.id AS product_id,
         p1.name AS product_name,
+        (
+          SELECT image_url
+          FROM product_images
+          WHERE product_id = p1.id
+          ORDER BY position ASC NULLS LAST, id ASC
+          LIMIT 1
+        ) AS product_image,
         p2.id AS compared_product_id,
         p2.name AS compared_product_name,
+        (
+          SELECT image_url
+          FROM product_images
+          WHERE product_id = p2.id
+          ORDER BY position ASC NULLS LAST, id ASC
+          LIMIT 1
+        ) AS compared_product_image,
         COUNT(pc.id) AS compare_count
       FROM product_comparisons pc
       JOIN products p1 ON p1.id = pc.product_id
