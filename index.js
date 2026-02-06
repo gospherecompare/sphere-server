@@ -26,6 +26,7 @@ app.use(
       "http://localhost:3000",
       "http://localhost:5173",
       "https://main.d2jgd4xy0rohx4.amplifyapp.com",
+      "https://main.d2ecrzwmegqlb.amplifyapp.com/",
     ],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
