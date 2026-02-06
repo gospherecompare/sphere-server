@@ -5067,7 +5067,7 @@ app.get("/api/public/trending/most-compared", async (req, res) => {
       WHERE pc.compared_at >= now() - INTERVAL '7 days'
       GROUP BY p1.id, p1.name, p2.id, p2.name
       ORDER BY compare_count DESC
-      LIMIT 10;
+      LIMIT 50;
     `);
 
     res.json({
