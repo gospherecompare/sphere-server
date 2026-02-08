@@ -1573,13 +1573,13 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
       )
       RETURNING id
       `,
-      [
-        productId,
-        smartphone.category || null,
-        smartphone.brand || null,
-        smartphone.model || null,
-        smartphone.launch_date || null,
-        JSON.stringify(images || []),
+        [
+          productId,
+          smartphone.category || smartphone.segment || null,
+          smartphone.brand || null,
+          smartphone.model || null,
+          smartphone.launch_date || null,
+          JSON.stringify(images || []),
         JSON.stringify(smartphone.colors || []),
         JSON.stringify(smartphone.build_design || {}),
         JSON.stringify(smartphone.display || {}),
@@ -3129,7 +3129,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     `;
 
     const phoneRes = await client.query(updatePhoneSQL, [
-      req.body.category || null,
+      (req.body.category || req.body.segment) || null,
       req.body.brand || null,
       req.body.model || null,
       parseDateForImport(req.body.launch_date),
@@ -3221,6 +3221,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 
       // Map input variant index -> DB id (useful when client sends variant indices)
       const variantIdMap = [];
+      const keepVariantIds = [];
 
       for (let vi = 0; vi < req.body.variants.length; vi++) {
         const v = req.body.variants[vi];
@@ -3244,6 +3245,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
             base_price,
           ]);
           variantIdMap[vi] = r.rows[0].id;
+          keepVariantIds.push(r.rows[0].id);
         } else {
           const r = await client.query(insertVariantSQL, [
             productId,
@@ -3252,11 +3254,28 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
             base_price,
           ]);
           variantIdMap[vi] = r.rows[0].id;
+          keepVariantIds.push(r.rows[0].id);
         }
       }
 
       // expose the mapping for later price handling
       req._variantIdMap = variantIdMap;
+
+      // Replace semantics: if `variants` array is provided, remove variants not present anymore.
+      // This enables "delete variant" from the admin UI by simply omitting that variant from the payload.
+      const keepIds = keepVariantIds
+        .map((x) => Number(x))
+        .filter((n) => Number.isInteger(n) && n > 0);
+      if (keepIds.length === 0) {
+        await client.query("DELETE FROM product_variants WHERE product_id = $1", [
+          productId,
+        ]);
+      } else {
+        await client.query(
+          "DELETE FROM product_variants WHERE product_id = $1 AND NOT (id = ANY($2::int[]))",
+          [productId, keepIds],
+        );
+      }
     }
 
     /* ---------- UPSERT STORE PRICES ---------- */
