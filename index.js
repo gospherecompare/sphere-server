@@ -1573,13 +1573,13 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
       )
       RETURNING id
       `,
-        [
-          productId,
-          smartphone.category || smartphone.segment || null,
-          smartphone.brand || null,
-          smartphone.model || null,
-          smartphone.launch_date || null,
-          JSON.stringify(images || []),
+      [
+        productId,
+        smartphone.category || smartphone.segment || null,
+        smartphone.brand || null,
+        smartphone.model || null,
+        smartphone.launch_date || null,
+        JSON.stringify(images || []),
         JSON.stringify(smartphone.colors || []),
         JSON.stringify(smartphone.build_design || {}),
         JSON.stringify(smartphone.display || {}),
@@ -3129,7 +3129,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     `;
 
     const phoneRes = await client.query(updatePhoneSQL, [
-      (req.body.category || req.body.segment) || null,
+      req.body.category || req.body.segment || null,
       req.body.brand || null,
       req.body.model || null,
       parseDateForImport(req.body.launch_date),
@@ -3267,9 +3267,10 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
         .map((x) => Number(x))
         .filter((n) => Number.isInteger(n) && n > 0);
       if (keepIds.length === 0) {
-        await client.query("DELETE FROM product_variants WHERE product_id = $1", [
-          productId,
-        ]);
+        await client.query(
+          "DELETE FROM product_variants WHERE product_id = $1",
+          [productId],
+        );
       } else {
         await client.query(
           "DELETE FROM product_variants WHERE product_id = $1 AND NOT (id = ANY($2::int[]))",
@@ -5087,7 +5088,6 @@ app.get("/api/public/trending/most-compared", async (req, res) => {
       WHERE pc.compared_at >= now() - INTERVAL '7 days'
       GROUP BY p1.id, p1.name, p2.id, p2.name
       ORDER BY compare_count DESC
-      LIMIT 50;
     `);
 
     res.json({
