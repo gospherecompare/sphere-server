@@ -522,6 +522,25 @@ async function runMigrations() {
       
       `);
 
+    // Popular feature clicks (analytics) - aggregated per day
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS feature_click_stats (
+        id SERIAL PRIMARY KEY,
+        device_type TEXT NOT NULL,
+        feature_id TEXT NOT NULL,
+        day DATE NOT NULL,
+        clicks INT NOT NULL DEFAULT 0,
+        last_clicked_at TIMESTAMP DEFAULT now(),
+        created_at TIMESTAMP DEFAULT now(),
+        UNIQUE (device_type, feature_id, day)
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_feature_click_stats_device_day
+      ON feature_click_stats (device_type, day);
+    `);
+
     console.log("✅ Migrations to   completed");
   } catch (err) {
     console.error("Migration error:", err);
@@ -4553,6 +4572,101 @@ app.post("/api/public/product/:id/view", async (req, res) => {
   } catch (err) {
     console.error("Error recording product view:", err);
     return res.status(500).json({ message: "Failed to record view" });
+  }
+});
+
+// Popular feature clicks (public) - aggregated per day
+app.post("/api/public/feature-click", async (req, res) => {
+  try {
+    const b = req.body || {};
+    const normalize = (v) =>
+      String(v || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "-");
+
+    const deviceType = normalize(b.device_type ?? b.deviceType ?? "");
+    const featureId = normalize(b.feature_id ?? b.featureId ?? b.id ?? "");
+
+    const isSafeId = (s) => /^[a-z0-9][a-z0-9-]{0,63}$/.test(String(s));
+
+    if (!deviceType || !featureId) {
+      return res
+        .status(400)
+        .json({ message: "device_type and feature_id are required" });
+    }
+    if (!isSafeId(deviceType) || !isSafeId(featureId)) {
+      return res.status(400).json({ message: "Invalid device_type/feature_id" });
+    }
+
+    await db.query(
+      `
+      INSERT INTO feature_click_stats (device_type, feature_id, day, clicks, last_clicked_at)
+      VALUES ($1, $2, CURRENT_DATE, 1, now())
+      ON CONFLICT (device_type, feature_id, day)
+      DO UPDATE SET
+        clicks = feature_click_stats.clicks + 1,
+        last_clicked_at = now()
+      `,
+      [deviceType, featureId],
+    );
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("POST /api/public/feature-click error:", err);
+    return res.status(500).json({ success: false });
+  }
+});
+
+// Popular feature ordering (public) - last N days
+app.get("/api/public/popular-features", async (req, res) => {
+  try {
+    const q = req.query || {};
+    const normalize = (v) =>
+      String(v || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "-");
+
+    const deviceType = normalize(q.deviceType ?? q.device_type ?? "smartphone");
+    const isSafeId = (s) => /^[a-z0-9][a-z0-9-]{0,63}$/.test(String(s));
+    if (!isSafeId(deviceType)) {
+      return res.status(400).json({ message: "Invalid deviceType" });
+    }
+
+    const daysRaw = Number(q.days ?? 7);
+    const limitRaw = Number(q.limit ?? 16);
+    const days = Number.isFinite(daysRaw)
+      ? Math.min(30, Math.max(1, Math.floor(daysRaw)))
+      : 7;
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(50, Math.max(1, Math.floor(limitRaw)))
+      : 16;
+
+    const result = await db.query(
+      `
+      SELECT
+        feature_id,
+        SUM(clicks)::int AS clicks,
+        MAX(last_clicked_at) AS last_clicked_at
+      FROM feature_click_stats
+      WHERE device_type = $1
+        AND day >= (CURRENT_DATE - (($2::int) - 1))
+      GROUP BY feature_id
+      ORDER BY clicks DESC, last_clicked_at DESC
+      LIMIT $3
+      `,
+      [deviceType, days, limit],
+    );
+
+    return res.json({
+      device_type: deviceType,
+      days,
+      results: result.rows || [],
+    });
+  } catch (err) {
+    console.error("GET /api/public/popular-features error:", err);
+    return res.status(500).json({ message: "Failed to load popular features" });
   }
 });
 
