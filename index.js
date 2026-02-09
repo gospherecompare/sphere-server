@@ -5266,10 +5266,151 @@ app.get("/api/search", async (req, res) => {
       [term],
     );
 
+    const safeNum = (v) => {
+      if (v === null || v === undefined || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const unique = (arr) => {
+      const out = [];
+      const seen = new Set();
+      for (const x of arr || []) {
+        const k = String(x || "").trim();
+        if (!k || seen.has(k)) continue;
+        seen.add(k);
+        out.push(x);
+      }
+      return out;
+    };
+
+    const tryParseNumberFromString = (val) => {
+      if (val === null || val === undefined) return null;
+      if (typeof val === "number") return Number.isFinite(val) ? val : null;
+      const m = String(val).match(/(\d{1,6})/);
+      return m ? Number(m[1]) : null;
+    };
+
+    const extractSmartphoneHighlights = (row) => {
+      const features = [];
+      if (!row) return features;
+
+      const display = row.display || {};
+      const battery = row.battery || {};
+      const camera = row.camera || {};
+      const performance = row.performance || {};
+
+      const displaySize =
+        (display && typeof display === "object" && (display.size || display.screen_size || display.display_size)) ||
+        (display && typeof display === "string" ? display : null);
+      if (displaySize) features.push(String(displaySize));
+
+      const battMah =
+        tryParseNumberFromString(
+          battery.battery_capacity_mah ??
+            battery.capacity_mAh ??
+            battery.capacity ??
+            battery.battery_capacity ??
+            battery,
+        ) || null;
+      if (battMah) features.push(`${battMah} mAh`);
+
+      const mainMp =
+        tryParseNumberFromString(
+          camera.main_camera_megapixels ??
+            camera.rear_camera?.main?.megapixels ??
+            camera.rear_camera?.main?.resolution_mp ??
+            camera.rear_camera?.main?.resolution ??
+            camera.rear_camera?.main ??
+            camera.main ??
+            camera,
+        ) || null;
+      if (mainMp) features.push(`${mainMp} MP`);
+
+      const processor =
+        performance.processor || performance.cpu || performance.chipset || null;
+      if (processor) features.push(String(processor));
+
+      return features.filter(Boolean).slice(0, 3);
+    };
+
     const results = [];
 
     // Add products to results
     for (const r of products.rows) {
+      let minPrice = null;
+      let variantTypes = [];
+      let keyFeatures = [];
+
+      try {
+        const variantsRes = await db.query(
+          `SELECT variant_key, attributes, base_price
+           FROM product_variants
+           WHERE product_id = $1
+           ORDER BY id ASC`,
+          [r.id],
+        );
+
+        const basePrices = variantsRes.rows
+          .map((v) => safeNum(v.base_price))
+          .filter((n) => n !== null);
+
+        const minBase =
+          basePrices.length > 0 ? Math.min(...basePrices) : null;
+
+        const storeMinRes = await db.query(
+          `SELECT MIN(vsp.price) AS min_price
+           FROM variant_store_prices vsp
+           INNER JOIN product_variants pv ON pv.id = vsp.variant_id
+           WHERE pv.product_id = $1`,
+          [r.id],
+        );
+
+        const minStore = safeNum(storeMinRes.rows?.[0]?.min_price);
+        minPrice =
+          minStore !== null && minBase !== null
+            ? Math.min(minStore, minBase)
+            : minStore ?? minBase;
+
+        variantTypes = unique(
+          variantsRes.rows.map((v) => {
+            const ram =
+              v.attributes && typeof v.attributes === "object"
+                ? v.attributes.ram || v.attributes.RAM || null
+                : null;
+            const storage =
+              v.attributes && typeof v.attributes === "object"
+                ? v.attributes.storage ||
+                  v.attributes.ROM_storage ||
+                  v.attributes.rom ||
+                  null
+                : null;
+
+            if (ram && storage) return `${ram}/${storage}`;
+            if (ram) return String(ram);
+            if (storage) return String(storage);
+            return v.variant_key || null;
+          }),
+        ).slice(0, 3);
+      } catch (e) {
+        // defensive: search suggestions should not fail because of variant lookups
+      }
+
+      if (String(r.product_type).toLowerCase() === "smartphone") {
+        try {
+          const smRes = await db.query(
+            `SELECT display, battery, camera, performance
+             FROM smartphones
+             WHERE product_id = $1
+             LIMIT 1`,
+            [r.id],
+          );
+          keyFeatures = extractSmartphoneHighlights(smRes.rows?.[0]);
+        } catch (e) {
+          // ignore highlight extraction errors
+        }
+      }
+
       results.push({
         type: "product",
         id: r.id,
@@ -5277,6 +5418,9 @@ app.get("/api/search", async (req, res) => {
         product_type: r.product_type,
         brand_name: r.brand_name || null,
         image_url: r.image_url || null,
+        min_price: minPrice,
+        variant_types: variantTypes,
+        key_features: keyFeatures,
       });
     }
 
