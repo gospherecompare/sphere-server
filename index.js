@@ -5234,6 +5234,9 @@ app.get("/api/search", async (req, res) => {
         b.name AS brand_name,
         (SELECT image_url FROM product_images WHERE product_id = p.id AND position = 1 LIMIT 1) AS image_url
        FROM products p
+       INNER JOIN product_publish pub
+         ON pub.product_id = p.id
+        AND pub.is_published = true
        LEFT JOIN brands b ON b.id = p.brand_id
        WHERE p.name ILIKE $1 
           OR b.name ILIKE $1
@@ -5244,9 +5247,18 @@ app.get("/api/search", async (req, res) => {
 
     // Search brands only
     const brands = await db.query(
-      `SELECT id, name FROM brands
-       WHERE name ILIKE $1
-       ORDER BY name ASC
+      `SELECT b.id, b.name
+       FROM brands b
+       WHERE b.name ILIKE $1
+         AND EXISTS (
+           SELECT 1
+           FROM products p
+           INNER JOIN product_publish pub
+             ON pub.product_id = p.id
+            AND pub.is_published = true
+           WHERE p.brand_id = b.id
+         )
+       ORDER BY b.name ASC
        LIMIT 6`,
       [term],
     );
