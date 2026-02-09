@@ -5151,6 +5151,9 @@ app.get("/api/public/product/:id", async (req, res) => {
     const pRes = await db.query(
       `SELECT p.id, p.name, p.product_type, b.name AS brand, b.id AS brand_id
        FROM products p
+       INNER JOIN product_publish pub
+         ON pub.product_id = p.id
+        AND pub.is_published = true
        LEFT JOIN brands b ON b.id = p.brand_id
        WHERE p.id = $1 LIMIT 1`,
       [id],
