@@ -27,6 +27,8 @@ app.use(
       "http://localhost:5173",
       "https://main.d2jgd4xy0rohx4.amplifyapp.com",
       "https://main.d2ecrzwmegqlb.amplifyapp.com",
+      "https://www.tryhook.shop/",
+      "https://www.tryhook.shop",
     ],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -4596,7 +4598,9 @@ app.post("/api/public/feature-click", async (req, res) => {
         .json({ message: "device_type and feature_id are required" });
     }
     if (!isSafeId(deviceType) || !isSafeId(featureId)) {
-      return res.status(400).json({ message: "Invalid device_type/feature_id" });
+      return res
+        .status(400)
+        .json({ message: "Invalid device_type/feature_id" });
     }
 
     await db.query(
@@ -5415,7 +5419,9 @@ app.get("/api/search", async (req, res) => {
       const performance = row.performance || {};
 
       const displaySize =
-        (display && typeof display === "object" && (display.size || display.screen_size || display.display_size)) ||
+        (display &&
+          typeof display === "object" &&
+          (display.size || display.screen_size || display.display_size)) ||
         (display && typeof display === "string" ? display : null);
       if (displaySize) features.push(String(displaySize));
 
@@ -5469,8 +5475,7 @@ app.get("/api/search", async (req, res) => {
           .map((v) => safeNum(v.base_price))
           .filter((n) => n !== null);
 
-        const minBase =
-          basePrices.length > 0 ? Math.min(...basePrices) : null;
+        const minBase = basePrices.length > 0 ? Math.min(...basePrices) : null;
 
         const storeMinRes = await db.query(
           `SELECT MIN(vsp.price) AS min_price
@@ -5484,7 +5489,7 @@ app.get("/api/search", async (req, res) => {
         minPrice =
           minStore !== null && minBase !== null
             ? Math.min(minStore, minBase)
-            : minStore ?? minBase;
+            : (minStore ?? minBase);
 
         variantTypes = unique(
           variantsRes.rows.map((v) => {
