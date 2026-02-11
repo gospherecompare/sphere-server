@@ -9,6 +9,9 @@ const { client, db } = require("./db");
 const multer = require("multer");
 const { sendRegistrationMail } = require("./utils/mailer");
 const { authenticateCustomer, authenticate } = require("./middleware/auth");
+const {
+  recomputeProductDynamicScoreSmartphones,
+} = require("./utils/hookScore");
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
@@ -26,7 +29,6 @@ app.use(
       "http://localhost:3000",
       "http://localhost:5173",
       "https://main.d2jgd4xy0rohx4.amplifyapp.com",
-      "https://main.d2ecrzwmegqlb.amplifyapp.com",
       "https://www.tryhook.shop/",
       "https://www.tryhook.shop",
     ],
@@ -506,6 +508,23 @@ async function runMigrations() {
         compared_at TIMESTAMP DEFAULT now()
       );
       `);
+
+    // Hook Dynamic Score (precomputed ranking signals)
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS product_dynamic_score (
+        product_id INT PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
+        buyer_intent NUMERIC DEFAULT 0,
+        trend_velocity NUMERIC DEFAULT 0,
+        freshness NUMERIC DEFAULT 0,
+        hook_score NUMERIC DEFAULT 0,
+        calculated_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_product_dynamic_score_hook
+      ON product_dynamic_score (hook_score DESC);
+    `);
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS wishlist (
         id SERIAL PRIMARY KEY,
@@ -1810,6 +1829,13 @@ app.get("/api/smartphones", async (req, res) => {
         s.sensors,
         s.created_at,
 
+        /* ---------- Hook Dynamic Score ---------- */
+        MAX(ds.hook_score) AS hook_score,
+        MAX(ds.buyer_intent) AS buyer_intent,
+        MAX(ds.trend_velocity) AS trend_velocity,
+        MAX(ds.freshness) AS freshness,
+        MAX(ds.calculated_at) AS hook_calculated_at,
+ 
         /* ---------- Images ---------- */
         COALESCE(
           (
@@ -1872,8 +1898,11 @@ app.get("/api/smartphones", async (req, res) => {
       LEFT JOIN product_variants v
         ON v.product_id = p.id
 
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
+ 
       WHERE p.product_type = 'smartphone'
-
+ 
       GROUP BY
         p.id, b.name,
         s.category, s.model, s.launch_date,
@@ -1881,7 +1910,7 @@ app.get("/api/smartphones", async (req, res) => {
         s.camera, s.battery, s.connectivity, s.network,
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at
 
-      ORDER BY p.id DESC;
+      ORDER BY COALESCE(MAX(ds.hook_score), 0) DESC, p.id DESC;
     `);
 
     res.json({ smartphones: result.rows });
@@ -4577,6 +4606,22 @@ app.post("/api/public/product/:id/view", async (req, res) => {
   }
 });
 
+// Recompute Hook Dynamic Score (admin) - use external cron to call this endpoint,
+// or run `npm run recompute:hookscore` on a schedule.
+app.post("/api/admin/hook-score/recompute", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const result = await recomputeProductDynamicScoreSmartphones(db);
+    return res.json(result);
+  } catch (err) {
+    console.error("POST /api/admin/hook-score/recompute error:", err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // Popular feature clicks (public) - aggregated per day
 app.post("/api/public/feature-click", async (req, res) => {
   try {
@@ -5284,6 +5329,15 @@ app.get("/api/public/product/:id", async (req, res) => {
 
     const product = pRes.rows[0];
 
+    const scoreRes = await db.query(
+      `SELECT hook_score, buyer_intent, trend_velocity, freshness, calculated_at
+       FROM product_dynamic_score
+       WHERE product_id = $1
+       LIMIT 1`,
+      [id],
+    );
+    const score = scoreRes.rows[0] || null;
+
     // Fetch product images
     const imgRes = await db.query(
       `SELECT image_url FROM product_images WHERE product_id = $1 ORDER BY position ASC`,
@@ -5326,6 +5380,11 @@ app.get("/api/public/product/:id", async (req, res) => {
       brand_id: product.brand_id,
       images: imgRes.rows.map((r) => r.image_url),
       variants: varRes,
+      hook_score: score?.hook_score ?? null,
+      buyer_intent: score?.buyer_intent ?? null,
+      trend_velocity: score?.trend_velocity ?? null,
+      freshness: score?.freshness ?? null,
+      hook_calculated_at: score?.calculated_at ?? null,
       ...smartphoneDetails,
       // Include the smartphone object as well for backward compatibility
       smartphone: smartphoneDetails,
@@ -5810,6 +5869,31 @@ async function start() {
     }
 
     await runMigrations();
+
+    // Optional: periodically recompute Hook Dynamic Score in-process.
+    // In production, prefer an external scheduler calling the admin endpoint
+    // or running the CLI script to avoid relying on a long-lived process.
+    if (process.env.HOOK_SCORE_CRON_ENABLED === "true") {
+      const defaultMs = 6 * 60 * 60 * 1000; // 6 hours
+      const intervalRaw = Number(process.env.HOOK_SCORE_CRON_INTERVAL_MS);
+      const intervalMs = Number.isFinite(intervalRaw)
+        ? Math.max(15 * 60 * 1000, Math.floor(intervalRaw))
+        : defaultMs;
+
+      const run = async () => {
+        try {
+          const r = await recomputeProductDynamicScoreSmartphones(db);
+          console.log("Hook score recompute:", r);
+        } catch (err) {
+          console.error("Hook score recompute failed:", err);
+        }
+      };
+
+      void run();
+      const timer = setInterval(run, intervalMs);
+      if (typeof timer.unref === "function") timer.unref();
+      console.log("Hook score cron enabled:", { intervalMs });
+    }
   } catch (err) {
     console.error("Migrations failed:", err);
     process.exit(1);
