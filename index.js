@@ -4,6 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const ExcelJS = require("exceljs");
 const { client, db } = require("./db");
 const multer = require("multer");
@@ -12,6 +13,7 @@ const { authenticateCustomer, authenticate } = require("./middleware/auth");
 const {
   recomputeProductDynamicScoreSmartphones,
 } = require("./utils/hookScore");
+const { recomputeProductTrendingScores } = require("./utils/trendingScore");
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
@@ -499,6 +501,22 @@ async function runMigrations() {
         viewed_at TIMESTAMP DEFAULT now()
       );
       `);
+
+    // Anonymous visitor key (hashed) enables "unique visitors" metrics.
+    await safeQuery(`
+      ALTER TABLE product_views
+      ADD COLUMN IF NOT EXISTS visitor_key TEXT;
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_product_views_product_viewed_at
+      ON product_views (product_id, viewed_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_product_views_product_visitor_viewed_at
+      ON product_views (product_id, visitor_key, viewed_at DESC);
+    `);
     //compared products table (cascade deletes to avoid FK blocks)
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS product_comparisons (
@@ -524,6 +542,33 @@ async function runMigrations() {
     await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_product_dynamic_score_hook
       ON product_dynamic_score (hook_score DESC);
+    `);
+
+    // Trending Scores (public "momentum" list) - can be recomputed on a schedule.
+    // Manual override fields allow editorial/campaign boosts.
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS product_trending_score (
+        product_id INT PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
+        views_7d INT NOT NULL DEFAULT 0,
+        compares_7d INT NOT NULL DEFAULT 0,
+        views_prev_7d INT NOT NULL DEFAULT 0,
+        velocity NUMERIC NOT NULL DEFAULT 0,
+        trending_score NUMERIC NOT NULL DEFAULT 0,
+        calculated_at TIMESTAMP DEFAULT now(),
+        manual_boost BOOLEAN DEFAULT false,
+        manual_priority INT DEFAULT 0,
+        manual_badge TEXT
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_product_trending_score_score
+      ON product_trending_score (trending_score DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_product_trending_score_sort
+      ON product_trending_score (manual_boost DESC, manual_priority DESC, trending_score DESC);
     `);
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS wishlist (
@@ -3331,6 +3376,15 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 
     /* ---------- UPSERT STORE PRICES ---------- */
     if (Array.isArray(req.body.variant_store_prices)) {
+      // Replace semantics: if `variant_store_prices` is provided, ensure removed
+      // store entries are deleted as well (so "delete store from variant" persists).
+      if (!productId) {
+        await client.query("ROLLBACK");
+        return res
+          .status(500)
+          .json({ message: "Missing product_id for smartphone" });
+      }
+
       const priceUpsertSQL = `
         INSERT INTO variant_store_prices 
           (id, variant_id, store_name, price, url, offer_text)
@@ -3357,28 +3411,96 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 
       const variantIdMap = req._variantIdMap || [];
 
-      for (const sp of req.body.variant_store_prices) {
-        // Resolve variant id: accept either a DB id or an input index (like 0)
-        let resolvedVariantId = null;
-        if (sp.variant_id !== undefined && sp.variant_id !== null) {
-          const vnum = Number(sp.variant_id);
-          if (!Number.isNaN(vnum)) {
-            if (variantIdMap[vnum]) resolvedVariantId = variantIdMap[vnum];
-            else resolvedVariantId = vnum; // treat as DB id
-          }
-        } else if (
-          sp.variant_index !== undefined &&
-          sp.variant_index !== null
-        ) {
+      // Load the set of variants that belong to this product (prevents editing
+      // store prices for another product's variants and helps resolve indices).
+      const pv = await client.query(
+        "SELECT id FROM product_variants WHERE product_id = $1",
+        [productId],
+      );
+      const productVariantIds = pv.rows.map((r) => r.id);
+      const productVariantIdSet = new Set(productVariantIds);
+
+      const resolveVariantId = (sp) => {
+        if (!sp) return null;
+
+        // Prefer explicit index mapping (unambiguous for clients that use it)
+        if (sp.variant_index !== undefined && sp.variant_index !== null) {
           const idx = Number(sp.variant_index);
-          if (!Number.isNaN(idx) && variantIdMap[idx])
-            resolvedVariantId = variantIdMap[idx];
+          if (!Number.isNaN(idx) && variantIdMap[idx]) {
+            const mapped = Number(variantIdMap[idx]);
+            return productVariantIdSet.has(mapped) ? mapped : null;
+          }
         }
 
+        // Prefer DB ids when they belong to this product; otherwise fall back to
+        // legacy behavior where `variant_id` might actually be an index.
+        if (sp.variant_id !== undefined && sp.variant_id !== null) {
+          const vnum = Number(sp.variant_id);
+          if (Number.isNaN(vnum)) return null;
+          if (productVariantIdSet.has(vnum)) return vnum;
+
+          if (variantIdMap[vnum]) {
+            const mapped = Number(variantIdMap[vnum]);
+            return productVariantIdSet.has(mapped) ? mapped : null;
+          }
+        }
+
+        return null;
+      };
+
+      // Determine which variants should have their store prices replaced:
+      // - If `variants` is provided, treat store prices as full replacement for all variants.
+      // - Otherwise, replace only for variants referenced by the payload.
+      const replaceVariantIds = new Set();
+      if (Array.isArray(req.body.variants)) {
+        productVariantIds.forEach((id) => replaceVariantIds.add(id));
+      } else {
+        for (const sp of req.body.variant_store_prices) {
+          const vid = resolveVariantId(sp);
+          if (vid) replaceVariantIds.add(vid);
+        }
+      }
+
+      // Delete store prices that are no longer present (by id) so removals persist.
+      const keepPriceIdsByVariant = new Map();
+      for (const vid of replaceVariantIds) keepPriceIdsByVariant.set(vid, new Set());
+      for (const sp of req.body.variant_store_prices) {
+        const vid = resolveVariantId(sp);
+        if (!vid || !replaceVariantIds.has(vid)) continue;
+        const pid = Number(sp.id);
+        if (Number.isInteger(pid) && pid > 0) {
+          keepPriceIdsByVariant.get(vid).add(pid);
+        }
+      }
+
+      for (const vid of replaceVariantIds) {
+        const keepIds = Array.from(keepPriceIdsByVariant.get(vid) || []);
+        if (keepIds.length === 0) {
+          await client.query(
+            "DELETE FROM variant_store_prices WHERE variant_id = $1",
+            [vid],
+          );
+        } else {
+          await client.query(
+            "DELETE FROM variant_store_prices WHERE variant_id = $1 AND NOT (id = ANY($2::int[]))",
+            [vid, keepIds],
+          );
+        }
+      }
+
+      for (const sp of req.body.variant_store_prices) {
+        const resolvedVariantId = resolveVariantId(sp);
         if (!resolvedVariantId) continue; // cannot resolve target variant
 
         const store_name = sp.store_name || sp.store || null;
-        const price = sp.price !== undefined ? Number(sp.price) : null;
+        if (!store_name) continue;
+
+        const parsedPrice =
+          sp.price !== undefined && sp.price !== null && sp.price !== ""
+            ? Number(sp.price)
+            : null;
+        const price = Number.isFinite(parsedPrice) ? parsedPrice : null;
+
         const url = sp.url || null;
         const offer_text = sp.offer_text || sp.offer || null;
 
@@ -4596,9 +4718,40 @@ app.post("/api/public/product/:id/view", async (req, res) => {
 
   console.log("Recording view for product id:", productId);
   try {
-    await db.query(`INSERT INTO product_views (product_id) VALUES ($1)`, [
-      productId,
-    ]);
+    const b = req.body || {};
+    const visitorIdRaw =
+      b.visitor_id ?? b.visitorId ?? req.headers["x-visitor-id"] ?? "";
+    const ipRaw =
+      (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+      req.ip ||
+      "";
+    const userAgent = req.headers["user-agent"] || "";
+
+    const keySource = visitorIdRaw
+      ? `vid:${String(visitorIdRaw).trim()}`
+      : `ip:${String(ipRaw)}|ua:${String(userAgent)}`;
+
+    const visitor_key = crypto
+      .createHash("sha256")
+      .update(keySource)
+      .digest("hex")
+      .slice(0, 32);
+
+    try {
+      await db.query(
+        `INSERT INTO product_views (product_id, visitor_key) VALUES ($1, $2)`,
+        [productId, visitor_key],
+      );
+    } catch (err) {
+      // Backward-compatible fallback if the DB hasn't added visitor_key yet
+      if (err && err.code === "42703") {
+        await db.query(`INSERT INTO product_views (product_id) VALUES ($1)`, [
+          productId,
+        ]);
+      } else {
+        throw err;
+      }
+    }
     return res.json({ message: "View recorded" });
   } catch (err) {
     console.error("Error recording product view:", err);
@@ -4619,6 +4772,208 @@ app.post("/api/admin/hook-score/recompute", authenticate, async (req, res) => {
   } catch (err) {
     console.error("POST /api/admin/hook-score/recompute error:", err);
     return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Recompute Trending Scores (admin) - run on a schedule via cron/CI or call this endpoint.
+app.post("/api/admin/trending/recompute", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const result = await recomputeProductTrendingScores(db);
+    return res.json(result);
+  } catch (err) {
+    console.error("POST /api/admin/trending/recompute error:", err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Admin: Inspect trending scores + signals (for debugging)
+app.get("/api/admin/trending", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const q = req.query || {};
+    const typeRaw = String(q.type ?? q.product_type ?? "").trim();
+    const limitRaw = Number(q.limit ?? 50);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(200, Math.max(1, Math.floor(limitRaw)))
+      : 50;
+
+    const allowedTypes = [
+      "smartphone",
+      "laptop",
+      "networking",
+      "home_appliance",
+      "accessories",
+    ];
+
+    const type =
+      typeRaw && allowedTypes.includes(typeRaw) ? typeRaw : typeRaw ? null : "";
+
+    if (type === null) {
+      return res.status(400).json({ message: "Invalid type" });
+    }
+
+    const params = [];
+    let where = "";
+    if (typeRaw) {
+      params.push(typeRaw);
+      where = `WHERE p.product_type = $${params.length}`;
+    }
+    params.push(limit);
+
+    const result = await db.query(
+      `
+      WITH views_total AS (
+        SELECT
+          product_id,
+          COUNT(*)::int AS views_total,
+          COUNT(DISTINCT COALESCE(visitor_key, id::text))::int AS unique_visitors_total
+        FROM product_views
+        GROUP BY product_id
+      ),
+      compares_total AS (
+        SELECT product_id, COUNT(*)::int AS compares_total
+        FROM (
+          SELECT product_id
+          FROM product_comparisons
+          UNION ALL
+          SELECT compared_with AS product_id
+          FROM product_comparisons
+        ) t
+        GROUP BY product_id
+      )
+      SELECT
+        p.id AS product_id,
+        p.name,
+        p.product_type,
+        b.name AS brand,
+        ts.views_7d,
+        ts.compares_7d,
+        ts.views_prev_7d,
+        ts.velocity,
+        ts.trending_score,
+        to_char(
+          ts.calculated_at AT TIME ZONE 'UTC',
+          'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+        ) AS calculated_at,
+        to_char(
+          MAX(ts.calculated_at) OVER () AT TIME ZONE 'UTC',
+          'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+        ) AS updated_at,
+        ts.manual_boost,
+        ts.manual_priority,
+        ts.manual_badge,
+        COALESCE(vt.views_total, 0) AS views_total,
+        COALESCE(vt.unique_visitors_total, 0) AS unique_visitors_total,
+        COALESCE(ct.compares_total, 0) AS compares_total
+      FROM product_trending_score ts
+      INNER JOIN products p
+        ON p.id = ts.product_id
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      LEFT JOIN views_total vt
+        ON vt.product_id = p.id
+      LEFT JOIN compares_total ct
+        ON ct.product_id = p.id
+      ${where}
+      ORDER BY
+        ts.manual_boost DESC,
+        ts.manual_priority DESC,
+        ts.trending_score DESC,
+        ts.calculated_at DESC,
+        p.id DESC
+      LIMIT $${params.length}
+      `,
+      params,
+    );
+
+    return res.json({
+      success: true,
+      type: typeRaw || "all",
+      period: "7d",
+      updated_at: result.rows?.[0]?.updated_at || null,
+      results: result.rows || [],
+    });
+  } catch (err) {
+    console.error("GET /api/admin/trending error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Admin: Manual boosts (editorial/campaign overrides)
+app.post("/api/admin/trending/boost", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const body = req.body || {};
+    const productId = Number(body.product_id ?? body.productId ?? body.id);
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ message: "Invalid product_id" });
+    }
+
+    const manualBoost =
+      body.manual_boost ?? body.manualBoost ?? body.manual ?? body.boost;
+    const manualPriorityRaw = Number(
+      body.manual_priority ?? body.manualPriority ?? body.priority ?? 0,
+    );
+    const manualPriority = Number.isFinite(manualPriorityRaw)
+      ? Math.max(0, Math.floor(manualPriorityRaw))
+      : 0;
+    const manualBadgeRaw = body.manual_badge ?? body.manualBadge ?? body.badge;
+    const manualBadge =
+      manualBadgeRaw === null || manualBadgeRaw === undefined
+        ? null
+        : String(manualBadgeRaw).trim().slice(0, 64);
+
+    const parseBool = (v) => {
+      if (v === true || v === false) return v;
+      if (v === 1 || v === 0) return Boolean(v);
+      if (v === null || v === undefined) return false;
+      const s = String(v).trim().toLowerCase();
+      if (["true", "1", "yes", "y", "on"].includes(s)) return true;
+      if (["false", "0", "no", "n", "off"].includes(s)) return false;
+      return false;
+    };
+
+    const manual_boost = parseBool(manualBoost);
+
+    await db.query(
+      `
+      INSERT INTO product_trending_score (product_id, manual_boost, manual_priority, manual_badge)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (product_id)
+      DO UPDATE SET
+        manual_boost = EXCLUDED.manual_boost,
+        manual_priority = EXCLUDED.manual_priority,
+        manual_badge = EXCLUDED.manual_badge
+      `,
+      [productId, manual_boost, manualPriority, manualBadge],
+    );
+
+    return res.json({
+      success: true,
+      product_id: productId,
+      manual_boost,
+      manual_priority: manualPriority,
+      manual_badge: manualBadge,
+    });
+  } catch (err) {
+    console.error("POST /api/admin/trending/boost error:", err);
+    if (err && err.code === "23503") {
+      return res.status(400).json({ message: "Invalid product_id" });
+    }
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
@@ -4720,20 +5075,136 @@ app.get("/api/public/popular-features", async (req, res) => {
 });
 
 app.get("/api/public/trending-products", async (req, res) => {
-  const result = await db.query(`
-    SELECT 
-      p.id,
-      p.name,
-      COUNT(v.id) AS views
-    FROM product_views v
-    JOIN products p ON p.id = v.product_id
-    WHERE v.viewed_at >= now() - INTERVAL '7 days'
-    GROUP BY p.id
-    ORDER BY views DESC
-    LIMIT 10;
-  `);
+  try {
+    const q = req.query || {};
+    const typeRaw = String(q.type ?? q.product_type ?? "smartphone").trim();
+    const limitRaw = Number(q.limit ?? 10);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(50, Math.max(1, Math.floor(limitRaw)))
+      : 10;
 
-  res.json({ trending: result.rows });
+    const allowedTypes = [
+      "smartphone",
+      "laptop",
+      "networking",
+      "home_appliance",
+      "accessories",
+    ];
+
+    if (!allowedTypes.includes(typeRaw)) {
+      return res.status(400).json({ message: "Invalid type" });
+    }
+
+    const result = await db.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name,
+        p.product_type,
+        b.name AS brand,
+        ts.trending_score,
+        ts.manual_boost,
+        ts.manual_priority,
+        ts.manual_badge,
+        to_char(
+          MAX(ts.calculated_at) OVER () AT TIME ZONE 'UTC',
+          'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+        ) AS updated_at,
+        (
+          SELECT pi.image_url
+          FROM product_images pi
+          WHERE pi.product_id = p.id
+          ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+          LIMIT 1
+        ) AS image,
+        COALESCE(
+          (
+            SELECT MIN(sp.price)
+            FROM product_variants v
+            LEFT JOIN variant_store_prices sp
+              ON sp.variant_id = v.id
+            WHERE v.product_id = p.id
+              AND sp.price IS NOT NULL
+          ),
+          (
+            SELECT MIN(v.base_price)
+            FROM product_variants v
+            WHERE v.product_id = p.id
+              AND v.base_price IS NOT NULL
+          )
+        ) AS price
+      FROM product_trending_score ts
+      INNER JOIN products p
+        ON p.id = ts.product_id
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      WHERE p.product_type = $1
+      ORDER BY
+        ts.manual_boost DESC,
+        ts.manual_priority DESC,
+        ts.trending_score DESC,
+        p.id DESC
+      LIMIT $2
+      `,
+      [typeRaw, limit],
+    );
+
+    const slugify = (name, id) => {
+      const s = name
+        ? String(name)
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/(^-|-$)/g, "")
+        : "";
+      return s || `product-${id}`;
+    };
+
+    const badgeForScore = (score) => {
+      const s = Number(score);
+      if (!Number.isFinite(s)) return "👀 Gaining Attention";
+      if (s >= 80) return "🔥 Trending Now";
+      if (s >= 60) return "📈 Popular This Week";
+      return "👀 Gaining Attention";
+    };
+
+    const rows = result.rows || [];
+    const updatedAt = rows?.[0]?.updated_at || null;
+
+    const trending = rows.map((r) => {
+      const manualBoost = Boolean(r.manual_boost);
+      const manualBadge = r.manual_badge ? String(r.manual_badge).trim() : "";
+      const badge =
+        manualBoost && manualBadge
+          ? manualBadge
+          : manualBoost
+            ? "🚀 Editor Pick"
+            : badgeForScore(r.trending_score);
+
+      return {
+        id: r.product_id,
+        name: r.name,
+        slug: slugify(r.name, r.product_id),
+        image: r.image || null,
+        price: r.price ?? null,
+        brand: r.brand || null,
+        product_type: r.product_type,
+        badge,
+      };
+    });
+
+    return res.json({
+      type: typeRaw,
+      period: "7d",
+      updated_at: updatedAt,
+      trending,
+    });
+  } catch (err) {
+    console.error("GET /api/public/trending-products error:", err);
+    return res.status(500).json({ message: "Failed to fetch trending products" });
+  }
 });
 
 // Trending Smartphones (variant-based: storage)
@@ -5893,6 +6364,31 @@ async function start() {
       const timer = setInterval(run, intervalMs);
       if (typeof timer.unref === "function") timer.unref();
       console.log("Hook score cron enabled:", { intervalMs });
+    }
+
+    // Optional: periodically recompute Trending Scores in-process.
+    // In production, prefer an external scheduler calling the admin endpoint
+    // or running the CLI script.
+    if (process.env.TRENDING_SCORE_CRON_ENABLED === "true") {
+      const defaultMs = 6 * 60 * 60 * 1000; // 6 hours
+      const intervalRaw = Number(process.env.TRENDING_SCORE_CRON_INTERVAL_MS);
+      const intervalMs = Number.isFinite(intervalRaw)
+        ? Math.max(15 * 60 * 1000, Math.floor(intervalRaw))
+        : defaultMs;
+
+      const run = async () => {
+        try {
+          const r = await recomputeProductTrendingScores(db);
+          console.log("Trending score recompute:", r);
+        } catch (err) {
+          console.error("Trending score recompute failed:", err);
+        }
+      };
+
+      void run();
+      const timer = setInterval(run, intervalMs);
+      if (typeof timer.unref === "function") timer.unref();
+      console.log("Trending score cron enabled:", { intervalMs });
     }
   } catch (err) {
     console.error("Migrations failed:", err);
