@@ -5287,6 +5287,7 @@ const handleTrendingSmartphones = async (req, res) => {
         p.name,
         b.name AS brand,
         s.model,
+        tp.views AS views_rank,
         (
           SELECT pi.image_url
           FROM product_images pi
@@ -5360,7 +5361,7 @@ const handleTrendingSmartphones = async (req, res) => {
       JOIN smartphones s ON s.product_id = p.id
       LEFT JOIN brands b ON b.id = p.brand_id
       LEFT JOIN product_variants v ON v.product_id = p.id
-      GROUP BY p.id, p.name, b.name, s.model
+      GROUP BY p.id, p.name, b.name, s.model, tp.views
       ORDER BY tp.views DESC, starting_price ASC NULLS LAST;
       `,
       [limit],
