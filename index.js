@@ -5207,71 +5207,190 @@ app.get("/api/public/trending-products", async (req, res) => {
   }
 });
 
-// Trending Smartphones (variant-based: storage)
-app.get("/api/public/trending/smartphones", async (req, res) => {
+const normalizeMemoryValue = (value) => {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+
+  const parsed = text.match(/(\d+(?:\.\d+)?)\s*(TB|GB|MB)/i);
+  if (parsed) {
+    const amount = Number(parsed[1]);
+    const unit = parsed[2].toUpperCase();
+    return `${Number.isFinite(amount) ? amount : parsed[1]} ${unit}`;
+  }
+
+  const cleaned = text
+    .replace(/\b(ram|rom|storage|internal|memory)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return cleaned || text;
+};
+
+const memoryToMb = (value) => {
+  if (value === null || value === undefined) return Number.MAX_SAFE_INTEGER;
+  const text = String(value).trim();
+  if (!text) return Number.MAX_SAFE_INTEGER;
+  const parsed = text.match(/(\d+(?:\.\d+)?)\s*(TB|GB|MB)/i);
+  if (!parsed) return Number.MAX_SAFE_INTEGER;
+
+  const amount = Number(parsed[1]);
+  if (!Number.isFinite(amount)) return Number.MAX_SAFE_INTEGER;
+  const unit = parsed[2].toUpperCase();
+
+  if (unit === "TB") return amount * 1024 * 1024;
+  if (unit === "GB") return amount * 1024;
+  return amount;
+};
+
+const combineMemoryValues = (values) => {
+  if (!values || values.length === 0) return null;
+  const normalized = values
+    .map(normalizeMemoryValue)
+    .filter((val) => val && String(val).trim().length > 0);
+  if (normalized.length === 0) return null;
+
+  const unique = Array.from(new Set(normalized));
+  unique.sort((a, b) => {
+    const diff = memoryToMb(a) - memoryToMb(b);
+    if (diff !== 0) return diff;
+    return String(a).localeCompare(String(b));
+  });
+
+  return unique.join(" / ");
+};
+
+const handleTrendingSmartphones = async (req, res) => {
   try {
-    const result = await db.query(`
+    const limitRaw = Number(req.query?.limit ?? 20);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(50, Math.max(1, Math.floor(limitRaw)))
+      : 20;
+
+    const result = await db.query(
+      `
+      WITH top_products AS (
+        SELECT p.id AS product_id, COUNT(v.id) AS views
+        FROM product_views v
+        JOIN products p ON p.id = v.product_id
+        JOIN product_publish pub
+          ON pub.product_id = p.id
+         AND pub.is_published = true
+        WHERE p.product_type = 'smartphone'
+          AND v.viewed_at >= NOW() - INTERVAL '7 days'
+        GROUP BY p.id
+        ORDER BY views DESC
+        LIMIT $1
+      )
       SELECT
         p.id AS product_id,
-        v.id AS variant_id,
         p.name,
         b.name AS brand,
         s.model,
-
-        v.attributes->>'ram' AS ram,
-        v.attributes->>'storage' AS storage,
-        v.base_price,
-
-        -- ✅ product image
         (
           SELECT pi.image_url
           FROM product_images pi
           WHERE pi.product_id = p.id
-          ORDER BY pi.position ASC
+          ORDER BY pi.position ASC NULLS LAST, pi.id ASC
           LIMIT 1
         ) AS image_url,
+        COALESCE(
+          (
+            SELECT MIN(sp.price)
+            FROM product_variants v
+            LEFT JOIN variant_store_prices sp
+              ON sp.variant_id = v.id
+            WHERE v.product_id = p.id
+              AND sp.price IS NOT NULL
+          ),
+          (
+            SELECT MIN(v.base_price)
+            FROM product_variants v
+            WHERE v.product_id = p.id
+              AND v.base_price IS NOT NULL
+          )
+        ) AS starting_price,
+        ARRAY_AGG(
+          DISTINCT NULLIF(
+            COALESCE(
+              v.attributes->>'ram',
+              v.attributes->>'RAM',
+              v.attributes->>'memory'
+            ),
+            ''
+          )
+        ) FILTER (
+          WHERE COALESCE(
+            v.attributes->>'ram',
+            v.attributes->>'RAM',
+            v.attributes->>'memory'
+          ) IS NOT NULL
+            AND COALESCE(
+              v.attributes->>'ram',
+              v.attributes->>'RAM',
+              v.attributes->>'memory'
+            ) <> ''
+        ) AS ram_values,
+        ARRAY_AGG(
+          DISTINCT NULLIF(
+            COALESCE(
+              v.attributes->>'storage',
+              v.attributes->>'rom',
+              v.attributes->>'ROM_storage',
+              v.attributes->>'internal_storage'
+            ),
+            ''
+          )
+        ) FILTER (
+          WHERE COALESCE(
+            v.attributes->>'storage',
+            v.attributes->>'rom',
+            v.attributes->>'ROM_storage',
+            v.attributes->>'internal_storage'
+          ) IS NOT NULL
+            AND COALESCE(
+              v.attributes->>'storage',
+              v.attributes->>'rom',
+              v.attributes->>'ROM_storage',
+              v.attributes->>'internal_storage'
+            ) <> ''
+        ) AS storage_values
+      FROM top_products tp
+      JOIN products p ON p.id = tp.product_id
+      JOIN smartphones s ON s.product_id = p.id
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN product_variants v ON v.product_id = p.id
+      GROUP BY p.id, p.name, b.name, s.model
+      ORDER BY tp.views DESC, starting_price ASC NULLS LAST;
+      `,
+      [limit],
+    );
 
-        COUNT(pv.id) AS views
+    const rows = result.rows || [];
+    const trending = rows.map((row) => ({
+      id: row.product_id,
+      product_id: row.product_id,
+      name: row.name,
+      brand: row.brand || null,
+      model: row.model || null,
+      image_url: row.image_url || null,
+      starting_price: row.starting_price ?? null,
+      ram: combineMemoryValues(row.ram_values || []),
+      storage: combineMemoryValues(row.storage_values || []),
+    }));
 
-      FROM product_views pv
-      INNER JOIN products p
-        ON p.id = pv.product_id
-      INNER JOIN smartphones s
-        ON s.product_id = p.id
-      INNER JOIN product_variants v
-        ON v.product_id = p.id
-      LEFT JOIN brands b
-        ON b.id = p.brand_id
-      INNER JOIN product_publish pub
-        ON pub.product_id = p.id
-       AND pub.is_published = true
-
-      WHERE p.product_type = 'smartphone'
-
-      GROUP BY
-        p.id,
-        v.id,
-        b.name,
-        s.model,
-        v.attributes,
-        v.base_price
-
-      ORDER BY views DESC
-      LIMIT 20;
-    `);
-
-    res.json({
-      success: true,
-      trending: result.rows,
-    });
+    return res.json({ success: true, trending });
   } catch (err) {
-    console.error("Trending smartphones (variant) error:", err);
-    res.status(500).json({
+    console.error("Trending smartphones error:", err);
+    return res.status(500).json({
       success: false,
       message: "Failed to fetch trending smartphones",
     });
   }
-});
+};
+
+// Trending Smartphones (grouped by product, combined RAM/ROM)
+app.get("/api/public/trending/smartphones", handleTrendingSmartphones);
 
 // Trending Laptops
 app.get("/api/public/trending/laptops", async (req, res) => {
@@ -5594,36 +5713,6 @@ app.get("/api/public/trending/all", async (req, res) => {
     console.error("GET /api/public/trending/all error:", err);
     return res.status(500).json({ error: err.message });
   }
-});
-
-app.get("/api/public/trending/smartphones", async (req, res) => {
-  const result = await db.query(`
-    SELECT
-      p.id,
-      p.name,
-      p.slug,
-      b.name AS brand,
-      COUNT(v.id) AS views,
-      s.display_size,
-      s.processor,
-      (
-        SELECT MIN(price)
-        FROM product_variants pv
-        WHERE pv.product_id = p.id
-      ) AS starting_price
-    FROM product_views v
-    JOIN products p ON p.id = v.product_id
-    JOIN smartphones s ON s.product_id = p.id
-    LEFT JOIN brands b ON b.id = p.brand_id
-    WHERE
-      p.product_type = 'smartphone'
-      AND v.viewed_at >= NOW() - INTERVAL '7 days'
-    GROUP BY p.id, s.id, b.name
-    ORDER BY views DESC
-    LIMIT 10;
-  `);
-
-  res.json(result.rows);
 });
 
 app.post("/api/public/compare", async (req, res) => {
