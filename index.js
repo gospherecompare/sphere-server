@@ -2077,52 +2077,34 @@ app.get("/api/smartphone/:id", async (req, res) => {
     if (!rawId || rawId.trim() === "")
       return res.status(400).json({ message: "Invalid id" });
 
-    // Try to find by internal smartphones.id OR by product_id (product's id)
-    const sres = await db.query(
-      "SELECT * FROM smartphones WHERE id = $1 OR product_id = $1 LIMIT 1",
-      [sid],
-    );
-    if (!sres.rows.length) {
-      // If the id wasn't numeric or no match by numeric id, also try matching by model or product id string
-      if (isNaN(sid)) {
-        const sres2 = await db.query(
-          "SELECT * FROM smartphones WHERE model = $1 OR brand = $1 LIMIT 1",
-          [rawId],
+    let smartphone = null;
+    if (!Number.isNaN(sid)) {
+      // Prefer product_id match first to avoid collisions with smartphones.id
+      const byProduct = await db.query(
+        "SELECT * FROM smartphones WHERE product_id = $1 LIMIT 1",
+        [sid],
+      );
+      if (byProduct.rows.length) {
+        smartphone = byProduct.rows[0];
+      } else {
+        const byId = await db.query(
+          "SELECT * FROM smartphones WHERE id = $1 LIMIT 1",
+          [sid],
         );
-        if (!sres2.rows.length)
-          return res.status(404).json({ message: "Not found" });
-        const smartphone = sres2.rows[0];
-        const productId = smartphone.product_id;
-        // Fetch product name from products table (ensure response includes product name)
-        const prodRes2 = await db.query(
-          "SELECT name FROM products WHERE id = $1 LIMIT 1",
-          [productId],
-        );
-        const productName2 = prodRes2.rows[0] ? prodRes2.rows[0].name : null;
-        const variantsRes = await db.query(
-          "SELECT * FROM product_variants WHERE product_id = $1 ORDER BY id ASC",
-          [productId],
-        );
-
-        const variants = [];
-        for (const v of variantsRes.rows) {
-          const stores = await db.query(
-            "SELECT * FROM variant_store_prices  WHERE variant_id = $1 ORDER BY id ASC",
-            [v.id],
-          );
-          const ram = v.attributes ? v.attributes.ram || null : null;
-          const storage = v.attributes ? v.attributes.storage || null : null;
-          variants.push({ ...v, ram, storage, store_prices: stores.rows });
-        }
-
-        return res.json({
-          data: { ...smartphone, name: productName2, variants },
-        });
+        if (byId.rows.length) smartphone = byId.rows[0];
       }
+    } else {
+      const sres2 = await db.query(
+        "SELECT * FROM smartphones WHERE model = $1 OR brand = $1 LIMIT 1",
+        [rawId],
+      );
+      if (sres2.rows.length) smartphone = sres2.rows[0];
+    }
+
+    if (!smartphone) {
       return res.status(404).json({ message: "Not found" });
     }
 
-    const smartphone = sres.rows[0];
     const productId = smartphone.product_id;
     // Fetch product name from products table and include in response
     const prodRes = await db.query(
@@ -3187,10 +3169,16 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       return res.status(400).json({ message: "Invalid id" });
     }
 
-    const findRes = await client.query(
-      "SELECT id, product_id FROM smartphones WHERE id = $1 OR product_id = $1 LIMIT 1",
+    let findRes = await client.query(
+      "SELECT id, product_id FROM smartphones WHERE product_id = $1 LIMIT 1",
       [parsedId],
     );
+    if (!findRes.rows.length) {
+      findRes = await client.query(
+        "SELECT id, product_id FROM smartphones WHERE id = $1 LIMIT 1",
+        [parsedId],
+      );
+    }
     if (!findRes.rows.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "Smartphone not found" });
@@ -3621,10 +3609,16 @@ app.delete("/api/smartphone/:id", authenticate, async (req, res) => {
 
     // resolve product_id from smartphone
     // Accept either internal smartphones.id or the linked products.id (product_id)
-    const sres = await client.query(
-      "SELECT product_id FROM smartphones WHERE id = $1 OR product_id = $1 LIMIT 1",
+    let sres = await client.query(
+      "SELECT product_id FROM smartphones WHERE product_id = $1 LIMIT 1",
       [sid],
     );
+    if (!sres.rows.length) {
+      sres = await client.query(
+        "SELECT product_id FROM smartphones WHERE id = $1 LIMIT 1",
+        [sid],
+      );
+    }
     if (!sres.rows.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "Smartphone not found" });
