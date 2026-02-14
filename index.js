@@ -14,6 +14,11 @@ const {
   recomputeProductDynamicScoreSmartphones,
 } = require("./utils/hookScore");
 const { recomputeProductTrendingScores } = require("./utils/trendingScore");
+const {
+  normalizeCompareScoreConfig,
+  buildCompareRanking,
+  weightsToPercent,
+} = require("./utils/compareScoring");
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
@@ -136,6 +141,40 @@ function normalizeBodyKeys(obj) {
     out[nk] = obj[k];
   }
   return out;
+}
+
+const DEFAULT_COMPARE_SCORING_CONFIG = normalizeCompareScoreConfig({});
+
+const toCompareScoringAdminResponse = (config) => ({
+  weights: weightsToPercent(config.weights || DEFAULT_COMPARE_SCORING_CONFIG.weights),
+  chipset_rules: Array.isArray(config.chipsetRules)
+    ? config.chipsetRules
+    : DEFAULT_COMPARE_SCORING_CONFIG.chipsetRules,
+  updated_at: config.updated_at || null,
+});
+
+async function readCompareScoringConfig() {
+  const result = await db.query(
+    `SELECT weights, chipset_rules, updated_at
+     FROM compare_scoring_config
+     WHERE id = 1
+     LIMIT 1`,
+  );
+
+  if (!result.rows.length) {
+    return { ...DEFAULT_COMPARE_SCORING_CONFIG, updated_at: null };
+  }
+
+  const row = result.rows[0];
+  const normalized = normalizeCompareScoreConfig({
+    weights: row.weights,
+    chipset_rules: row.chipset_rules,
+  });
+
+  return {
+    ...normalized,
+    updated_at: row.updated_at || null,
+  };
 }
 
 /* -----------------------
@@ -570,6 +609,23 @@ async function runMigrations() {
       CREATE INDEX IF NOT EXISTS idx_product_trending_score_sort
       ON product_trending_score (manual_boost DESC, manual_priority DESC, trending_score DESC);
     `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS compare_scoring_config (
+        id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        weights JSONB NOT NULL DEFAULT '{"performance":0.36,"display":0.2,"camera":0.2,"battery":0.14,"priceValue":0.1}'::jsonb,
+        chipset_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
+        updated_by INT REFERENCES "user"(id),
+        updated_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      INSERT INTO compare_scoring_config (id)
+      VALUES (1)
+      ON CONFLICT (id) DO NOTHING;
+    `);
+
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS wishlist (
         id SERIAL PRIMARY KEY,
@@ -4971,6 +5027,61 @@ app.post("/api/admin/trending/boost", authenticate, async (req, res) => {
   }
 });
 
+app.get("/api/admin/compare-scoring", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const config = await readCompareScoringConfig();
+    return res.json(toCompareScoringAdminResponse(config));
+  } catch (err) {
+    console.error("GET /api/admin/compare-scoring error:", err);
+    return res.status(500).json({ message: "Failed to load compare scoring config" });
+  }
+});
+
+app.put("/api/admin/compare-scoring", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const body = req.body || {};
+    const normalized = normalizeCompareScoreConfig({
+      weights: body.weights || body,
+      chipset_rules: body.chipset_rules ?? body.chipsetRules ?? [],
+    });
+
+    await db.query(
+      `
+      INSERT INTO compare_scoring_config (id, weights, chipset_rules, updated_by, updated_at)
+      VALUES (1, $1::jsonb, $2::jsonb, $3, now())
+      ON CONFLICT (id)
+      DO UPDATE SET
+        weights = EXCLUDED.weights,
+        chipset_rules = EXCLUDED.chipset_rules,
+        updated_by = EXCLUDED.updated_by,
+        updated_at = now()
+      `,
+      [
+        JSON.stringify(normalized.weights),
+        JSON.stringify(normalized.chipsetRules),
+        req.user?.id ?? null,
+      ],
+    );
+
+    const updated = await readCompareScoringConfig();
+    return res.json({
+      success: true,
+      ...toCompareScoringAdminResponse(updated),
+    });
+  } catch (err) {
+    console.error("PUT /api/admin/compare-scoring error:", err);
+    return res.status(500).json({ message: "Failed to update compare scoring config" });
+  }
+});
+
 // Popular feature clicks (public) - aggregated per day
 app.post("/api/public/feature-click", async (req, res) => {
   try {
@@ -5707,6 +5818,123 @@ app.get("/api/public/trending/all", async (req, res) => {
   } catch (err) {
     console.error("GET /api/public/trending/all error:", err);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/public/compare/scores", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const rawDevices = Array.isArray(body.devices)
+      ? body.devices
+      : Array.isArray(body.products)
+        ? body.products
+        : [];
+
+    const normalizedDevices = [];
+    const seenProductIds = new Set();
+
+    for (const item of rawDevices) {
+      const productIdRaw =
+        typeof item === "number"
+          ? item
+          : item?.product_id ?? item?.productId ?? item?.id;
+      const productId = Number(productIdRaw);
+      if (!Number.isInteger(productId) || productId <= 0) continue;
+      if (seenProductIds.has(productId)) continue;
+
+      const variantId = Number(item?.variant_id ?? item?.variantId);
+      const variantIndex = Number(item?.variant_index ?? item?.variantIndex);
+
+      const entry = { product_id: productId };
+      if (Number.isInteger(variantId) && variantId > 0) {
+        entry.variant_id = variantId;
+      } else if (Number.isInteger(variantIndex) && variantIndex >= 0) {
+        entry.variant_index = variantIndex;
+      }
+
+      normalizedDevices.push(entry);
+      seenProductIds.add(productId);
+    }
+
+    if (normalizedDevices.length < 2 || normalizedDevices.length > 4) {
+      return res.status(400).json({
+        message: "Select minimum 2 and maximum 4 valid products",
+      });
+    }
+
+    const productIds = normalizedDevices.map((entry) => entry.product_id);
+    const productResult = await db.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name,
+        p.product_type,
+        COALESCE(s.performance, n.performance, l.cpu, ha.performance, '{}'::jsonb) AS performance,
+        COALESCE(s.display, l.display, '{}'::jsonb) AS display,
+        COALESCE(s.camera, '{}'::jsonb) AS camera,
+        COALESCE(s.battery, l.battery, '{}'::jsonb) AS battery,
+        (
+          SELECT MIN(v.base_price)
+          FROM product_variants v
+          WHERE v.product_id = p.id
+            AND v.base_price IS NOT NULL
+        ) AS min_price,
+        COALESCE(
+          (
+            SELECT json_agg(
+              jsonb_build_object(
+                'id', v.id,
+                'base_price', v.base_price,
+                'price', v.base_price,
+                'attributes', v.attributes
+              )
+              ORDER BY v.id ASC
+            )
+            FROM product_variants v
+            WHERE v.product_id = p.id
+          ),
+          '[]'::json
+        ) AS variants
+      FROM products p
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+      LEFT JOIN smartphones s
+        ON s.product_id = p.id
+      LEFT JOIN laptop l
+        ON l.product_id = p.id
+      LEFT JOIN networking n
+        ON n.product_id = p.id
+      LEFT JOIN home_appliance ha
+        ON ha.product_id = p.id
+      WHERE p.id = ANY($1::int[])
+      `,
+      [productIds],
+    );
+
+    if (productResult.rows.length < 2) {
+      return res.status(404).json({ message: "Products not found" });
+    }
+
+    const compareConfig = await readCompareScoringConfig();
+    const variantSelection = Object.fromEntries(
+      normalizedDevices.map((entry) => [String(entry.product_id), entry]),
+    );
+    const ranking = buildCompareRanking(
+      productResult.rows,
+      variantSelection,
+      compareConfig,
+    );
+
+    return res.json({
+      scores: ranking.map((row) => ({
+        product_id: Number(row.productId),
+        overall_score: row.overallScore,
+      })),
+    });
+  } catch (err) {
+    console.error("POST /api/public/compare/scores error:", err);
+    return res.status(500).json({ message: "Failed to score comparison" });
   }
 });
 
