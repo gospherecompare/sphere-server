@@ -12,6 +12,8 @@ const { sendRegistrationMail } = require("./utils/mailer");
 const { authenticateCustomer, authenticate } = require("./middleware/auth");
 const {
   recomputeProductDynamicScoreSmartphones,
+  recomputeProductDynamicScoreLaptops,
+  recomputeProductDynamicScoreTVs,
 } = require("./utils/hookScore");
 const { recomputeProductTrendingScores } = require("./utils/trendingScore");
 const {
@@ -143,10 +145,715 @@ function normalizeBodyKeys(obj) {
   return out;
 }
 
+const LAPTOP_REQUIRED_SECTION_KEYS = [
+  "basic_info_json",
+  "build_design_json",
+  "display_json",
+  "performance_json",
+  "memory_json",
+  "storage_json",
+  "battery_json",
+  "connectivity_json",
+  "ports_json",
+  "multimedia_json",
+  "software_json",
+  "security_json",
+  "physical_json",
+  "camera_json",
+  "warranty_json",
+  "environmental_json",
+  "in_the_box_json",
+  "import_details_json",
+];
+
+const LAPTOP_SCORE_SECTION_KEYS = new Set([
+  "build_design_json",
+  "display_json",
+  "performance_json",
+  "memory_json",
+  "storage_json",
+  "battery_json",
+  "connectivity_json",
+  "ports_json",
+  "multimedia_json",
+  "software_json",
+  "security_json",
+  "physical_json",
+  "camera_json",
+  "warranty_json",
+  "environmental_json",
+]);
+
+const LAPTOP_CANONICAL_SECTION_TO_JSON = {
+  basic_info: "basic_info_json",
+  performance: "performance_json",
+  display: "display_json",
+  memory: "memory_json",
+  storage: "storage_json",
+  battery: "battery_json",
+  multimedia: "multimedia_json",
+  ports: "ports_json",
+  camera: "camera_json",
+  security: "security_json",
+  physical: "physical_json",
+  software: "software_json",
+};
+
+const toPlainObject = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value;
+};
+
+const hasOwn = (obj, key) =>
+  Object.prototype.hasOwnProperty.call(obj || {}, key);
+
+const toArray = (value) => {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null || value === "") return [];
+  return [value];
+};
+
+const normalizeNullableText = (value) => {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+  }
+  return value;
+};
+
+const stripScoreKey = (value) => {
+  const obj = toPlainObject(value);
+  const { score: _score, ...rest } = obj;
+  return rest;
+};
+
+const mergeSectionObject = (base, incoming, ensureScore = false) => {
+  const merged = { ...toPlainObject(base), ...toPlainObject(incoming) };
+  if (ensureScore && !hasOwn(merged, "score")) merged.score = null;
+  return merged;
+};
+
+const ensureSectionShape = (value, ensureScore = false) => {
+  const normalized = toPlainObject(value);
+  if (ensureScore && !hasOwn(normalized, "score")) normalized.score = null;
+  return normalized;
+};
+
+const getObjectValue = (payload, directKey, sectionKey, existingValue = {}) => {
+  if (hasOwn(payload, directKey)) return toPlainObject(payload[directKey]);
+  if (hasOwn(payload, sectionKey)) return stripScoreKey(payload[sectionKey]);
+  return toPlainObject(existingValue);
+};
+
+const buildLegacyLaptopFromPayload = (payload, existingLaptopRow = {}) => {
+  const existingRow = existingLaptopRow || {};
+  const multimediaJson = toPlainObject(payload.multimedia_json);
+
+  const features = hasOwn(payload, "features")
+    ? toArray(payload.features).filter(Boolean)
+    : hasOwn(multimediaJson, "features")
+      ? toArray(multimediaJson.features).filter(Boolean)
+      : toArray(existingRow.features).filter(Boolean);
+
+  return {
+    cpu: getObjectValue(payload, "cpu", "performance_json", existingRow.cpu),
+    display: getObjectValue(
+      payload,
+      "display",
+      "display_json",
+      existingRow.display,
+    ),
+    memory: getObjectValue(
+      payload,
+      "memory",
+      "memory_json",
+      existingRow.memory,
+    ),
+    storage: getObjectValue(
+      payload,
+      "storage",
+      "storage_json",
+      existingRow.storage,
+    ),
+    battery: getObjectValue(
+      payload,
+      "battery",
+      "battery_json",
+      existingRow.battery,
+    ),
+    connectivity: getObjectValue(
+      payload,
+      "connectivity",
+      "connectivity_json",
+      existingRow.connectivity,
+    ),
+    physical: getObjectValue(
+      payload,
+      "physical",
+      "physical_json",
+      existingRow.physical,
+    ),
+    software: getObjectValue(
+      payload,
+      "software",
+      "software_json",
+      existingRow.software,
+    ),
+    warranty: getObjectValue(
+      payload,
+      "warranty",
+      "warranty_json",
+      existingRow.warranty,
+    ),
+    features,
+  };
+};
+
+const normalizeLaptopPayload = (inputLaptop = {}, existingLaptopRow = {}) => {
+  const payload = toPlainObject(inputLaptop);
+  const existingRow = existingLaptopRow || {};
+  const existingMeta = toPlainObject(existingRow.meta);
+  const existingSections = toPlainObject(existingRow.spec_sections);
+  const canonicalBasicInfo = toPlainObject(payload.basic_info);
+  const basicInfoJson = mergeSectionObject(
+    toPlainObject(payload.basic_info_json),
+    stripScoreKey(canonicalBasicInfo),
+  );
+  const canonicalMetadata = toPlainObject(payload.metadata);
+  const canonicalBuildDesign = toPlainObject(canonicalMetadata.build_design);
+  const buildDesignJson = mergeSectionObject(
+    toPlainObject(payload.build_design_json),
+    stripScoreKey(canonicalBuildDesign),
+  );
+  const legacyPayload = {
+    ...payload,
+    cpu: hasOwn(payload, "cpu")
+      ? payload.cpu
+      : hasOwn(payload, "performance")
+        ? payload.performance
+        : undefined,
+  };
+  const legacy = buildLegacyLaptopFromPayload(legacyPayload, existingRow);
+
+  const category = normalizeNullableText(
+    hasOwn(payload, "category")
+      ? payload.category
+      : hasOwn(basicInfoJson, "category")
+        ? basicInfoJson.category
+        : existingMeta.category,
+  );
+
+  const brand = normalizeNullableText(
+    hasOwn(payload, "brand")
+      ? payload.brand
+      : hasOwn(basicInfoJson, "brand")
+        ? basicInfoJson.brand
+        : hasOwn(basicInfoJson, "brand_name")
+          ? basicInfoJson.brand_name
+          : existingMeta.brand,
+  );
+
+  const model = normalizeNullableText(
+    hasOwn(payload, "model")
+      ? payload.model
+      : hasOwn(basicInfoJson, "model")
+        ? basicInfoJson.model
+        : existingMeta.model,
+  );
+
+  const launchDate = normalizeNullableText(
+    hasOwn(payload, "launch_date")
+      ? payload.launch_date
+      : hasOwn(basicInfoJson, "launch_date")
+        ? basicInfoJson.launch_date
+        : existingMeta.launch_date,
+  );
+
+  const colors = hasOwn(payload, "colors")
+    ? toArray(payload.colors)
+    : hasOwn(buildDesignJson, "colors")
+      ? toArray(buildDesignJson.colors)
+      : hasOwn(basicInfoJson, "colors")
+        ? toArray(basicInfoJson.colors)
+        : toArray(existingMeta.colors);
+
+  const sections = { ...existingSections };
+
+  for (const [key, value] of Object.entries(payload)) {
+    if (key.endsWith("_json")) {
+      const normalizedValue =
+        value && typeof value === "object" && !Array.isArray(value)
+          ? stripScoreKey(value)
+          : value;
+      if (Array.isArray(normalizedValue)) {
+        sections[key] = normalizedValue;
+        continue;
+      }
+      if (normalizedValue && typeof normalizedValue === "object") {
+        sections[key] = {
+          ...toPlainObject(sections[key]),
+          ...toPlainObject(normalizedValue),
+        };
+        continue;
+      }
+      if (normalizedValue !== undefined) {
+        sections[key] = normalizedValue;
+      }
+      continue;
+    }
+
+    const mappedSectionKey = LAPTOP_CANONICAL_SECTION_TO_JSON[key];
+    if (mappedSectionKey) {
+      const normalizedValue =
+        value && typeof value === "object" && !Array.isArray(value)
+          ? stripScoreKey(value)
+          : value;
+      if (Array.isArray(normalizedValue)) {
+        sections[mappedSectionKey] = normalizedValue;
+        continue;
+      }
+      if (normalizedValue && typeof normalizedValue === "object") {
+        sections[mappedSectionKey] = {
+          ...toPlainObject(sections[mappedSectionKey]),
+          ...toPlainObject(normalizedValue),
+        };
+        continue;
+      }
+      if (normalizedValue !== undefined) {
+        sections[mappedSectionKey] = normalizedValue;
+      }
+      continue;
+    }
+
+    if (key === "metadata") continue;
+  }
+
+  sections.build_design_json = mergeSectionObject(
+    sections.build_design_json,
+    stripScoreKey(canonicalBuildDesign),
+    true,
+  );
+  sections.connectivity_json = mergeSectionObject(
+    sections.connectivity_json,
+    stripScoreKey(canonicalMetadata.connectivity),
+    true,
+  );
+  sections.warranty_json = mergeSectionObject(
+    sections.warranty_json,
+    stripScoreKey(canonicalMetadata.warranty),
+    true,
+  );
+  sections.environmental_json = mergeSectionObject(
+    sections.environmental_json,
+    stripScoreKey(canonicalMetadata.environmental),
+    true,
+  );
+  sections.in_the_box_json = mergeSectionObject(
+    sections.in_the_box_json,
+    stripScoreKey(canonicalMetadata.in_the_box),
+  );
+  sections.import_details_json = mergeSectionObject(
+    sections.import_details_json,
+    stripScoreKey(canonicalMetadata.import_details),
+  );
+  sections.dynamic_json = mergeSectionObject(
+    sections.dynamic_json,
+    stripScoreKey(canonicalMetadata.dynamic),
+  );
+
+  if (Array.isArray(canonicalMetadata.images)) {
+    sections.images_json = canonicalMetadata.images;
+  }
+  if (Array.isArray(canonicalMetadata.variants)) {
+    sections.variants_json = canonicalMetadata.variants;
+  }
+
+  sections.basic_info_json = mergeSectionObject(sections.basic_info_json, {
+    category,
+    brand,
+    model,
+    launch_date: launchDate,
+  });
+  sections.build_design_json = mergeSectionObject(
+    sections.build_design_json,
+    { colors },
+    true,
+  );
+  sections.performance_json = mergeSectionObject(
+    sections.performance_json,
+    legacy.cpu,
+    true,
+  );
+  sections.display_json = mergeSectionObject(
+    sections.display_json,
+    legacy.display,
+    true,
+  );
+  sections.memory_json = mergeSectionObject(
+    sections.memory_json,
+    legacy.memory,
+    true,
+  );
+  sections.storage_json = mergeSectionObject(
+    sections.storage_json,
+    legacy.storage,
+    true,
+  );
+  sections.battery_json = mergeSectionObject(
+    sections.battery_json,
+    legacy.battery,
+    true,
+  );
+  sections.connectivity_json = mergeSectionObject(
+    sections.connectivity_json,
+    legacy.connectivity,
+    true,
+  );
+  sections.software_json = mergeSectionObject(
+    sections.software_json,
+    legacy.software,
+    true,
+  );
+  sections.physical_json = mergeSectionObject(
+    sections.physical_json,
+    legacy.physical,
+    true,
+  );
+  sections.warranty_json = mergeSectionObject(
+    sections.warranty_json,
+    legacy.warranty,
+    true,
+  );
+  sections.ports_json = mergeSectionObject(
+    sections.ports_json,
+    getObjectValue(payload, "ports", "ports_json"),
+    true,
+  );
+  sections.multimedia_json = mergeSectionObject(
+    sections.multimedia_json,
+    getObjectValue(payload, "multimedia", "multimedia_json"),
+    true,
+  );
+  sections.security_json = mergeSectionObject(
+    sections.security_json,
+    getObjectValue(payload, "security", "security_json"),
+    true,
+  );
+  sections.camera_json = mergeSectionObject(
+    sections.camera_json,
+    getObjectValue(payload, "camera", "camera_json"),
+    true,
+  );
+
+  if (legacy.features.length) {
+    sections.multimedia_json = mergeSectionObject(
+      sections.multimedia_json,
+      { features: legacy.features },
+      true,
+    );
+  }
+
+  const reservedTopLevelKeys = new Set([
+    "category",
+    "brand",
+    "model",
+    "launch_date",
+    "colors",
+    "cpu",
+    "display",
+    "memory",
+    "storage",
+    "battery",
+    "connectivity",
+    "physical",
+    "software",
+    "features",
+    "warranty",
+    "ports",
+    "multimedia",
+    "security",
+    "camera",
+    "basic_info",
+    "performance",
+    "metadata",
+    "meta",
+  ]);
+
+  const dynamicTopLevel = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (reservedTopLevelKeys.has(key) || key.endsWith("_json")) continue;
+    dynamicTopLevel[key] = value;
+  }
+
+  if (Object.keys(dynamicTopLevel).length) {
+    sections.dynamic_json = mergeSectionObject(
+      sections.dynamic_json,
+      dynamicTopLevel,
+    );
+  }
+
+  for (const sectionKey of LAPTOP_REQUIRED_SECTION_KEYS) {
+    sections[sectionKey] = ensureSectionShape(
+      sections[sectionKey],
+      LAPTOP_SCORE_SECTION_KEYS.has(sectionKey),
+    );
+  }
+
+  const meta = {
+    ...existingMeta,
+    category,
+    brand,
+    model,
+    launch_date: launchDate,
+    colors,
+    spec_schema_version: 2,
+  };
+
+  return {
+    legacy,
+    meta,
+    spec_sections: sections,
+  };
+};
+
+const ensureScoreOnJsonSections = (sectionsValue) => {
+  const sectionsObj = toPlainObject(sectionsValue);
+  const normalized = {};
+
+  for (const [key, value] of Object.entries(sectionsObj)) {
+    if (
+      key.endsWith("_json") &&
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value)
+    ) {
+      const sectionObj = toPlainObject(value);
+      normalized[key] = hasOwn(sectionObj, "score")
+        ? sectionObj
+        : { score: null, ...sectionObj };
+      continue;
+    }
+    normalized[key] = value;
+  }
+
+  return normalized;
+};
+
+const normalizeLaptopSectionsForResponse = (sectionsValue, rowValue) => {
+  const rowObj = toPlainObject(rowValue);
+  const sectionsObj = ensureScoreOnJsonSections(sectionsValue);
+  const normalized = { ...sectionsObj };
+
+  if (Array.isArray(rowObj.images)) {
+    normalized.images_json = rowObj.images;
+  } else if (!Array.isArray(normalized.images_json)) {
+    normalized.images_json = [];
+  }
+
+  if (Array.isArray(rowObj.variants)) {
+    normalized.variants_json = rowObj.variants;
+  }
+
+  return ensureScoreOnJsonSections(normalized);
+};
+
+const stripScoreRecursively = (value) => {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripScoreRecursively(item));
+  }
+  if (!value || typeof value !== "object") return value;
+
+  const cleaned = {};
+  for (const [key, val] of Object.entries(value)) {
+    if (key === "score") continue;
+    cleaned[key] = stripScoreRecursively(val);
+  }
+  return cleaned;
+};
+
+const removeSectionKeyCollisions = (
+  rowValue,
+  sectionsValue,
+  extraOmitKeys = [],
+) => {
+  const rowObj = toPlainObject(rowValue);
+  const sectionsObj = toPlainObject(sectionsValue);
+  const sectionKeys = new Set(Object.keys(sectionsObj));
+  const omitKeys = new Set(["spec_sections", ...extraOmitKeys]);
+  const cleaned = {};
+
+  for (const [key, value] of Object.entries(rowObj)) {
+    if (omitKeys.has(key)) continue;
+    if (sectionKeys.has(key)) continue;
+    cleaned[key] = value;
+  }
+
+  return cleaned;
+};
+
+const enrichLaptopResponse = (row) => {
+  const safeRow = row || {};
+  const sections = normalizeLaptopSectionsForResponse(
+    safeRow.spec_sections,
+    safeRow,
+  );
+  const base = removeSectionKeyCollisions(safeRow, sections, [
+    "meta",
+    "rating",
+    "images",
+    "variants",
+    "brand",
+    "model",
+    "colors",
+    "category",
+    "launch_date",
+    "spec_schema_version",
+  ]);
+  return {
+    ...base,
+    spec_sections: sections,
+  };
+};
+
+const toCanonicalLaptopProductResponse = (row) => {
+  const safeRow = row || {};
+  const sections = normalizeLaptopSectionsForResponse(
+    safeRow.spec_sections,
+    safeRow,
+  );
+  const meta = toPlainObject(safeRow.meta);
+  const basicInfoSection = toPlainObject(sections.basic_info_json);
+  const dynamicSection = toPlainObject(sections.dynamic_json);
+  const {
+    title: _basicTitle,
+    brand: _basicBrand,
+    product_name: _basicProductName,
+    brand_name: _basicBrandName,
+    ...basicInfoExtras
+  } = basicInfoSection;
+
+  const ensureScored = (value) => {
+    const obj = toPlainObject(value);
+    return hasOwn(obj, "score") ? obj : { score: null, ...obj };
+  };
+
+  const toArraySafe = (value) => (Array.isArray(value) ? value : []);
+
+  const buildInfo = ensureScored({
+    ...basicInfoExtras,
+    product_name:
+      basicInfoSection.product_name ||
+      basicInfoSection.title ||
+      dynamicSection.product_name ||
+      safeRow.name ||
+      null,
+    brand_name:
+      basicInfoSection.brand_name ||
+      basicInfoSection.brand ||
+      dynamicSection.brand_name ||
+      safeRow.brand_name ||
+      null,
+    category: basicInfoSection.category || meta.category || null,
+    model: basicInfoSection.model || meta.model || null,
+    launch_date: basicInfoSection.launch_date || meta.launch_date || null,
+    colors: toArraySafe(
+      basicInfoSection.colors && Array.isArray(basicInfoSection.colors)
+        ? basicInfoSection.colors
+        : meta.colors,
+    ),
+    product_type:
+      basicInfoSection.product_type ||
+      dynamicSection.product_type ||
+      safeRow.product_type ||
+      "laptop",
+  });
+
+  const multimediaSection = ensureScored({
+    ...toPlainObject(sections.multimedia_json),
+    features: toArraySafe(
+      toPlainObject(sections.multimedia_json).features || safeRow.features,
+    ),
+  });
+
+  const dynamicMeta = {};
+  for (const [key, value] of Object.entries(dynamicSection)) {
+    if (["product_name", "brand_name", "product_type"].includes(key)) continue;
+    dynamicMeta[key] = value;
+  }
+
+  return stripScoreRecursively({
+    product_id: safeRow.product_id ?? null,
+    basic_info: buildInfo,
+    performance: ensureScored(
+      Object.keys(toPlainObject(sections.performance_json)).length
+        ? sections.performance_json
+        : safeRow.cpu,
+    ),
+    display: ensureScored(
+      Object.keys(toPlainObject(sections.display_json)).length
+        ? sections.display_json
+        : safeRow.display,
+    ),
+    memory: ensureScored(
+      Object.keys(toPlainObject(sections.memory_json)).length
+        ? sections.memory_json
+        : safeRow.memory,
+    ),
+    storage: ensureScored(
+      Object.keys(toPlainObject(sections.storage_json)).length
+        ? sections.storage_json
+        : safeRow.storage,
+    ),
+    battery: ensureScored(
+      Object.keys(toPlainObject(sections.battery_json)).length
+        ? sections.battery_json
+        : safeRow.battery,
+    ),
+    multimedia: multimediaSection,
+    ports: ensureScored(sections.ports_json),
+    camera: ensureScored(sections.camera_json),
+    security: ensureScored(sections.security_json),
+    physical: ensureScored(
+      Object.keys(toPlainObject(sections.physical_json)).length
+        ? sections.physical_json
+        : safeRow.physical,
+    ),
+    software: ensureScored(
+      Object.keys(toPlainObject(sections.software_json)).length
+        ? sections.software_json
+        : safeRow.software,
+    ),
+    metadata: ensureScored({
+      spec_schema_version: meta.spec_schema_version ?? 2,
+      created_at: safeRow.created_at || null,
+      build_design: ensureScored(sections.build_design_json),
+      connectivity: ensureScored(
+        Object.keys(toPlainObject(sections.connectivity_json)).length
+          ? sections.connectivity_json
+          : safeRow.connectivity,
+      ),
+      warranty: ensureScored(
+        Object.keys(toPlainObject(sections.warranty_json)).length
+          ? sections.warranty_json
+          : safeRow.warranty,
+      ),
+      environmental: ensureScored(sections.environmental_json),
+      in_the_box: ensureScored(sections.in_the_box_json),
+      import_details: ensureScored(sections.import_details_json),
+      images: toArraySafe(sections.images_json),
+      variants: toArraySafe(sections.variants_json),
+      dynamic: ensureScored(dynamicMeta),
+    }),
+  });
+};
+
 const DEFAULT_COMPARE_SCORING_CONFIG = normalizeCompareScoreConfig({});
 
 const toCompareScoringAdminResponse = (config) => ({
-  weights: weightsToPercent(config.weights || DEFAULT_COMPARE_SCORING_CONFIG.weights),
+  weights: weightsToPercent(
+    config.weights || DEFAULT_COMPARE_SCORING_CONFIG.weights,
+  ),
   chipset_rules: Array.isArray(config.chipsetRules)
     ? config.chipsetRules
     : DEFAULT_COMPARE_SCORING_CONFIG.chipsetRules,
@@ -268,10 +975,44 @@ async function runMigrations() {
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
         product_type TEXT CHECK (
-          product_type IN ('smartphone','laptop','networking','home_appliance','accessories')
+          product_type IN ('smartphone','laptop','networking','tv','accessories')
         ) NOT NULL,
         brand_id INT REFERENCES brands(id),
         created_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    // Existing installs may already have publish rows for legacy product types.
+    // Remove those rows first so product cleanup below does not violate FK checks.
+    await safeQuery(`
+      DO $$
+      BEGIN
+        IF to_regclass('public.product_publish') IS NOT NULL THEN
+          DELETE FROM product_publish
+          WHERE product_id IN (
+            SELECT id FROM products WHERE product_type = 'home_appliance'
+          );
+        END IF;
+      END
+      $$;
+    `);
+
+    // Remove legacy home_appliance products as the category is replaced by tv.
+    await safeQuery(`
+      DELETE FROM products
+      WHERE product_type = 'home_appliance';
+    `);
+
+    // Ensure product_type check allows tv on existing installations.
+    await safeQuery(`
+      ALTER TABLE products
+      DROP CONSTRAINT IF EXISTS products_product_type_check;
+    `);
+    await safeQuery(`
+      ALTER TABLE products
+      ADD CONSTRAINT products_product_type_check
+      CHECK (
+        product_type IN ('smartphone','laptop','networking','tv','accessories')
       );
     `);
 
@@ -407,21 +1148,32 @@ async function runMigrations() {
 
     // 9) smartphone_ratings (depends on smartphones and Customers)
 
-    // 10) home_appliance (depends on products)
+    // 10) tvs (depends on products)
+    // Legacy home_appliance table is replaced by tvs.
     await safeQuery(`
-      CREATE TABLE IF NOT EXISTS home_appliance (
+      DROP TABLE IF EXISTS home_appliance CASCADE;
+    `);
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS tvs (
         product_id INT PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
-        appliance_type TEXT CHECK (
-          appliance_type IN ('washing_machine','air_conditioner','refrigerator','television')
-        ),
-        model_number TEXT,
-        release_year INT,
-        country_of_origin TEXT,
-        specifications JSONB,
-        features JSONB,
-        performance JSONB,
-        physical_details JSONB,
-        warranty JSONB,
+        category TEXT,
+        model TEXT,
+        key_specs_json JSONB,
+        basic_info_json JSONB,
+        display_json JSONB,
+        video_engine_json JSONB,
+        audio_json JSONB,
+        smart_tv_json JSONB,
+        gaming_json JSONB,
+        ports_json JSONB,
+        connectivity_json JSONB,
+        power_json JSONB,
+        physical_json JSONB,
+        product_details_json JSONB,
+        in_the_box_json JSONB,
+        warranty_json JSONB,
+        images_json JSONB,
+        variants_json JSONB,
         created_at TIMESTAMP DEFAULT now()
       );
     `);
@@ -441,12 +1193,16 @@ async function runMigrations() {
         features JSONB,
         warranty JSONB,
         meta JSONB,
+        spec_sections JSONB,
         created_at TIMESTAMP DEFAULT now()
       );
     `);
 
     // Ensure `meta` column exists for existing installations
     await safeQuery(`ALTER TABLE laptop ADD COLUMN IF NOT EXISTS meta JSONB;`);
+    await safeQuery(
+      `ALTER TABLE laptop ADD COLUMN IF NOT EXISTS spec_sections JSONB;`,
+    );
 
     //12) networking (depends on products)
     await safeQuery(`
@@ -512,7 +1268,7 @@ async function runMigrations() {
 
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS product_publish (
-      product_id INT PRIMARY KEY REFERENCES products(id),
+      product_id INT PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
       is_published BOOLEAN DEFAULT FALSE,
       published_by INT REFERENCES "user"(id),
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1869,7 +2625,7 @@ app.post("/api/products", authenticate, async (req, res) => {
       "smartphone",
       "laptop",
       "networking",
-      "home_appliance",
+      "tv",
       "accessories",
     ];
 
@@ -1947,13 +2703,6 @@ app.get("/api/smartphones", async (req, res) => {
           '[]'::json
         ) AS images,
 
-        /* ---------- Rating ---------- */
-        (
-          SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
-          FROM product_ratings r
-          WHERE r.product_id = p.id
-        ) AS rating,
-
         /* ---------- Variants + Store Prices ---------- */
         COALESCE(
           json_agg(
@@ -2014,7 +2763,24 @@ app.get("/api/smartphones", async (req, res) => {
       ORDER BY COALESCE(MAX(ds.hook_score), 0) DESC, p.id DESC;
     `);
 
-    res.json({ smartphones: result.rows });
+    const optionalMetricKeys = [
+      "hook_score",
+      "buyer_intent",
+      "trend_velocity",
+      "freshness",
+      "hook_calculated_at",
+      "rating",
+    ];
+
+    const smartphones = (result.rows || []).map((row) => {
+      const item = { ...(row || {}) };
+      for (const key of optionalMetricKeys) {
+        if (item[key] == null) delete item[key];
+      }
+      return item;
+    });
+
+    res.json({ smartphones });
   } catch (err) {
     console.error("GET /api/smartphones error:", err);
     res.status(500).json({ error: err.message });
@@ -2232,7 +2998,71 @@ app.post("/api/laptops", authenticate, async (req, res) => {
       return res.status(403).json({ message: "Admin access required" });
     }
 
-    const { product, laptop, images = [], variants = [] } = req.body;
+    const {
+      product = {},
+      laptop = {},
+      images = [],
+      variants = [],
+    } = req.body || {};
+    const requestBody = toPlainObject(req.body);
+    const productInput = toPlainObject(product);
+    const laptopRaw = toPlainObject(laptop);
+    const laptopInput =
+      Object.keys(laptopRaw).length > 0 ? laptopRaw : requestBody;
+    const laptopMetadataInput = toPlainObject(laptopInput.metadata);
+    const normalizedLaptop = normalizeLaptopPayload(laptopInput);
+
+    const basicInfoForName = mergeSectionObject(
+      toPlainObject(laptopInput.basic_info_json),
+      toPlainObject(laptopInput.basic_info),
+    );
+    const productNameCandidates = [
+      productInput.name,
+      requestBody.name,
+      requestBody.product_name,
+      basicInfoForName.product_name,
+      basicInfoForName.title,
+      basicInfoForName.model_name,
+      laptopInput.model,
+      laptopInput.model_name,
+      laptopInput.title,
+    ];
+    const productName =
+      productNameCandidates.map(normalizeNullableText).find(Boolean) || null;
+
+    if (!productName) {
+      return res.status(400).json({
+        message:
+          "Missing required field: product.name (or basic_info.title / basic_info_json.title / model_name).",
+      });
+    }
+
+    const brandIdRaw = productInput.brand_id ?? requestBody.brand_id ?? null;
+    let brandId = null;
+    if (brandIdRaw !== null && brandIdRaw !== undefined && brandIdRaw !== "") {
+      const parsedBrandId = Number(brandIdRaw);
+      if (!Number.isFinite(parsedBrandId)) {
+        return res
+          .status(400)
+          .json({ message: "product.brand_id must be a numeric value." });
+      }
+      brandId = parsedBrandId;
+    }
+
+    const imageList = Array.isArray(images)
+      ? images
+      : Array.isArray(requestBody.images)
+        ? requestBody.images
+        : Array.isArray(laptopMetadataInput.images)
+          ? laptopMetadataInput.images
+          : [];
+    const variantList = Array.isArray(variants)
+      ? variants
+      : Array.isArray(requestBody.variants)
+        ? requestBody.variants
+        : Array.isArray(laptopMetadataInput.variants)
+          ? laptopMetadataInput.variants
+          : [];
 
     await client.query("BEGIN");
 
@@ -2243,7 +3073,7 @@ app.post("/api/laptops", authenticate, async (req, res) => {
       VALUES ($1, 'laptop', $2)
       RETURNING id
       `,
-      [product.name, product.brand_id],
+      [productName, brandId],
     );
     const productId = productRes.rows[0].id;
 
@@ -2252,39 +3082,34 @@ app.post("/api/laptops", authenticate, async (req, res) => {
       `
       INSERT INTO laptop (
         product_id, cpu, display, memory, storage, battery,
-        connectivity, physical, software, features, warranty, meta
+        connectivity, physical, software, features, warranty, meta, spec_sections
       )
       VALUES (
         $1,
         $2::jsonb,$3::jsonb,$4::jsonb,$5::jsonb,$6::jsonb,
-        $7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12::jsonb
+        $7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb
       )
       `,
       [
         productId,
-        JSON.stringify(laptop.cpu || {}),
-        JSON.stringify(laptop.display || {}),
-        JSON.stringify(laptop.memory || {}),
-        JSON.stringify(laptop.storage || {}),
-        JSON.stringify(laptop.battery || {}),
-        JSON.stringify(laptop.connectivity || {}),
-        JSON.stringify(laptop.physical || {}),
-        JSON.stringify(laptop.software || {}),
-        JSON.stringify(laptop.features || []),
-        JSON.stringify(laptop.warranty || {}),
-        JSON.stringify({
-          category: laptop.category || null,
-          brand: laptop.brand || null,
-          model: laptop.model || null,
-          launch_date: laptop.launch_date || null,
-          colors: laptop.colors || [],
-        }),
+        JSON.stringify(normalizedLaptop.legacy.cpu || {}),
+        JSON.stringify(normalizedLaptop.legacy.display || {}),
+        JSON.stringify(normalizedLaptop.legacy.memory || {}),
+        JSON.stringify(normalizedLaptop.legacy.storage || {}),
+        JSON.stringify(normalizedLaptop.legacy.battery || {}),
+        JSON.stringify(normalizedLaptop.legacy.connectivity || {}),
+        JSON.stringify(normalizedLaptop.legacy.physical || {}),
+        JSON.stringify(normalizedLaptop.legacy.software || {}),
+        JSON.stringify(normalizedLaptop.legacy.features || []),
+        JSON.stringify(normalizedLaptop.legacy.warranty || {}),
+        JSON.stringify(normalizedLaptop.meta || {}),
+        JSON.stringify(normalizedLaptop.spec_sections || {}),
       ],
     );
 
     /* 3️⃣ Images */
-    for (let i = 0; i < images.length; i++) {
-      const url = images[i];
+    for (let i = 0; i < imageList.length; i++) {
+      const url = imageList[i];
       await client.query(
         `INSERT INTO product_images (product_id, image_url, position)
          VALUES ($1,$2,$3)`,
@@ -2293,8 +3118,25 @@ app.post("/api/laptops", authenticate, async (req, res) => {
     }
 
     /* 4️⃣ Variants + Store Prices */
-    for (const v of variants) {
-      const variantKey = `${v.ram}_${v.storage}`; // 🔥 FIXED (NOT NULL)
+    for (const v of variantList) {
+      const variantObj = toPlainObject(v);
+      const variantAttributes = {
+        ...toPlainObject(variantObj.attributes),
+        ram:
+          variantObj.ram ??
+          toPlainObject(variantObj.attributes).ram ??
+          toPlainObject(variantObj.attributes).RAM ??
+          null,
+        storage:
+          variantObj.storage ??
+          toPlainObject(variantObj.attributes).storage ??
+          toPlainObject(variantObj.attributes).rom ??
+          null,
+      };
+
+      const variantKey =
+        normalizeNullableText(variantObj.variant_key) ||
+        `${variantAttributes.ram || "na"}_${variantAttributes.storage || "na"}`;
 
       const variantRes = await client.query(
         `
@@ -2306,14 +3148,21 @@ app.post("/api/laptops", authenticate, async (req, res) => {
         [
           productId,
           variantKey,
-          JSON.stringify({ ram: v.ram, storage: v.storage }),
-          v.base_price || null,
+          JSON.stringify(variantAttributes),
+          variantObj.base_price || variantObj.price || null,
         ],
       );
 
       const variantId = variantRes.rows[0].id;
 
-      for (const s of v.stores || []) {
+      const stores = Array.isArray(variantObj.stores)
+        ? variantObj.stores
+        : Array.isArray(variantObj.store_prices)
+          ? variantObj.store_prices
+          : [];
+
+      for (const s of stores) {
+        const storeObj = toPlainObject(s);
         await client.query(
           `
           INSERT INTO variant_store_prices
@@ -2322,10 +3171,10 @@ app.post("/api/laptops", authenticate, async (req, res) => {
           `,
           [
             variantId,
-            s.store_name,
-            s.price || null,
-            s.url || null,
-            s.offer_text || null,
+            storeObj.store_name || storeObj.store || "Store",
+            storeObj.price || null,
+            storeObj.url || null,
+            storeObj.offer_text || storeObj.offerText || null,
           ],
         );
       }
@@ -2347,6 +3196,12 @@ app.post("/api/laptops", authenticate, async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("POST /api/laptops error:", err);
+    if (err && err.code === "23505") {
+      return res.status(409).json({
+        error:
+          "Duplicate product. A laptop with this product name already exists.",
+      });
+    }
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
@@ -2355,7 +3210,8 @@ app.post("/api/laptops", authenticate, async (req, res) => {
 
 app.get("/api/laptops", async (req, res) => {
   try {
-    const result = await db.query(`
+    const result = await db.query(
+      `
       SELECT
         p.id AS product_id,
         p.name,
@@ -2373,6 +3229,8 @@ app.get("/api/laptops", async (req, res) => {
         l.software,
         l.features,
         l.warranty,
+        l.meta,
+        l.spec_sections,
         l.created_at,
 
         /* ---------- Images ---------- */
@@ -2384,13 +3242,6 @@ app.get("/api/laptops", async (req, res) => {
           ),
           '[]'::json
         ) AS images,
-
-        /* ---------- Rating ---------- */
-        (
-          SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
-          FROM product_ratings r
-          WHERE r.product_id = p.id
-        ) AS rating,
 
         /* ---------- Variants + Store Prices ---------- */
         COALESCE(
@@ -2438,6 +3289,9 @@ app.get("/api/laptops", async (req, res) => {
       LEFT JOIN product_variants v
         ON v.product_id = p.id
 
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
+
       WHERE p.product_type = 'laptop'
 
       GROUP BY
@@ -2453,12 +3307,16 @@ app.get("/api/laptops", async (req, res) => {
         l.software,
         l.features,
         l.warranty,
+        l.meta,
+        l.spec_sections,
         l.created_at
 
-      ORDER BY p.created_at DESC;
-    `);
+      ORDER BY COALESCE(MAX(ds.hook_score), 0) DESC, p.id DESC;
+    `,
+    );
 
-    res.json({ laptops: result.rows });
+    const laptops = (result.rows || []).map(toCanonicalLaptopProductResponse);
+    res.json({ laptops });
   } catch (err) {
     console.error("GET /api/laptops error:", err);
     res.status(500).json({ error: err.message });
@@ -2526,16 +3384,23 @@ app.get("/api/laptops/:id", authenticate, async (req, res) => {
 
     // Prepare sanitized response
     const sanitize = (lobj, variantsArr) => {
-      const { id, product_id, meta, ...rest } = lobj || {};
-      const metaObj = meta || {};
-      return { ...rest, ...metaObj, variants: variantsArr || [] };
+      const { id, product_id, meta, spec_sections, ...rest } = lobj || {};
+      const metaObj = toPlainObject(meta);
+      const sectionsObj = toPlainObject(spec_sections);
+      const base = removeSectionKeyCollisions(rest, sectionsObj);
+      return {
+        ...base,
+        ...metaObj,
+        spec_sections: sectionsObj,
+        variants: variantsArr || [],
+      };
     };
 
     const sanitized = sanitize(laptop, variants);
     sanitized.name = productName;
 
     return res.json({
-      product: { name: productName },
+      product: { name: productName, brand_id: productBrandId },
       laptop: sanitized,
       images,
       variants,
@@ -2576,14 +3441,35 @@ app.put("/api/laptops/:id", authenticate, async (req, res) => {
       variants = [],
       published,
     } = req.body;
+    const requestBody = toPlainObject(req.body);
+    const productInput = toPlainObject(product);
+    const laptopRaw = toPlainObject(laptop);
+    const laptopInput =
+      Object.keys(laptopRaw).length > 0 ? laptopRaw : requestBody;
+    const laptopMetadataInput = toPlainObject(laptopInput.metadata);
+    const normalizedLaptop = normalizeLaptopPayload(laptopInput, laptopRow);
+    const imageList = Array.isArray(images)
+      ? images
+      : Array.isArray(requestBody.images)
+        ? requestBody.images
+        : Array.isArray(laptopMetadataInput.images)
+          ? laptopMetadataInput.images
+          : [];
+    const variantList = Array.isArray(variants)
+      ? variants
+      : Array.isArray(requestBody.variants)
+        ? requestBody.variants
+        : Array.isArray(laptopMetadataInput.variants)
+          ? laptopMetadataInput.variants
+          : [];
 
     await client.query("BEGIN");
 
     // Update product
-    if (product.name || product.brand_id !== undefined) {
+    if (productInput.name || productInput.brand_id !== undefined) {
       await client.query(
         "UPDATE products SET name = $1, brand_id = $2 WHERE id = $3",
-        [product.name || null, product.brand_id || null, productId],
+        [productInput.name || null, productInput.brand_id || null, productId],
       );
     }
 
@@ -2601,27 +3487,23 @@ app.put("/api/laptops/:id", authenticate, async (req, res) => {
         software = $8::jsonb,
         features = $9::jsonb,
         warranty = $10::jsonb,
-        meta = $11::jsonb
-      WHERE product_id = $12
+        meta = $11::jsonb,
+        spec_sections = $12::jsonb
+      WHERE product_id = $13
       `,
       [
-        JSON.stringify(laptop.cpu || {}),
-        JSON.stringify(laptop.display || {}),
-        JSON.stringify(laptop.memory || {}),
-        JSON.stringify(laptop.storage || {}),
-        JSON.stringify(laptop.battery || {}),
-        JSON.stringify(laptop.connectivity || {}),
-        JSON.stringify(laptop.physical || {}),
-        JSON.stringify(laptop.software || {}),
-        JSON.stringify(laptop.features || []),
-        JSON.stringify(laptop.warranty || {}),
-        JSON.stringify({
-          category: laptop.category || null,
-          brand: laptop.brand || null,
-          model: laptop.model || null,
-          launch_date: laptop.launch_date || null,
-          colors: laptop.colors || [],
-        }),
+        JSON.stringify(normalizedLaptop.legacy.cpu || {}),
+        JSON.stringify(normalizedLaptop.legacy.display || {}),
+        JSON.stringify(normalizedLaptop.legacy.memory || {}),
+        JSON.stringify(normalizedLaptop.legacy.storage || {}),
+        JSON.stringify(normalizedLaptop.legacy.battery || {}),
+        JSON.stringify(normalizedLaptop.legacy.connectivity || {}),
+        JSON.stringify(normalizedLaptop.legacy.physical || {}),
+        JSON.stringify(normalizedLaptop.legacy.software || {}),
+        JSON.stringify(normalizedLaptop.legacy.features || []),
+        JSON.stringify(normalizedLaptop.legacy.warranty || {}),
+        JSON.stringify(normalizedLaptop.meta || {}),
+        JSON.stringify(normalizedLaptop.spec_sections || {}),
         productId,
       ],
     );
@@ -2630,10 +3512,10 @@ app.put("/api/laptops/:id", authenticate, async (req, res) => {
     await client.query("DELETE FROM product_images WHERE product_id = $1", [
       productId,
     ]);
-    for (let i = 0; i < (images || []).length; i++) {
+    for (let i = 0; i < imageList.length; i++) {
       await client.query(
         "INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)",
-        [productId, images[i], i + 1],
+        [productId, imageList[i], i + 1],
       );
     }
 
@@ -2652,7 +3534,7 @@ app.put("/api/laptops/:id", authenticate, async (req, res) => {
       productId,
     ]);
 
-    for (const v of variants || []) {
+    for (const v of variantList || []) {
       const variantKey = `${v.ram || ""}_${v.storage || ""}`;
       const variantRes = await client.query(
         `INSERT INTO product_variants (product_id, variant_key, attributes, base_price) VALUES ($1,$2,$3::jsonb,$4) RETURNING id`,
@@ -2705,7 +3587,151 @@ app.put("/api/laptops/:id", authenticate, async (req, res) => {
   }
 });
 
-app.post("/api/homeappliances", authenticate, async (req, res) => {
+const TV_JSON_OBJECT_SECTIONS = [
+  "key_specs_json",
+  "basic_info_json",
+  "display_json",
+  "video_engine_json",
+  "audio_json",
+  "smart_tv_json",
+  "gaming_json",
+  "ports_json",
+  "connectivity_json",
+  "power_json",
+  "physical_json",
+  "product_details_json",
+  "in_the_box_json",
+  "warranty_json",
+];
+
+const toNumericPrice = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const cleaned = String(value).replace(/[^0-9.]/g, "");
+  if (!cleaned) return null;
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const normalizeTvPayloadInput = (input = {}) => {
+  const body = toPlainObject(input);
+  const nestedTv = toPlainObject(body.tv);
+  const merged = Object.keys(nestedTv).length ? { ...body, ...nestedTv } : body;
+  const product = toPlainObject(merged.product);
+  const legacyHomeAppliance = toPlainObject(merged.home_appliance);
+
+  const normalized = { ...merged };
+  if (!hasOwn(normalized, "product_name") && hasOwn(product, "name")) {
+    normalized.product_name = product.name;
+  }
+  if (!hasOwn(normalized, "brand_id") && hasOwn(product, "brand_id")) {
+    normalized.brand_id = product.brand_id;
+  }
+  if (!hasOwn(normalized, "publish") && hasOwn(normalized, "published")) {
+    normalized.publish = normalized.published;
+  }
+  if (
+    !Array.isArray(normalized.images_json) &&
+    Array.isArray(normalized.images)
+  ) {
+    normalized.images_json = normalized.images;
+  }
+  if (
+    !Array.isArray(normalized.variants_json) &&
+    Array.isArray(normalized.variants)
+  ) {
+    normalized.variants_json = normalized.variants;
+  }
+
+  // Backward compatibility: map legacy home_appliance payload into TV sections.
+  if (Object.keys(legacyHomeAppliance).length) {
+    if (!hasOwn(normalized, "category") && legacyHomeAppliance.appliance_type) {
+      normalized.category = legacyHomeAppliance.appliance_type;
+    }
+
+    if (!hasOwn(normalized, "model") && legacyHomeAppliance.model_number) {
+      normalized.model = legacyHomeAppliance.model_number;
+    }
+
+    if (!hasOwn(normalized, "basic_info_json")) {
+      normalized.basic_info_json = {
+        model_number: legacyHomeAppliance.model_number || null,
+        launch_year: legacyHomeAppliance.release_year || null,
+      };
+    }
+
+    if (
+      !hasOwn(normalized, "product_details_json") &&
+      (legacyHomeAppliance.country_of_origin ||
+        legacyHomeAppliance.release_year)
+    ) {
+      normalized.product_details_json = {
+        country_of_origin: legacyHomeAppliance.country_of_origin || null,
+        launch_year: legacyHomeAppliance.release_year || null,
+      };
+    }
+
+    if (
+      !hasOwn(normalized, "display_json") &&
+      legacyHomeAppliance.specifications &&
+      typeof legacyHomeAppliance.specifications === "object"
+    ) {
+      normalized.display_json = legacyHomeAppliance.specifications;
+    }
+
+    if (
+      !hasOwn(normalized, "video_engine_json") &&
+      legacyHomeAppliance.performance &&
+      typeof legacyHomeAppliance.performance === "object"
+    ) {
+      normalized.video_engine_json = legacyHomeAppliance.performance;
+    }
+
+    if (
+      !hasOwn(normalized, "physical_json") &&
+      legacyHomeAppliance.physical_details &&
+      typeof legacyHomeAppliance.physical_details === "object"
+    ) {
+      normalized.physical_json = legacyHomeAppliance.physical_details;
+    }
+
+    if (
+      !hasOwn(normalized, "warranty_json") &&
+      legacyHomeAppliance.warranty &&
+      typeof legacyHomeAppliance.warranty === "object"
+    ) {
+      normalized.warranty_json = legacyHomeAppliance.warranty;
+    }
+
+    if (
+      !hasOwn(normalized, "smart_tv_json") &&
+      Array.isArray(legacyHomeAppliance.features)
+    ) {
+      normalized.smart_tv_json = {
+        smart_features: legacyHomeAppliance.features,
+      };
+    }
+  }
+
+  return normalized;
+};
+
+const resolveBrandIdByName = async (client, brandName) => {
+  const normalizedName = normalizeNullableText(brandName);
+  if (!normalizedName) return null;
+
+  const brandRes = await client.query(
+    `SELECT id
+     FROM brands
+     WHERE LOWER(name) = LOWER($1)
+     LIMIT 1`,
+    [normalizedName],
+  );
+
+  return brandRes.rows[0] ? brandRes.rows[0].id : null;
+};
+
+app.post("/api/tvs", authenticate, async (req, res) => {
   const client = await db.connect();
   const toJSON = (v) => (v === undefined ? null : JSON.stringify(v));
 
@@ -2714,217 +3740,299 @@ app.post("/api/homeappliances", authenticate, async (req, res) => {
       return res.status(403).json({ message: "Admin access required" });
     }
 
-    const { product, home_appliance, images = [], variants = [] } = req.body;
+    const payload = normalizeTvPayloadInput(req.body || {});
+    const productName = normalizeNullableText(
+      payload.product_name ||
+        payload.name ||
+        toPlainObject(payload.basic_info_json).title ||
+        payload.model,
+    );
+
+    if (!productName) {
+      return res.status(400).json({ message: "product_name is required" });
+    }
+
+    const model = normalizeNullableText(
+      payload.model ||
+        toPlainObject(payload.basic_info_json).model_number ||
+        toPlainObject(payload.basic_info_json).model,
+    );
+    const category = normalizeNullableText(payload.category);
+    const publish = hasOwn(payload, "publish")
+      ? Boolean(payload.publish)
+      : false;
+
+    let brandId =
+      payload.brand_id !== undefined && payload.brand_id !== null
+        ? Number(payload.brand_id)
+        : null;
+    if (!Number.isInteger(brandId) || brandId <= 0) {
+      brandId = await resolveBrandIdByName(client, payload.brand_name);
+    }
+
+    const imagesJson = Array.isArray(payload.images_json)
+      ? payload.images_json
+      : [];
+    const variantsJson = Array.isArray(payload.variants_json)
+      ? payload.variants_json
+      : [];
 
     await client.query("BEGIN");
 
-    /* ---------- 1️⃣ Insert product ---------- */
     const productRes = await client.query(
       `
       INSERT INTO products (name, brand_id, product_type)
-      VALUES ($1,$2,'home_appliance')
+      VALUES ($1,$2,'tv')
       RETURNING id
       `,
-      [product.name, product.brand_id],
+      [productName, brandId],
     );
-
     const productId = productRes.rows[0].id;
 
-    /* ---------- 2️⃣ Insert home appliance ---------- */
+    const sectionValues = {};
+    for (const key of TV_JSON_OBJECT_SECTIONS) {
+      sectionValues[key] = toPlainObject(payload[key]);
+    }
+
     await client.query(
       `
-      INSERT INTO home_appliance (
+      INSERT INTO tvs (
         product_id,
-        appliance_type,
-        model_number,
-        release_year,
-        country_of_origin,
-        specifications,
-        features,
-        performance,
-        physical_details,
-        warranty
+        category,
+        model,
+        key_specs_json,
+        basic_info_json,
+        display_json,
+        video_engine_json,
+        audio_json,
+        smart_tv_json,
+        gaming_json,
+        ports_json,
+        connectivity_json,
+        power_json,
+        physical_json,
+        product_details_json,
+        in_the_box_json,
+        warranty_json,
+        images_json,
+        variants_json
       )
       VALUES (
-        $1,$2,$3,$4,$5,
-        $6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb
+        $1,$2,$3,
+        $4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,
+        $11::jsonb,$12::jsonb,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17::jsonb,
+        $18::jsonb,$19::jsonb
       )
       `,
       [
         productId,
-        home_appliance.appliance_type,
-        home_appliance.model_number,
-        home_appliance.release_year,
-        home_appliance.country_of_origin,
-        toJSON(home_appliance.specifications),
-        toJSON(home_appliance.features),
-        toJSON(home_appliance.performance),
-        toJSON(home_appliance.physical_details),
-        toJSON(home_appliance.warranty),
+        category,
+        model,
+        toJSON(sectionValues.key_specs_json),
+        toJSON(sectionValues.basic_info_json),
+        toJSON(sectionValues.display_json),
+        toJSON(sectionValues.video_engine_json),
+        toJSON(sectionValues.audio_json),
+        toJSON(sectionValues.smart_tv_json),
+        toJSON(sectionValues.gaming_json),
+        toJSON(sectionValues.ports_json),
+        toJSON(sectionValues.connectivity_json),
+        toJSON(sectionValues.power_json),
+        toJSON(sectionValues.physical_json),
+        toJSON(sectionValues.product_details_json),
+        toJSON(sectionValues.in_the_box_json),
+        toJSON(sectionValues.warranty_json),
+        toJSON(imagesJson),
+        toJSON(variantsJson),
       ],
     );
 
-    /* ---------- 3️⃣ Images ---------- */
-    for (let i = 0; i < images.length; i++) {
-      const url = images[i];
+    for (let i = 0; i < imagesJson.length; i++) {
+      const imageUrl = normalizeNullableText(imagesJson[i]);
+      if (!imageUrl) continue;
       await client.query(
-        `INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)`,
-        [productId, url, i + 1],
+        `INSERT INTO product_images (product_id, image_url, position)
+         VALUES ($1,$2,$3)`,
+        [productId, imageUrl, i + 1],
       );
     }
 
-    /* ---------- 4️⃣ Variants + Stores ---------- */
-    for (const v of variants) {
-      if (!v.variant_key) {
-        throw new Error("variant_key is required");
-      }
+    for (let i = 0; i < variantsJson.length; i++) {
+      const variant = toPlainObject(variantsJson[i]);
+      const variantKey =
+        normalizeNullableText(
+          variant.variant_key || variant.screen_size || variant.size,
+        ) || `tv_variant_${i + 1}`;
+
+      const attributes = { ...variant };
+      delete attributes.base_price;
+      delete attributes.store_prices;
+      delete attributes.variant_id;
 
       const variantRes = await client.query(
         `
-        INSERT INTO product_variants
-          (product_id, variant_key, attributes, base_price)
+        INSERT INTO product_variants (product_id, variant_key, attributes, base_price)
         VALUES ($1,$2,$3::jsonb,$4)
         RETURNING id
         `,
-        [productId, v.variant_key, JSON.stringify(v), v.base_price],
+        [
+          productId,
+          variantKey,
+          JSON.stringify(attributes),
+          toNumericPrice(variant.base_price),
+        ],
       );
 
       const variantId = variantRes.rows[0].id;
+      const storePrices = Array.isArray(variant.store_prices)
+        ? variant.store_prices
+        : Array.isArray(variant.stores)
+          ? variant.stores
+          : [];
 
-      for (const s of v.stores || []) {
+      for (const storeRow of storePrices) {
+        const store = toPlainObject(storeRow);
+        const storeName = normalizeNullableText(
+          store.store_name || store.store,
+        );
+        if (!storeName) continue;
+
         await client.query(
           `
           INSERT INTO variant_store_prices
-            (variant_id, store_name, price, url, offer_text)
-          VALUES ($1,$2,$3,$4,$5)
+            (variant_id, store_name, price, url, offer_text, delivery_info)
+          VALUES ($1,$2,$3,$4,$5,$6)
           `,
-          [variantId, s.store_name, s.price, s.url, s.offer_text || null],
+          [
+            variantId,
+            storeName,
+            toNumericPrice(store.price),
+            normalizeNullableText(store.url),
+            normalizeNullableText(store.offer_text),
+            normalizeNullableText(store.delivery_info),
+          ],
         );
       }
     }
 
-    /* ---------- 5️⃣ Publish default ---------- */
     await client.query(
-      `INSERT INTO product_publish (product_id, is_published)
-       VALUES ($1,false)`,
-      [productId],
+      `
+      INSERT INTO product_publish (product_id, is_published)
+      VALUES ($1,$2)
+      `,
+      [productId, publish],
     );
 
     await client.query("COMMIT");
 
-    res.status(201).json({
-      message: "Home appliance created successfully",
+    return res.status(201).json({
+      message: "TV created successfully",
       product_id: productId,
     });
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("POST /api/home-appliances error:", err);
-    res.status(500).json({ error: err.message });
+    console.error("POST /api/tvs error:", err);
+    return res.status(500).json({ error: err.message });
   } finally {
     client.release();
   }
 });
 
-app.get("/api/homeappliances", async (req, res) => {
+app.get("/api/tvs", async (req, res) => {
   try {
     const result = await db.query(`
       SELECT
         p.id AS product_id,
-        p.name,
+        p.name AS product_name,
         p.product_type,
         b.name AS brand_name,
+        t.category,
+        t.model,
+        COALESCE(pub.is_published, false) AS publish,
+        ds.hook_score,
+        ds.buyer_intent,
+        ds.trend_velocity,
+        ds.freshness,
+        ds.calculated_at AS hook_calculated_at,
 
-        ha.appliance_type,
-        ha.model_number,
-        ha.release_year,
-        ha.country_of_origin,
-        ha.specifications,
-        ha.features,
-        ha.performance,
-        ha.physical_details,
-        ha.warranty,
-        ha.created_at,
+        t.key_specs_json,
+        t.basic_info_json,
+        t.display_json,
+        t.video_engine_json,
+        t.audio_json,
+        t.smart_tv_json,
+        t.gaming_json,
+        t.ports_json,
+        t.connectivity_json,
+        t.power_json,
+        t.physical_json,
+        t.product_details_json,
+        t.in_the_box_json,
+        t.warranty_json,
 
-        /* ---------- Images ---------- */
         COALESCE(
           (
-            SELECT json_agg(pi.image_url)
+            SELECT json_agg(pi.image_url ORDER BY pi.position ASC NULLS LAST, pi.id ASC)
             FROM product_images pi
             WHERE pi.product_id = p.id
           ),
-          '[]'::json
-        ) AS images,
+          COALESCE(t.images_json, '[]'::jsonb)::json
+        ) AS images_json,
 
-        /* ---------- Rating ---------- */
-        (
-          SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
-          FROM product_ratings r
-          WHERE r.product_id = p.id
-        ) AS rating,
-
-        /* ---------- Variants + Store Prices ---------- */
         COALESCE(
-          json_agg(
-            DISTINCT jsonb_build_object(
-              'variant_id', v.id,
-              'variant_key', v.variant_key,
-              'attributes', v.attributes,
-              'base_price', v.base_price,
-              'store_prices', (
-                SELECT COALESCE(
-                  json_agg(
-                    jsonb_build_object(
-                      'id', sp.id,
-                      'store_name', sp.store_name,
-                      'price', sp.price,
-                      'url', sp.url,
-                      'offer_text', sp.offer_text,
-                      'delivery_info', sp.delivery_info
-                    )
-                  ),
-                  '[]'::json
+          (
+            SELECT json_agg(
+              jsonb_build_object(
+                'screen_size', COALESCE(v.attributes->>'screen_size', v.attributes->>'size'),
+                'base_price', v.base_price,
+                'variant_id', v.id,
+                'store_prices', (
+                  SELECT COALESCE(
+                    json_agg(
+                      jsonb_build_object(
+                        'id', sp.id,
+                        'store_name', sp.store_name,
+                        'price', sp.price,
+                        'url', sp.url,
+                        'offer_text', sp.offer_text,
+                        'delivery_info', sp.delivery_info
+                      )
+                      ORDER BY sp.id ASC
+                    ),
+                    '[]'::json
+                  )
+                  FROM variant_store_prices sp
+                  WHERE sp.variant_id = v.id
                 )
-                FROM variant_store_prices sp
-                WHERE sp.variant_id = v.id
               )
+              ORDER BY v.id ASC
             )
-          ) FILTER (WHERE v.id IS NOT NULL),
-          '[]'::json
-        ) AS variants
+            FROM product_variants v
+            WHERE v.product_id = p.id
+          ),
+          COALESCE(t.variants_json, '[]'::jsonb)::json
+        ) AS variants_json
 
       FROM products p
-      INNER JOIN home_appliance ha ON ha.product_id = p.id
+      INNER JOIN tvs t
+        ON t.product_id = p.id
       INNER JOIN product_publish pub
         ON pub.product_id = p.id
        AND pub.is_published = true
-      LEFT JOIN brands b ON b.id = p.brand_id
-      LEFT JOIN product_variants v ON v.product_id = p.id
-
-      WHERE p.product_type = 'home_appliance'
-
-      GROUP BY
-        p.id, b.name,
-        ha.appliance_type,
-        ha.model_number,
-        ha.release_year,
-        ha.country_of_origin,
-        ha.specifications,
-        ha.features,
-        ha.performance,
-        ha.physical_details,
-        ha.warranty,
-        ha.created_at
-
-      ORDER BY p.id DESC;
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
+      WHERE p.product_type = 'tv'
+      ORDER BY COALESCE(ds.hook_score, 0) DESC, p.id DESC
     `);
 
-    res.json({ home_appliances: result.rows });
+    return res.json({ tvs: result.rows });
   } catch (err) {
-    console.error("GET /api/home-appliances error:", err);
-    res.status(500).json({ error: err.message });
+    console.error("GET /api/tvs error:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
-
 app.post("/api/networking", authenticate, async (req, res) => {
   const client = await db.connect();
   const toJSON = (v) => (v === undefined ? null : JSON.stringify(v));
@@ -3507,7 +4615,8 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 
       // Delete store prices that are no longer present (by id) so removals persist.
       const keepPriceIdsByVariant = new Map();
-      for (const vid of replaceVariantIds) keepPriceIdsByVariant.set(vid, new Set());
+      for (const vid of replaceVariantIds)
+        keepPriceIdsByVariant.set(vid, new Set());
       for (const sp of req.body.variant_store_prices) {
         const vid = resolveVariantId(sp);
         if (!vid || !replaceVariantIds.has(vid)) continue;
@@ -3728,6 +4837,132 @@ app.delete("/api/smartphone/:id", authenticate, async (req, res) => {
   }
 });
 
+// Delete laptop
+app.delete("/api/laptop/:id", authenticate, async (req, res) => {
+  const client = await db.connect();
+  try {
+    const lid = Number(req.params.id);
+    if (Number.isNaN(lid) || lid <= 0) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    await client.query("BEGIN");
+
+    // Accept either laptop.product_id or laptop.id
+    let lres = await client.query(
+      "SELECT product_id FROM laptop WHERE product_id = $1 LIMIT 1",
+      [lid],
+    );
+    if (!lres.rows.length) {
+      lres = await client.query(
+        "SELECT product_id FROM laptop WHERE id = $1 LIMIT 1",
+        [lid],
+      );
+    }
+    if (!lres.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Laptop not found" });
+    }
+
+    const productId = lres.rows[0].product_id;
+
+    // Prevent deleting published laptops
+    const pub = await client.query(
+      "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
+      [productId],
+    );
+    if (pub.rows.length && pub.rows[0].is_published) {
+      await client.query("ROLLBACK");
+      return res
+        .status(403)
+        .json({ message: "Cannot delete: Laptop is published" });
+    }
+
+    await client.query("DELETE FROM product_publish WHERE product_id = $1", [
+      productId,
+    ]);
+    await client.query(
+      "DELETE FROM product_comparisons WHERE product_id = $1 OR compared_with = $1",
+      [productId],
+    );
+    await client.query(
+      "DELETE FROM product_sphere_ratings WHERE product_id = $1",
+      [productId],
+    );
+    await client.query("DELETE FROM products WHERE id = $1", [productId]);
+
+    await client.query("COMMIT");
+    return res.json({
+      message: "Unpublished laptop and product deleted successfully",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("DELETE /api/laptop/:id error:", err);
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Delete TV
+app.delete("/api/tvs/:id", authenticate, async (req, res) => {
+  const client = await db.connect();
+  try {
+    const tid = Number(req.params.id);
+    if (Number.isNaN(tid) || tid <= 0) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    await client.query("BEGIN");
+
+    const tvRes = await client.query(
+      "SELECT product_id FROM tvs WHERE product_id = $1 LIMIT 1",
+      [tid],
+    );
+    if (!tvRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "TV not found" });
+    }
+
+    const productId = tvRes.rows[0].product_id;
+
+    const pubRes = await client.query(
+      "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
+      [productId],
+    );
+    if (pubRes.rows.length && pubRes.rows[0].is_published) {
+      await client.query("ROLLBACK");
+      return res
+        .status(403)
+        .json({ message: "Cannot delete: TV is published" });
+    }
+
+    await client.query("DELETE FROM product_publish WHERE product_id = $1", [
+      productId,
+    ]);
+    await client.query(
+      "DELETE FROM product_comparisons WHERE product_id = $1 OR compared_with = $1",
+      [productId],
+    );
+    await client.query(
+      "DELETE FROM product_sphere_ratings WHERE product_id = $1",
+      [productId],
+    );
+    await client.query("DELETE FROM products WHERE id = $1", [productId]);
+
+    await client.query("COMMIT");
+    return res.json({
+      message: "Unpublished TV and product deleted successfully",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("DELETE /api/tvs/:id error:", err);
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // Delete a color from a smartphone's colors JSONB by index
 app.get("/api/laptop", authenticate, async (req, res) => {
   try {
@@ -3749,6 +4984,8 @@ app.get("/api/laptop", authenticate, async (req, res) => {
         l.software,
         l.features,
         l.warranty,
+        l.meta,
+        l.spec_sections,
         l.created_at,
 
         COALESCE(pub.is_published, false) AS is_published
@@ -3768,253 +5005,384 @@ app.get("/api/laptop", authenticate, async (req, res) => {
       ORDER BY p.id DESC
     `);
 
-    res.json({ laptops: result.rows });
+    const laptops = (result.rows || []).map(enrichLaptopResponse);
+    res.json({ laptops });
   } catch (err) {
     console.error("GET /api/laptop error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/api/homeappliance", authenticate, async (req, res) => {
+app.get("/api/tv", authenticate, async (req, res) => {
   try {
     const result = await db.query(`
       SELECT
         p.id AS product_id,
-        p.name,
+        p.name AS product_name,
         p.product_type,
-
         b.name AS brand_name,
+        p.brand_id,
+        t.category,
+        t.model,
 
-        h.appliance_type,
-        h.model_number,
-        h.release_year,
-        h.country_of_origin,
-        h.specifications,
-        h.features,
-        h.performance,
-        h.physical_details,
-        h.warranty,
-        h.created_at,
+        t.key_specs_json,
+        t.basic_info_json,
+        t.display_json,
+        t.video_engine_json,
+        t.audio_json,
+        t.smart_tv_json,
+        t.gaming_json,
+        t.ports_json,
+        t.connectivity_json,
+        t.power_json,
+        t.physical_json,
+        t.product_details_json,
+        t.in_the_box_json,
+        t.warranty_json,
+        t.images_json,
+        t.variants_json,
+        t.created_at,
 
         COALESCE(pub.is_published, false) AS is_published
-
       FROM products p
-      INNER JOIN home_appliance h
-        ON h.product_id = p.id
-
+      INNER JOIN tvs t
+        ON t.product_id = p.id
       LEFT JOIN brands b
         ON b.id = p.brand_id
-
       LEFT JOIN product_publish pub
         ON pub.product_id = p.id
-
-      WHERE p.product_type = 'home_appliance'
-
+      WHERE p.product_type = 'tv'
       ORDER BY p.id DESC
     `);
 
-    res.json({ home_appliances: result.rows });
+    return res.json({ tvs: result.rows });
   } catch (err) {
-    console.error("GET /api/home-appliance error:", err);
-    res.status(500).json({ error: err.message });
+    console.error("GET /api/tv error:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
-// Get single home appliance by id (accepts product_id)
-app.get("/api/home-appliances/:id", authenticate, async (req, res) => {
+app.get("/api/tvs/:id", authenticate, async (req, res) => {
   try {
     const rawId = req.params.id;
     const pid = Number(rawId);
-    if (!rawId || rawId.trim() === "")
+    if (!rawId || rawId.trim() === "") {
       return res.status(400).json({ message: "Invalid id" });
+    }
 
-    const har = await db.query(
-      "SELECT * FROM home_appliance WHERE product_id = $1 LIMIT 1",
+    const tvRes = await db.query(
+      "SELECT * FROM tvs WHERE product_id = $1 LIMIT 1",
       [pid],
     );
-    if (!har.rows.length) return res.status(404).json({ message: "Not found" });
+    if (!tvRes.rows.length) {
+      return res.status(404).json({ message: "Not found" });
+    }
 
-    const home = har.rows[0];
-    const productId = home.product_id;
+    const tv = tvRes.rows[0];
+    const productId = tv.product_id;
 
-    const prodRes = await db.query(
+    const productRes = await db.query(
       "SELECT name, brand_id FROM products WHERE id = $1 LIMIT 1",
       [productId],
     );
-    const productName = prodRes.rows[0] ? prodRes.rows[0].name : null;
-    const productBrandId = prodRes.rows[0] ? prodRes.rows[0].brand_id : null;
+
+    const product = productRes.rows[0] || { name: null, brand_id: null };
 
     const imagesRes = await db.query(
-      "SELECT image_url FROM product_images WHERE product_id = $1 ORDER BY position ASC",
+      "SELECT image_url FROM product_images WHERE product_id = $1 ORDER BY position ASC, id ASC",
       [productId],
     );
-    const images = imagesRes.rows.map((r) => r.image_url);
+    const imagesJson = imagesRes.rows.map((row) => row.image_url);
 
     const variantsRes = await db.query(
       "SELECT * FROM product_variants WHERE product_id = $1 ORDER BY id ASC",
       [productId],
     );
 
-    const variants = [];
-    for (const v of variantsRes.rows) {
-      const stores = await db.query(
+    const variantsJson = [];
+    for (const variant of variantsRes.rows) {
+      const storesRes = await db.query(
         "SELECT * FROM variant_store_prices WHERE variant_id = $1 ORDER BY id ASC",
-        [v.id],
+        [variant.id],
       );
-      variants.push({ ...v, stores: stores.rows });
+
+      variantsJson.push({
+        ...toPlainObject(variant.attributes),
+        variant_id: variant.id,
+        variant_key: variant.variant_key,
+        base_price: variant.base_price,
+        store_prices: storesRes.rows,
+      });
     }
 
-    const pubRes = await db.query(
+    const publishRes = await db.query(
       "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
       [productId],
     );
-    const published = pubRes.rows[0] ? pubRes.rows[0].is_published : false;
+    const published = publishRes.rows[0]
+      ? publishRes.rows[0].is_published
+      : false;
 
     return res.json({
-      product: { name: productName, brand_id: productBrandId },
-      home_appliance: home,
-      images,
-      variants,
+      product,
+      tv,
+      images_json: imagesJson,
+      variants_json: variantsJson,
       published,
     });
   } catch (err) {
-    console.error("GET /api/home-appliances/:id error:", err);
+    console.error("GET /api/tvs/:id error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// Update home appliance (product, home_appliance jsonb, images, variants, publish)
-app.put("/api/home-appliances/:id", authenticate, async (req, res) => {
+app.put("/api/tvs/:id", authenticate, async (req, res) => {
   const client = await db.connect();
+  const toJSON = (v) => (v === undefined ? null : JSON.stringify(v));
+
   try {
-    if (req.user.role !== "admin")
+    if (req.user.role !== "admin") {
       return res.status(403).json({ message: "Admin access required" });
+    }
 
     const rawId = req.params.id;
     const pid = Number(rawId);
-    if (!rawId || rawId.trim() === "")
+    if (!rawId || rawId.trim() === "") {
       return res.status(400).json({ message: "Invalid id" });
+    }
 
-    const har = await db.query(
-      "SELECT * FROM home_appliance WHERE product_id = $1 LIMIT 1",
+    const tvLookup = await db.query(
+      "SELECT * FROM tvs WHERE product_id = $1 LIMIT 1",
       [pid],
     );
-    if (!har.rows.length) return res.status(404).json({ message: "Not found" });
+    if (!tvLookup.rows.length) {
+      return res.status(404).json({ message: "Not found" });
+    }
 
-    const productId = har.rows[0].product_id;
+    const tvRow = tvLookup.rows[0];
+    const productId = tvRow.product_id;
 
-    const {
-      product = {},
-      home_appliance = {},
-      images = [],
-      variants = [],
-      published,
-    } = req.body;
+    const payload = normalizeTvPayloadInput(req.body || {});
+    const product = toPlainObject(payload.product);
+
+    let productName = normalizeNullableText(
+      payload.product_name || payload.name || product.name,
+    );
+
+    let brandId =
+      payload.brand_id !== undefined && payload.brand_id !== null
+        ? Number(payload.brand_id)
+        : product.brand_id !== undefined && product.brand_id !== null
+          ? Number(product.brand_id)
+          : null;
+
+    if ((!Number.isInteger(brandId) || brandId <= 0) && payload.brand_name) {
+      brandId = await resolveBrandIdByName(client, payload.brand_name);
+    }
+
+    const category = hasOwn(payload, "category")
+      ? normalizeNullableText(payload.category)
+      : tvRow.category;
+    const model = hasOwn(payload, "model")
+      ? normalizeNullableText(payload.model)
+      : tvRow.model;
+
+    const sectionValues = {};
+    for (const key of TV_JSON_OBJECT_SECTIONS) {
+      sectionValues[key] = hasOwn(payload, key)
+        ? toPlainObject(payload[key])
+        : toPlainObject(tvRow[key]);
+    }
+
+    const imagesJson = hasOwn(payload, "images_json")
+      ? Array.isArray(payload.images_json)
+        ? payload.images_json
+        : []
+      : hasOwn(payload, "images")
+        ? Array.isArray(payload.images)
+          ? payload.images
+          : []
+        : Array.isArray(tvRow.images_json)
+          ? tvRow.images_json
+          : [];
+
+    const variantsJson = hasOwn(payload, "variants_json")
+      ? Array.isArray(payload.variants_json)
+        ? payload.variants_json
+        : []
+      : hasOwn(payload, "variants")
+        ? Array.isArray(payload.variants)
+          ? payload.variants
+          : []
+        : Array.isArray(tvRow.variants_json)
+          ? tvRow.variants_json
+          : [];
+
+    const publish = hasOwn(payload, "publish")
+      ? Boolean(payload.publish)
+      : hasOwn(payload, "published")
+        ? Boolean(payload.published)
+        : undefined;
 
     await client.query("BEGIN");
 
-    // Update product
-    if (product.name || product.brand_id !== undefined) {
+    if (productName || Number.isInteger(brandId)) {
+      const existingProduct = await client.query(
+        "SELECT name, brand_id FROM products WHERE id = $1 LIMIT 1",
+        [productId],
+      );
+
+      const currentProduct = existingProduct.rows[0] || {};
+      if (!productName) productName = currentProduct.name || null;
+      const brandToSave = Number.isInteger(brandId)
+        ? brandId
+        : currentProduct.brand_id;
+
       await client.query(
         "UPDATE products SET name = $1, brand_id = $2 WHERE id = $3",
-        [product.name || null, product.brand_id || null, productId],
+        [productName, brandToSave || null, productId],
       );
     }
 
-    const toJSON = (v) => (v === undefined ? null : JSON.stringify(v));
-
-    // Update home_appliance JSONB fields
     await client.query(
       `
-      UPDATE home_appliance SET
-        appliance_type = $1,
-        model_number = $2,
-        release_year = $3,
-        country_of_origin = $4,
-        specifications = $5::jsonb,
-        features = $6::jsonb,
-        performance = $7::jsonb,
-        physical_details = $8::jsonb,
-        warranty = $9::jsonb
-      WHERE product_id = $10
+      UPDATE tvs SET
+        category = $1,
+        model = $2,
+        key_specs_json = $3::jsonb,
+        basic_info_json = $4::jsonb,
+        display_json = $5::jsonb,
+        video_engine_json = $6::jsonb,
+        audio_json = $7::jsonb,
+        smart_tv_json = $8::jsonb,
+        gaming_json = $9::jsonb,
+        ports_json = $10::jsonb,
+        connectivity_json = $11::jsonb,
+        power_json = $12::jsonb,
+        physical_json = $13::jsonb,
+        product_details_json = $14::jsonb,
+        in_the_box_json = $15::jsonb,
+        warranty_json = $16::jsonb,
+        images_json = $17::jsonb,
+        variants_json = $18::jsonb
+      WHERE product_id = $19
       `,
       [
-        home_appliance.appliance_type || null,
-        home_appliance.model_number || null,
-        home_appliance.release_year || null,
-        home_appliance.country_of_origin || null,
-        toJSON(home_appliance.specifications),
-        toJSON(home_appliance.features),
-        toJSON(home_appliance.performance),
-        toJSON(home_appliance.physical_details),
-        toJSON(home_appliance.warranty),
+        category,
+        model,
+        toJSON(sectionValues.key_specs_json),
+        toJSON(sectionValues.basic_info_json),
+        toJSON(sectionValues.display_json),
+        toJSON(sectionValues.video_engine_json),
+        toJSON(sectionValues.audio_json),
+        toJSON(sectionValues.smart_tv_json),
+        toJSON(sectionValues.gaming_json),
+        toJSON(sectionValues.ports_json),
+        toJSON(sectionValues.connectivity_json),
+        toJSON(sectionValues.power_json),
+        toJSON(sectionValues.physical_json),
+        toJSON(sectionValues.product_details_json),
+        toJSON(sectionValues.in_the_box_json),
+        toJSON(sectionValues.warranty_json),
+        toJSON(imagesJson),
+        toJSON(variantsJson),
         productId,
       ],
     );
 
-    // Replace images
     await client.query("DELETE FROM product_images WHERE product_id = $1", [
       productId,
     ]);
-    for (let i = 0; i < (images || []).length; i++) {
+    for (let i = 0; i < imagesJson.length; i++) {
+      const imageUrl = normalizeNullableText(imagesJson[i]);
+      if (!imageUrl) continue;
       await client.query(
         "INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)",
-        [productId, images[i], i + 1],
+        [productId, imageUrl, i + 1],
       );
     }
 
-    // Replace variants
-    const oldVarRes = await client.query(
+    const oldVariantRes = await client.query(
       "SELECT id FROM product_variants WHERE product_id = $1",
       [productId],
     );
-    for (const v of oldVarRes.rows) {
+    for (const row of oldVariantRes.rows) {
       await client.query(
         "DELETE FROM variant_store_prices WHERE variant_id = $1",
-        [v.id],
+        [row.id],
       );
     }
     await client.query("DELETE FROM product_variants WHERE product_id = $1", [
       productId,
     ]);
 
-    for (const v of variants || []) {
-      const variantKey = v.variant_key || `${v.ram || ""}_${v.storage || ""}`;
+    for (let i = 0; i < variantsJson.length; i++) {
+      const variant = toPlainObject(variantsJson[i]);
+      const variantKey =
+        normalizeNullableText(
+          variant.variant_key || variant.screen_size || variant.size,
+        ) || `tv_variant_${i + 1}`;
+
+      const attributes = { ...variant };
+      delete attributes.base_price;
+      delete attributes.store_prices;
+      delete attributes.variant_id;
+
       const variantRes = await client.query(
-        `INSERT INTO product_variants (product_id, variant_key, attributes, base_price) VALUES ($1,$2,$3::jsonb,$4) RETURNING id`,
+        `
+        INSERT INTO product_variants (product_id, variant_key, attributes, base_price)
+        VALUES ($1,$2,$3::jsonb,$4)
+        RETURNING id
+        `,
         [
           productId,
           variantKey,
-          JSON.stringify(v.attributes || { ram: v.ram, storage: v.storage }),
-          v.base_price || null,
+          JSON.stringify(attributes),
+          toNumericPrice(variant.base_price),
         ],
       );
+
       const variantId = variantRes.rows[0].id;
-      for (const s of v.stores || []) {
+      const storePrices = Array.isArray(variant.store_prices)
+        ? variant.store_prices
+        : Array.isArray(variant.stores)
+          ? variant.stores
+          : [];
+
+      for (const storeRow of storePrices) {
+        const store = toPlainObject(storeRow);
+        const storeName = normalizeNullableText(
+          store.store_name || store.store,
+        );
+        if (!storeName) continue;
+
         await client.query(
-          `INSERT INTO variant_store_prices (variant_id, store_name, price, url, offer_text, delivery_info) VALUES ($1,$2,$3,$4,$5,$6)`,
+          `
+          INSERT INTO variant_store_prices
+            (variant_id, store_name, price, url, offer_text, delivery_info)
+          VALUES ($1,$2,$3,$4,$5,$6)
+          `,
           [
             variantId,
-            s.store_name || null,
-            s.price || null,
-            s.url || null,
-            s.offer_text || null,
-            s.delivery_info || null,
+            storeName,
+            toNumericPrice(store.price),
+            normalizeNullableText(store.url),
+            normalizeNullableText(store.offer_text),
+            normalizeNullableText(store.delivery_info),
           ],
         );
       }
     }
 
-    // Update publish state
-    if (published !== undefined) {
-      const up = await client.query(
+    if (publish !== undefined) {
+      const updatePublish = await client.query(
         "UPDATE product_publish SET is_published = $1 WHERE product_id = $2",
-        [published, productId],
+        [publish, productId],
       );
-      if (up.rowCount === 0) {
+      if (updatePublish.rowCount === 0) {
         await client.query(
           "INSERT INTO product_publish (product_id, is_published) VALUES ($1,$2)",
-          [productId, published],
+          [productId, publish],
         );
       }
     }
@@ -4022,18 +5390,17 @@ app.put("/api/home-appliances/:id", authenticate, async (req, res) => {
     await client.query("COMMIT");
 
     return res.json({
-      message: "Home appliance updated",
+      message: "TV updated",
       product_id: productId,
     });
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("PUT /api/home-appliances/:id error:", err);
+    console.error("PUT /api/tvs/:id error:", err);
     return res.status(500).json({ error: err.message });
   } finally {
     client.release();
   }
 });
-
 /* -----------------------
   Ram/Storage/Long API
 ------------------------*/
@@ -4817,8 +6184,22 @@ app.post("/api/admin/hook-score/recompute", authenticate, async (req, res) => {
       return res.status(403).json({ message: "Admin access required" });
     }
 
-    const result = await recomputeProductDynamicScoreSmartphones(db);
-    return res.json(result);
+    const smartphones = await recomputeProductDynamicScoreSmartphones(db);
+    const laptops = await recomputeProductDynamicScoreLaptops(db);
+    const tvs = await recomputeProductDynamicScoreTVs(db);
+
+    return res.json({
+      ok: true,
+      updated:
+        (smartphones.updated || 0) +
+        (laptops.updated || 0) +
+        (tvs.updated || 0),
+      results: {
+        smartphones,
+        laptops,
+        tvs,
+      },
+    });
   } catch (err) {
     console.error("POST /api/admin/hook-score/recompute error:", err);
     return res.status(500).json({ ok: false, error: err.message });
@@ -4858,7 +6239,7 @@ app.get("/api/admin/trending", authenticate, async (req, res) => {
       "smartphone",
       "laptop",
       "networking",
-      "home_appliance",
+      "tv",
       "accessories",
     ];
 
@@ -4936,8 +6317,8 @@ app.get("/api/admin/trending", authenticate, async (req, res) => {
         ON ct.product_id = p.id
       ${where}
       ORDER BY
-        ts.manual_boost DESC,
         ts.manual_priority DESC,
+        ts.manual_boost DESC,
         ts.trending_score DESC,
         ts.calculated_at DESC,
         p.id DESC
@@ -5037,7 +6418,9 @@ app.get("/api/admin/compare-scoring", authenticate, async (req, res) => {
     return res.json(toCompareScoringAdminResponse(config));
   } catch (err) {
     console.error("GET /api/admin/compare-scoring error:", err);
-    return res.status(500).json({ message: "Failed to load compare scoring config" });
+    return res
+      .status(500)
+      .json({ message: "Failed to load compare scoring config" });
   }
 });
 
@@ -5078,7 +6461,9 @@ app.put("/api/admin/compare-scoring", authenticate, async (req, res) => {
     });
   } catch (err) {
     console.error("PUT /api/admin/compare-scoring error:", err);
-    return res.status(500).json({ message: "Failed to update compare scoring config" });
+    return res
+      .status(500)
+      .json({ message: "Failed to update compare scoring config" });
   }
 });
 
@@ -5192,7 +6577,7 @@ app.get("/api/public/trending-products", async (req, res) => {
       "smartphone",
       "laptop",
       "networking",
-      "home_appliance",
+      "tv",
       "accessories",
     ];
 
@@ -5248,8 +6633,8 @@ app.get("/api/public/trending-products", async (req, res) => {
         ON b.id = p.brand_id
       WHERE p.product_type = $1
       ORDER BY
-        ts.manual_boost DESC,
         ts.manual_priority DESC,
+        ts.manual_boost DESC,
         ts.trending_score DESC,
         p.id DESC
       LIMIT $2
@@ -5308,7 +6693,9 @@ app.get("/api/public/trending-products", async (req, res) => {
     });
   } catch (err) {
     console.error("GET /api/public/trending-products error:", err);
-    return res.status(500).json({ message: "Failed to fetch trending products" });
+    return res
+      .status(500)
+      .json({ message: "Failed to fetch trending products" });
   }
 });
 
@@ -5501,102 +6888,348 @@ app.get("/api/public/trending/smartphones", handleTrendingSmartphones);
 // Trending Laptops
 app.get("/api/public/trending/laptops", async (req, res) => {
   try {
-    const result = await db.query(`
-      WITH top_products AS (
-        SELECT p.id AS product_id, COUNT(v.id) AS views
-        FROM product_views v
-        JOIN products p ON p.id = v.product_id
-        WHERE v.viewed_at >= now() - INTERVAL '7 days'
-          AND p.product_type = 'laptop'
-        GROUP BY p.id
-        ORDER BY views DESC
-        LIMIT 12
-      )
+    const limitRaw = Number(req.query?.limit ?? 50);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(100, Math.max(1, Math.floor(limitRaw)))
+      : 50;
+
+    const result = await db.query(
+      `
       SELECT
         p.id AS product_id,
-        p.name AS product_name,
-        b.name AS brand,
-        p.name AS model,
-        (
-          SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
-          FROM product_ratings r
-          WHERE r.product_id = p.id
-        ) AS rating,
-        (
-          SELECT MIN(sp.price)
-          FROM product_variants v
-          LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
-          WHERE v.product_id = p.id AND sp.price IS NOT NULL
-        ) AS price,
-        (
-          SELECT COALESCE(v.attributes->>'storage', v.attributes->>'storage_size', '')
-          FROM product_variants v
-          WHERE v.product_id = p.id
-          ORDER BY v.id ASC
-          LIMIT 1
-        ) AS storage,
-        COALESCE(pi.image_url, NULL) AS image,
-        tp.views
-      FROM top_products tp
-      JOIN products p ON p.id = tp.product_id
-      LEFT JOIN brands b ON b.id = p.brand_id
-      LEFT JOIN laptop l ON l.product_id = p.id
-      LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.position = 1
-      ORDER BY tp.views DESC, price ASC NULLS LAST
-      LIMIT 50;
-    `);
+        p.name,
+        p.product_type,
 
-    return res.json({ trending: result.rows });
+        b.name AS brand_name,
+
+        l.cpu,
+        l.display,
+        l.memory,
+        l.storage,
+        l.battery,
+        l.connectivity,
+        l.physical,
+        l.software,
+        l.features,
+        l.warranty,
+        l.meta,
+        l.spec_sections,
+        l.created_at,
+
+        MAX(ts.trending_score) AS trending_score,
+        MAX(ts.views_7d) AS views_7d,
+        MAX(ts.views_prev_7d) AS views_prev_7d,
+        MAX(ts.velocity) AS velocity,
+        MAX((ts.manual_boost)::int) AS manual_boost,
+        MAX(ts.manual_priority) AS manual_priority,
+        MAX(ts.manual_badge) AS manual_badge,
+        MAX(ts.calculated_at) AS trending_calculated_at,
+
+        /* ---------- Images ---------- */
+        COALESCE(
+          (
+            SELECT json_agg(pi.image_url)
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+          ),
+          '[]'::json
+        ) AS images,
+
+        /* ---------- Variants + Store Prices ---------- */
+        COALESCE(
+          json_agg(
+            DISTINCT jsonb_build_object(
+              'variant_id', v.id,
+              'variant_key', v.variant_key,
+              'ram', v.attributes->>'ram',
+              'storage', v.attributes->>'storage',
+              'base_price', v.base_price,
+              'store_prices', (
+                SELECT COALESCE(
+                  json_agg(
+                    jsonb_build_object(
+                      'id', sp.id,
+                      'store_name', sp.store_name,
+                      'price', sp.price,
+                      'url', sp.url,
+                      'offer_text', sp.offer_text,
+                      'delivery_info', sp.delivery_info
+                    )
+                  ),
+                  '[]'::json
+                )
+                FROM variant_store_prices sp
+                WHERE sp.variant_id = v.id
+              )
+            )
+          ) FILTER (WHERE v.id IS NOT NULL),
+          '[]'::json
+        ) AS variants
+
+      FROM products p
+
+      INNER JOIN laptop l
+        ON l.product_id = p.id
+
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN product_variants v
+        ON v.product_id = p.id
+      LEFT JOIN product_trending_score ts
+        ON ts.product_id = p.id
+
+      WHERE p.product_type = 'laptop'
+
+      GROUP BY
+        p.id,
+        b.name,
+        l.cpu,
+        l.display,
+        l.memory,
+        l.storage,
+        l.battery,
+        l.connectivity,
+        l.physical,
+        l.software,
+        l.features,
+        l.warranty,
+        l.meta,
+        l.spec_sections,
+        l.created_at
+
+      ORDER BY
+        COALESCE(MAX(ts.manual_priority), 0) DESC,
+        COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
+        COALESCE(MAX(ts.trending_score), 0) DESC,
+        p.id DESC
+
+      LIMIT $1;
+    `,
+      [limit],
+    );
+
+    const badgeForScore = (score) => {
+      const s = Number(score);
+      if (!Number.isFinite(s)) return "Gaining Attention";
+      if (s >= 80) return "Trending Now";
+      if (s >= 60) return "Popular This Week";
+      return "Gaining Attention";
+    };
+
+    const laptops = (result.rows || []).map((row) => {
+      const trendScoreRaw = Number(row?.trending_score);
+      const trendScore = Number.isFinite(trendScoreRaw) ? trendScoreRaw : null;
+      const views7dRaw = Number(row?.views_7d);
+      const viewsPrevRaw = Number(row?.views_prev_7d);
+      const views7d = Number.isFinite(views7dRaw) ? views7dRaw : 0;
+      const viewsPrev7d = Number.isFinite(viewsPrevRaw) ? viewsPrevRaw : 0;
+      const manualBoost = Boolean(Number(row?.manual_boost ?? 0));
+      const manualBadge = row?.manual_badge
+        ? String(row.manual_badge).trim()
+        : "";
+
+      return {
+        ...toCanonicalLaptopProductResponse(row),
+        trend_score: trendScore,
+        trend_views_7d: views7d,
+        trend_views_prev_7d: viewsPrev7d,
+        trend_delta: views7d - viewsPrev7d,
+        trend_velocity: row?.velocity ?? null,
+        trend_manual_boost: manualBoost,
+        trend_manual_priority: row?.manual_priority ?? 0,
+        trend_manual_badge: manualBadge || null,
+        trend_badge:
+          manualBoost && manualBadge
+            ? manualBadge
+            : manualBoost
+              ? "Editor Pick"
+              : badgeForScore(trendScore),
+        trend_calculated_at: row?.trending_calculated_at ?? null,
+      };
+    });
+
+    return res.json({
+      period: "7d",
+      updated_at:
+        (result.rows || []).find((r) => r?.trending_calculated_at)
+          ?.trending_calculated_at ?? null,
+      laptops,
+      trending: laptops,
+    });
   } catch (err) {
     console.error("GET /api/public/trending/laptops error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// Trending Home Appliances
-app.get("/api/public/trending/appliances", async (req, res) => {
+// Trending TVs
+app.get("/api/public/trending/tvs", async (req, res) => {
   try {
-    const result = await db.query(`
-      WITH top_products AS (
-        SELECT p.id AS product_id, COUNT(v.id) AS views
-        FROM product_views v
-        JOIN products p ON p.id = v.product_id
-        WHERE v.viewed_at >= now() - INTERVAL '7 days'
-          AND p.product_type = 'home_appliance'
-        GROUP BY p.id
-        ORDER BY views DESC
-        LIMIT 12
-      )
+    const limitRaw = Number(req.query?.limit ?? 50);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(100, Math.max(1, Math.floor(limitRaw)))
+      : 50;
+
+    const result = await db.query(
+      `
       SELECT
         p.id AS product_id,
+        p.name AS name,
         p.name AS product_name,
+        p.product_type,
+        b.name AS brand_name,
         b.name AS brand,
-        ha.model_number AS model,
+        COALESCE(t.model, p.name) AS model,
+
+        MAX(ts.trending_score) AS trending_score,
+        MAX(ts.views_7d) AS views_7d,
+        MAX(ts.views_prev_7d) AS views_prev_7d,
+        MAX(ts.velocity) AS velocity,
+        MAX((ts.manual_boost)::int) AS manual_boost,
+        MAX(ts.manual_priority) AS manual_priority,
+        MAX(ts.manual_badge) AS manual_badge,
+        MAX(ts.calculated_at) AS trending_calculated_at,
+
         (
           SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
           FROM product_ratings r
           WHERE r.product_id = p.id
         ) AS rating,
         (
-          SELECT MIN(sp.price)
+          SELECT COALESCE(MIN(sp.price), MIN(v.base_price))
           FROM product_variants v
-          LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
-          WHERE v.product_id = p.id AND sp.price IS NOT NULL
+          LEFT JOIN variant_store_prices sp
+            ON sp.variant_id = v.id
+          WHERE v.product_id = p.id
         ) AS price,
-        COALESCE(pi.image_url, NULL) AS image,
-        tp.views
-      FROM top_products tp
-      JOIN products p ON p.id = tp.product_id
-      LEFT JOIN brands b ON b.id = p.brand_id
-      LEFT JOIN home_appliance ha ON ha.product_id = p.id
-      LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.position = 1
-      ORDER BY tp.views DESC, price ASC NULLS LAST
-      LIMIT 50;
-    `);
+        (
+          SELECT pi.image_url
+          FROM product_images pi
+          WHERE pi.product_id = p.id
+          ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+          LIMIT 1
+        ) AS image,
+        COALESCE(
+          (
+            SELECT json_agg(pi.image_url ORDER BY pi.position ASC NULLS LAST, pi.id ASC)
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+          ),
+          '[]'::json
+        ) AS images,
+        COALESCE(
+          (
+            SELECT json_agg(
+              jsonb_build_object(
+                'variant_id', v.id,
+                'screen_size', COALESCE(v.attributes->>'screen_size', v.attributes->>'size'),
+                'base_price', v.base_price,
+                'store_prices', (
+                  SELECT COALESCE(
+                    json_agg(
+                      jsonb_build_object(
+                        'id', sp.id,
+                        'store_name', sp.store_name,
+                        'price', sp.price,
+                        'url', sp.url,
+                        'offer_text', sp.offer_text,
+                        'delivery_info', sp.delivery_info
+                      )
+                      ORDER BY sp.id ASC
+                    ),
+                    '[]'::json
+                  )
+                  FROM variant_store_prices sp
+                  WHERE sp.variant_id = v.id
+                )
+              )
+              ORDER BY v.id ASC
+            )
+            FROM product_variants v
+            WHERE v.product_id = p.id
+          ),
+          '[]'::json
+        ) AS variants
+      FROM products p
+      INNER JOIN tvs t
+        ON t.product_id = p.id
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      LEFT JOIN product_trending_score ts
+        ON ts.product_id = p.id
+      WHERE p.product_type = 'tv'
+      GROUP BY
+        p.id,
+        p.name,
+        p.product_type,
+        b.name,
+        t.model
+      ORDER BY
+        COALESCE(MAX(ts.manual_priority), 0) DESC,
+        COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
+        COALESCE(MAX(ts.trending_score), 0) DESC,
+        p.id DESC
+      LIMIT $1;
+      `,
+      [limit],
+    );
 
-    return res.json({ trending: result.rows });
+    const badgeForScore = (score) => {
+      const s = Number(score);
+      if (!Number.isFinite(s)) return "Gaining Attention";
+      if (s >= 80) return "Trending Now";
+      if (s >= 60) return "Popular This Week";
+      return "Gaining Attention";
+    };
+
+    const tvs = (result.rows || []).map((row) => {
+      const trendScoreRaw = Number(row?.trending_score);
+      const trendScore = Number.isFinite(trendScoreRaw) ? trendScoreRaw : null;
+      const views7dRaw = Number(row?.views_7d);
+      const viewsPrevRaw = Number(row?.views_prev_7d);
+      const views7d = Number.isFinite(views7dRaw) ? views7dRaw : 0;
+      const viewsPrev7d = Number.isFinite(viewsPrevRaw) ? viewsPrevRaw : 0;
+      const manualBoost = Boolean(Number(row?.manual_boost ?? 0));
+      const manualBadge = row?.manual_badge
+        ? String(row.manual_badge).trim()
+        : "";
+
+      return {
+        ...row,
+        trend_score: trendScore,
+        trend_views_7d: views7d,
+        trend_views_prev_7d: viewsPrev7d,
+        trend_delta: views7d - viewsPrev7d,
+        trend_velocity: row?.velocity ?? null,
+        trend_manual_boost: manualBoost,
+        trend_manual_priority: row?.manual_priority ?? 0,
+        trend_manual_badge: manualBadge || null,
+        trend_badge:
+          manualBoost && manualBadge
+            ? manualBadge
+            : manualBoost
+              ? "Editor Pick"
+              : badgeForScore(trendScore),
+        trend_calculated_at: row?.trending_calculated_at ?? null,
+      };
+    });
+
+    return res.json({
+      period: "7d",
+      updated_at:
+        (result.rows || []).find((r) => r?.trending_calculated_at)
+          ?.trending_calculated_at ?? null,
+      tvs,
+      trending: tvs,
+    });
   } catch (err) {
-    console.error("GET /api/public/trending/appliances error:", err);
+    console.error("GET /api/public/trending/tvs error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -5712,15 +7345,15 @@ app.get("/api/public/new/laptops", async (req, res) => {
   }
 });
 
-// New Launches - Home Appliances
-app.get("/api/public/new/appliances", async (req, res) => {
+// New Launches - TVs
+app.get("/api/public/new/tvs", async (req, res) => {
   try {
     const result = await db.query(`
       SELECT
         p.id AS product_id,
         p.name AS product_name,
         b.name AS brand,
-        ha.release_year AS launch_date,
+        COALESCE(t.created_at, p.created_at) AS launch_date,
         (
           SELECT MIN(sp.price)
           FROM product_variants v
@@ -5729,16 +7362,16 @@ app.get("/api/public/new/appliances", async (req, res) => {
         ) AS price
       FROM products p
       LEFT JOIN brands b ON b.id = p.brand_id
-      LEFT JOIN home_appliance ha ON ha.product_id = p.id
+      LEFT JOIN tvs t ON t.product_id = p.id
       INNER JOIN product_publish pub ON pub.product_id = p.id AND pub.is_published = true
-      WHERE p.product_type = 'home_appliance'
-      ORDER BY COALESCE(ha.release_year::text, p.created_at::text) DESC
+      WHERE p.product_type = 'tv'
+      ORDER BY COALESCE(t.created_at, p.created_at) DESC
       LIMIT 20;
     `);
 
     return res.json({ new: result.rows });
   } catch (err) {
-    console.error("GET /api/public/new/appliances error:", err);
+    console.error("GET /api/public/new/tvs error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -5774,7 +7407,7 @@ app.get("/api/public/new/networking", async (req, res) => {
   }
 });
 
-// Trending All Types (smartphones, laptops, networking, appliances, etc.)
+// Trending All Types (smartphones, laptops, networking, tvs, etc.)
 app.get("/api/public/trending/all", async (req, res) => {
   try {
     const result = await db.query(`
@@ -5792,7 +7425,7 @@ app.get("/api/public/trending/all", async (req, res) => {
         p.name AS product_name,
         p.product_type,
         b.name AS brand,
-        COALESCE(s.model, ha.model_number, n.model_number, p.name) AS model,
+        COALESCE(s.model, t.model, n.model_number, p.name) AS model,
         (
           SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
           FROM product_ratings r
@@ -5809,7 +7442,7 @@ app.get("/api/public/trending/all", async (req, res) => {
       JOIN products p ON p.id = tp.product_id
       LEFT JOIN brands b ON b.id = p.brand_id
       LEFT JOIN smartphones s ON s.product_id = p.id
-      LEFT JOIN home_appliance ha ON ha.product_id = p.id
+      LEFT JOIN tvs t ON t.product_id = p.id
       LEFT JOIN networking n ON n.product_id = p.id
       ORDER BY tp.views DESC, price ASC NULLS LAST;
     `);
@@ -5837,7 +7470,7 @@ app.post("/api/public/compare/scores", async (req, res) => {
       const productIdRaw =
         typeof item === "number"
           ? item
-          : item?.product_id ?? item?.productId ?? item?.id;
+          : (item?.product_id ?? item?.productId ?? item?.id);
       const productId = Number(productIdRaw);
       if (!Number.isInteger(productId) || productId <= 0) continue;
       if (seenProductIds.has(productId)) continue;
@@ -5869,10 +7502,10 @@ app.post("/api/public/compare/scores", async (req, res) => {
         p.id AS product_id,
         p.name,
         p.product_type,
-        COALESCE(s.performance, n.performance, l.cpu, ha.performance, '{}'::jsonb) AS performance,
-        COALESCE(s.display, l.display, '{}'::jsonb) AS display,
+        COALESCE(s.performance, n.performance, l.cpu, t.video_engine_json, '{}'::jsonb) AS performance,
+        COALESCE(s.display, l.display, t.display_json, '{}'::jsonb) AS display,
         COALESCE(s.camera, '{}'::jsonb) AS camera,
-        COALESCE(s.battery, l.battery, '{}'::jsonb) AS battery,
+        COALESCE(s.battery, l.battery, t.power_json, '{}'::jsonb) AS battery,
         (
           SELECT MIN(v.base_price)
           FROM product_variants v
@@ -5905,8 +7538,8 @@ app.post("/api/public/compare/scores", async (req, res) => {
         ON l.product_id = p.id
       LEFT JOIN networking n
         ON n.product_id = p.id
-      LEFT JOIN home_appliance ha
-        ON ha.product_id = p.id
+      LEFT JOIN tvs t
+        ON t.product_id = p.id
       WHERE p.id = ANY($1::int[])
       `,
       [productIds],
@@ -6163,11 +7796,15 @@ app.get("/api/public/product/:id", async (req, res) => {
       brand_id: product.brand_id,
       images: imgRes.rows.map((r) => r.image_url),
       variants: varRes,
-      hook_score: score?.hook_score ?? null,
-      buyer_intent: score?.buyer_intent ?? null,
-      trend_velocity: score?.trend_velocity ?? null,
-      freshness: score?.freshness ?? null,
-      hook_calculated_at: score?.calculated_at ?? null,
+      ...(product.product_type === "smartphone"
+        ? {
+            hook_score: score?.hook_score ?? null,
+            buyer_intent: score?.buyer_intent ?? null,
+            trend_velocity: score?.trend_velocity ?? null,
+            freshness: score?.freshness ?? null,
+            hook_calculated_at: score?.calculated_at ?? null,
+          }
+        : {}),
       ...smartphoneDetails,
       // Include the smartphone object as well for backward compatibility
       smartphone: smartphoneDetails,
@@ -6665,8 +8302,21 @@ async function start() {
 
       const run = async () => {
         try {
-          const r = await recomputeProductDynamicScoreSmartphones(db);
-          console.log("Hook score recompute:", r);
+          const smartphones = await recomputeProductDynamicScoreSmartphones(db);
+          const laptops = await recomputeProductDynamicScoreLaptops(db);
+          const tvs = await recomputeProductDynamicScoreTVs(db);
+          console.log("Hook score recompute:", {
+            ok: true,
+            updated:
+              (smartphones.updated || 0) +
+              (laptops.updated || 0) +
+              (tvs.updated || 0),
+            results: {
+              smartphones,
+              laptops,
+              tvs,
+            },
+          });
         } catch (err) {
           console.error("Hook score recompute failed:", err);
         }
