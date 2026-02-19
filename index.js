@@ -6761,25 +6761,19 @@ const handleTrendingSmartphones = async (req, res) => {
 
     const result = await db.query(
       `
-      WITH top_products AS (
-        SELECT p.id AS product_id, COUNT(v.id) AS views
-        FROM product_views v
-        JOIN products p ON p.id = v.product_id
-        JOIN product_publish pub
-          ON pub.product_id = p.id
-         AND pub.is_published = true
-        WHERE p.product_type = 'smartphone'
-          AND v.viewed_at >= NOW() - INTERVAL '7 days'
-        GROUP BY p.id
-        ORDER BY views DESC
-        LIMIT $1
-      )
       SELECT
         p.id AS product_id,
         p.name,
         b.name AS brand,
         s.model,
-        tp.views AS views_rank,
+        MAX(ts.trending_score) AS trending_score,
+        MAX(ts.views_7d) AS views_7d,
+        MAX(ts.views_prev_7d) AS views_prev_7d,
+        MAX(ts.velocity) AS velocity,
+        MAX((ts.manual_boost)::int) AS manual_boost,
+        MAX(ts.manual_priority) AS manual_priority,
+        MAX(ts.manual_badge) AS manual_badge,
+        MAX(ts.calculated_at) AS trending_calculated_at,
         (
           SELECT pi.image_url
           FROM product_images pi
@@ -6848,13 +6842,22 @@ const handleTrendingSmartphones = async (req, res) => {
               v.attributes->>'internal_storage'
             ) <> ''
         ) AS storage_values
-      FROM top_products tp
-      JOIN products p ON p.id = tp.product_id
+      FROM products p
       JOIN smartphones s ON s.product_id = p.id
+      JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
       LEFT JOIN brands b ON b.id = p.brand_id
       LEFT JOIN product_variants v ON v.product_id = p.id
-      GROUP BY p.id, p.name, b.name, s.model, tp.views
-      ORDER BY tp.views DESC, starting_price ASC NULLS LAST;
+      LEFT JOIN product_trending_score ts ON ts.product_id = p.id
+      WHERE p.product_type = 'smartphone'
+      GROUP BY p.id, p.name, b.name, s.model
+      ORDER BY
+        COALESCE(MAX(ts.manual_priority), 0) DESC,
+        COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
+        COALESCE(MAX(ts.trending_score), 0) DESC,
+        p.id DESC
+      LIMIT $1;
       `,
       [limit],
     );
@@ -6870,9 +6873,38 @@ const handleTrendingSmartphones = async (req, res) => {
       starting_price: row.starting_price ?? null,
       ram: combineMemoryValues(row.ram_values || []),
       storage: combineMemoryValues(row.storage_values || []),
+      trend_score:
+        Number.isFinite(Number(row?.trending_score)) &&
+        row?.trending_score !== null
+          ? Number(row.trending_score)
+          : null,
+      trend_views_7d: Number.isFinite(Number(row?.views_7d))
+        ? Number(row.views_7d)
+        : 0,
+      trend_views_prev_7d: Number.isFinite(Number(row?.views_prev_7d))
+        ? Number(row.views_prev_7d)
+        : 0,
+      trend_velocity:
+        Number.isFinite(Number(row?.velocity)) && row?.velocity !== null
+          ? Number(row.velocity)
+          : null,
+      trend_manual_boost: Boolean(Number(row?.manual_boost ?? 0)),
+      trend_manual_priority: Number.isFinite(Number(row?.manual_priority))
+        ? Number(row.manual_priority)
+        : 0,
+      trend_manual_badge: row?.manual_badge || null,
+      trend_calculated_at: row?.trending_calculated_at ?? null,
     }));
 
-    return res.json({ success: true, trending });
+    return res.json({
+      success: true,
+      period: "7d",
+      updated_at:
+        (rows || []).find((r) => r?.trending_calculated_at)
+          ?.trending_calculated_at ?? null,
+      trending,
+      smartphones: trending,
+    });
   } catch (err) {
     console.error("Trending smartphones error:", err);
     return res.status(500).json({
