@@ -207,6 +207,8 @@ const toPlainObject = (value) => {
 const hasOwn = (obj, key) =>
   Object.prototype.hasOwnProperty.call(obj || {}, key);
 
+const isScoreLikeKey = (key) => String(key || "").toLowerCase() === "score";
+
 const toArray = (value) => {
   if (Array.isArray(value)) return value;
   if (value === undefined || value === null || value === "") return [];
@@ -224,8 +226,12 @@ const normalizeNullableText = (value) => {
 
 const stripScoreKey = (value) => {
   const obj = toPlainObject(value);
-  const { score: _score, ...rest } = obj;
-  return rest;
+  const cleaned = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (isScoreLikeKey(key)) continue;
+    cleaned[key] = val;
+  }
+  return cleaned;
 };
 
 const mergeSectionObject = (base, incoming, ensureScore = false) => {
@@ -666,7 +672,7 @@ const stripScoreRecursively = (value) => {
 
   const cleaned = {};
   for (const [key, val] of Object.entries(value)) {
-    if (key === "score") continue;
+    if (isScoreLikeKey(key)) continue;
     cleaned[key] = stripScoreRecursively(val);
   }
   return cleaned;
@@ -710,10 +716,10 @@ const enrichLaptopResponse = (row) => {
     "launch_date",
     "spec_schema_version",
   ]);
-  return {
+  return stripScoreRecursively({
     ...base,
     spec_sections: sections,
-  };
+  });
 };
 
 const toCanonicalLaptopProductResponse = (row) => {
@@ -2763,21 +2769,9 @@ app.get("/api/smartphones", async (req, res) => {
       ORDER BY COALESCE(MAX(ds.hook_score), 0) DESC, p.id DESC;
     `);
 
-    const optionalMetricKeys = [
-      "hook_score",
-      "buyer_intent",
-      "trend_velocity",
-      "freshness",
-      "hook_calculated_at",
-      "rating",
-    ];
-
     const smartphones = (result.rows || []).map((row) => {
       const item = { ...(row || {}) };
-      for (const key of optionalMetricKeys) {
-        if (item[key] == null) delete item[key];
-      }
-      return item;
+      return stripScoreRecursively(item);
     });
 
     res.json({ smartphones });
@@ -2883,7 +2877,11 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
       ORDER BY p.id DESC;
     `);
 
-    res.json({ smartphones: result.rows });
+    const smartphones = (result.rows || []).map((row) =>
+      stripScoreRecursively(row || {}),
+    );
+
+    res.json({ smartphones });
   } catch (err) {
     console.error("GET /api/smartphones error:", err);
     res.status(500).json({ error: err.message });
@@ -2977,7 +2975,11 @@ app.get("/api/smartphone/:id", async (req, res) => {
         return { ...rv, store_prices: sanitizedStorePrices };
       });
 
-      return { ...rest, colors, variants: sanitizedVariants };
+      return stripScoreRecursively({
+        ...rest,
+        colors,
+        variants: sanitizedVariants,
+      });
     };
 
     const sanitized = sanitize(smartphone, variants);
@@ -3388,12 +3390,12 @@ app.get("/api/laptops/:id", authenticate, async (req, res) => {
       const metaObj = toPlainObject(meta);
       const sectionsObj = toPlainObject(spec_sections);
       const base = removeSectionKeyCollisions(rest, sectionsObj);
-      return {
+      return stripScoreRecursively({
         ...base,
         ...metaObj,
         spec_sections: sectionsObj,
         variants: variantsArr || [],
-      };
+      });
     };
 
     const sanitized = sanitize(laptop, variants);
@@ -4027,7 +4029,10 @@ app.get("/api/tvs", async (req, res) => {
       ORDER BY COALESCE(ds.hook_score, 0) DESC, p.id DESC
     `);
 
-    return res.json({ tvs: result.rows });
+    const tvs = (result.rows || []).map((row) =>
+      stripScoreRecursively(row || {}),
+    );
+    return res.json({ tvs });
   } catch (err) {
     console.error("GET /api/tvs error:", err);
     return res.status(500).json({ error: err.message });
@@ -5055,7 +5060,10 @@ app.get("/api/tv", authenticate, async (req, res) => {
       ORDER BY p.id DESC
     `);
 
-    return res.json({ tvs: result.rows });
+    const tvs = (result.rows || []).map((row) =>
+      stripScoreRecursively(row || {}),
+    );
+    return res.json({ tvs });
   } catch (err) {
     console.error("GET /api/tv error:", err);
     return res.status(500).json({ error: err.message });
@@ -5123,13 +5131,13 @@ app.get("/api/tvs/:id", authenticate, async (req, res) => {
       ? publishRes.rows[0].is_published
       : false;
 
-    return res.json({
+    return res.json(stripScoreRecursively({
       product,
       tv,
       images_json: imagesJson,
       variants_json: variantsJson,
       published,
-    });
+    }));
   } catch (err) {
     console.error("GET /api/tvs/:id error:", err);
     return res.status(500).json({ error: err.message });
@@ -7842,7 +7850,7 @@ app.get("/api/public/product/:id", async (req, res) => {
       smartphone: smartphoneDetails,
     };
 
-    res.json(responseData);
+    res.json(stripScoreRecursively(responseData));
   } catch (err) {
     console.error("GET /api/public/product/:id error:", err);
     res.status(500).json({ error: err.message });
