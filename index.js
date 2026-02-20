@@ -2984,6 +2984,8 @@ app.get("/api/smartphone/:id", async (req, res) => {
 
     const sanitized = sanitize(smartphone, variants);
     sanitized.name = productName;
+    sanitized.launch_date = smartphone.launch_date || null;
+    sanitized.created_at = smartphone.created_at || null;
 
     return res.json({ data: sanitized });
   } catch (err) {
@@ -7480,6 +7482,9 @@ app.get("/api/public/trending/all", async (req, res) => {
         tp.views
       FROM top_products tp
       JOIN products p ON p.id = tp.product_id
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
       LEFT JOIN brands b ON b.id = p.brand_id
       LEFT JOIN smartphones s ON s.product_id = p.id
       LEFT JOIN tvs t ON t.product_id = p.id
@@ -7630,6 +7635,28 @@ app.post("/api/public/compare", async (req, res) => {
       ) {
         return res.status(400).json({ message: "Invalid product ids" });
       }
+      if (left === right) {
+        return res
+          .status(400)
+          .json({ message: "Please compare two different products" });
+      }
+
+      const publishedPair = await db.query(
+        `
+        SELECT p.id
+        FROM products p
+        INNER JOIN product_publish pub
+          ON pub.product_id = p.id
+         AND pub.is_published = true
+        WHERE p.id = ANY($1::int[])
+        `,
+        [[left, right]],
+      );
+      if ((publishedPair.rows || []).length < 2) {
+        return res.status(400).json({
+          message: "Only published products can be compared",
+        });
+      }
 
       // normalize order so A vs B == B vs A
       const [l, r] = [left, right].sort((a, b) => a - b);
@@ -7661,12 +7688,34 @@ app.post("/api/public/compare", async (req, res) => {
       });
     }
 
-    for (let i = 0; i < unique.length; i++) {
-      for (let j = i + 1; j < unique.length; j++) {
+    const publishedProducts = await db.query(
+      `
+      SELECT p.id
+      FROM products p
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+      WHERE p.id = ANY($1::int[])
+      `,
+      [unique],
+    );
+    const publishedIds = new Set(
+      (publishedProducts.rows || []).map((row) => Number(row.id)),
+    );
+    const filtered = unique.filter((id) => publishedIds.has(Number(id)));
+
+    if (filtered.length !== unique.length) {
+      return res.status(400).json({
+        message: "Only published products can be compared",
+      });
+    }
+
+    for (let i = 0; i < filtered.length; i++) {
+      for (let j = i + 1; j < filtered.length; j++) {
         await db.query(
           `INSERT INTO product_comparisons (product_id, compared_with)
            VALUES ($1, $2)`,
-          [unique[i], unique[j]],
+          [filtered[i], filtered[j]],
         );
       }
     }
@@ -7704,7 +7753,15 @@ app.get("/api/public/trending/most-compared", async (req, res) => {
       FROM product_comparisons pc
       JOIN products p1 ON p1.id = pc.product_id
       JOIN products p2 ON p2.id = pc.compared_with
+      INNER JOIN product_publish pub1
+        ON pub1.product_id = p1.id
+       AND pub1.is_published = true
+      INNER JOIN product_publish pub2
+        ON pub2.product_id = p2.id
+       AND pub2.is_published = true
       WHERE pc.compared_at >= now() - INTERVAL '7 days'
+        AND p1.product_type IN ('smartphone', 'laptop', 'tv')
+        AND p2.product_type IN ('smartphone', 'laptop', 'tv')
       GROUP BY p1.id, p1.name, p2.id, p2.name
       ORDER BY compare_count DESC
     `);
