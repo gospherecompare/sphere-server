@@ -4,6 +4,9 @@ const { authenticate } = require("../middleware/auth");
 
 const router = express.Router();
 
+const hasOwn = (obj, key) =>
+  Object.prototype.hasOwnProperty.call(obj || {}, key);
+
 function safeJSONParse(raw) {
   if (raw === null || raw === undefined || raw === "") return null;
   if (typeof raw === "object") return raw;
@@ -32,6 +35,29 @@ function parseSensors(raw) {
     .map((p) => p.trim())
     .filter(Boolean);
   return parts.length ? JSON.stringify(parts) : null;
+}
+
+function mergeSectionObjects(...parts) {
+  const out = {};
+  for (const part of parts) {
+    if (part && typeof part === "object" && !Array.isArray(part)) {
+      Object.assign(out, part);
+    }
+  }
+  return out;
+}
+
+function toNumericPrice(val) {
+  if (val === null || val === undefined || val === "") return null;
+  if (typeof val === "number") return Number.isFinite(val) ? val : null;
+
+  const cleaned = String(val)
+    .replace(/[^\d.]/g, "")
+    .trim();
+  if (!cleaned) return null;
+
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
 }
 
 function parseDateForImport(val) {
@@ -98,13 +124,33 @@ router.post("/req", authenticate, async (req, res) => {
     const performance = safeJSONParse(b.performance_json) || {};
     const camera = safeJSONParse(b.camera_json) || {};
     const battery = safeJSONParse(b.battery_json) || {};
-    const connectivity = safeJSONParse(b.connectivity_json) || {};
-    const network = safeJSONParse(b.network_json) || {};
+    const connectivity = mergeSectionObjects(
+      safeJSONParse(b.connectivity_json),
+      safeJSONParse(b.network_connectivity_json),
+      safeJSONParse(b.connectivity),
+    );
+    const network = mergeSectionObjects(
+      safeJSONParse(b.network_json),
+      safeJSONParse(b.navigation_json),
+      safeJSONParse(b.network),
+    );
     const ports =
       safeJSONParse(b.port_json) || safeJSONParse(b.ports_json) || {};
     const audio = safeJSONParse(b.audio_json) || {};
     const multimedia = safeJSONParse(b.multimedia_json) || {};
-    const sensors = parseSensors(b.sensors || null);
+    const sensorsJson = safeJSONParse(b.sensors_json);
+    const sensorsInput =
+      b.sensors ??
+      (Array.isArray(sensorsJson?.sensors)
+        ? sensorsJson.sensors
+        : sensorsJson || null);
+    const sensors = parseSensors(sensorsInput);
+
+    const publish = hasOwn(b, "publish")
+      ? Boolean(b.publish)
+      : hasOwn(b, "published")
+        ? Boolean(b.published)
+        : false;
 
     // prevent duplicates
     const modelKey = model.replace(/\s+/g, "").toLowerCase();
@@ -193,7 +239,7 @@ router.post("/req", authenticate, async (req, res) => {
           const variantKey =
             v.variant_key || `${v.ram || "na"}_${v.storage || "na"}`;
           const attributes = { ram: v.ram, storage: v.storage };
-          const basePrice = v.base_price ?? v.price ?? null;
+          const basePrice = toNumericPrice(v.base_price ?? v.price);
 
           const variantRes = await client.query(
             `INSERT INTO product_variants (product_id, variant_key, attributes, base_price)
@@ -214,7 +260,19 @@ router.post("/req", authenticate, async (req, res) => {
               ? v.store_prices
               : Array.isArray(v.stores)
                 ? v.stores
-                : [];
+                : v.store || v.store_name || v.storeName || v.price != null
+                  ? [
+                      {
+                        store_name:
+                          v.store_name || v.store || v.storeName || "Store",
+                        price: v.price ?? v.base_price ?? null,
+                        url: v.url ?? null,
+                        offer_text: v.offer_text ?? v.offerText ?? null,
+                        delivery_info:
+                          v.delivery_info ?? v.deliveryInfo ?? null,
+                      },
+                    ]
+                  : [];
 
           if (variantId && storePrices.length) {
             for (const sp of storePrices) {
@@ -236,7 +294,7 @@ router.post("/req", authenticate, async (req, res) => {
                   [
                     variantId,
                     storeName,
-                    sp.price ?? null,
+                    toNumericPrice(sp.price),
                     sp.url ?? null,
                     sp.offer_text ?? sp.offerText ?? null,
                     sp.delivery_info ?? sp.deliveryInfo ?? null,
@@ -255,6 +313,18 @@ router.post("/req", authenticate, async (req, res) => {
         }
       }
     }
+
+    // publish row upsert (lets GET /api/smartphones include when publish=true)
+    await client.query(
+      `INSERT INTO product_publish (product_id, is_published, published_by)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (product_id)
+       DO UPDATE SET
+         is_published = EXCLUDED.is_published,
+         published_by = COALESCE(EXCLUDED.published_by, product_publish.published_by),
+         updated_at = CURRENT_TIMESTAMP`,
+      [productId, publish, req.user?.id || null],
+    );
 
     await client.query("COMMIT");
     return res.json({
