@@ -1046,6 +1046,16 @@ async function runMigrations() {
       );
     `);
 
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS product_variant_images (
+        id SERIAL PRIMARY KEY,
+        variant_id INT REFERENCES product_variants(id) ON DELETE CASCADE,
+        image_url TEXT NOT NULL,
+        position INT,
+        UNIQUE (variant_id, image_url)
+      );
+    `);
+
     // 5) smartphones (depends on products)
     // Provide an internal id PK and keep product_id as FK to products
     await safeQuery(`
@@ -3617,6 +3627,137 @@ const toNumericPrice = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+const normalizeImageArray = (value) => {
+  if (!Array.isArray(value)) return [];
+  return value.map((img) => normalizeNullableText(img)).filter(Boolean);
+};
+
+const parseFirstNumeric = (value) => {
+  if (value === undefined || value === null) return null;
+  const matched = String(value).match(/(\d+(?:\.\d+)?)/);
+  if (!matched) return null;
+  const parsed = Number(matched[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const normalizeTvStorePriceRows = (rows = []) => {
+  if (!Array.isArray(rows)) return [];
+  const byStore = new Map();
+  for (const row of rows) {
+    const store = toPlainObject(row);
+    const storeName = normalizeNullableText(store.store_name || store.store);
+    if (!storeName) continue;
+    const candidate = {
+      store_name: storeName,
+      price: toNumericPrice(store.price),
+      url: normalizeNullableText(store.url),
+      offer_text: normalizeNullableText(store.offer_text || store.offer),
+      delivery_info: normalizeNullableText(store.delivery_info),
+    };
+    const key = storeName.toLowerCase();
+    const previous = byStore.get(key);
+    if (!previous) {
+      byStore.set(key, candidate);
+      continue;
+    }
+
+    const previousPrice =
+      typeof previous.price === "number" && Number.isFinite(previous.price)
+        ? previous.price
+        : null;
+    const candidatePrice =
+      typeof candidate.price === "number" && Number.isFinite(candidate.price)
+        ? candidate.price
+        : null;
+
+    // Keep the best price for duplicate stores while preserving other metadata.
+    const pickCandidate =
+      (candidatePrice !== null && previousPrice === null) ||
+      (candidatePrice !== null &&
+        previousPrice !== null &&
+        candidatePrice < previousPrice);
+    if (pickCandidate) {
+      byStore.set(key, {
+        ...previous,
+        ...candidate,
+      });
+    }
+  }
+  return Array.from(byStore.values()).sort((a, b) => {
+    const priceA =
+      typeof a.price === "number" && Number.isFinite(a.price) ? a.price : null;
+    const priceB =
+      typeof b.price === "number" && Number.isFinite(b.price) ? b.price : null;
+    if (priceA !== null && priceB !== null && priceA !== priceB) {
+      return priceA - priceB;
+    }
+    if (priceA !== null && priceB === null) return -1;
+    if (priceA === null && priceB !== null) return 1;
+    return String(a.store_name || "").localeCompare(String(b.store_name || ""));
+  });
+};
+
+const normalizeTvVariantInput = (variantInput = {}, index = 0) => {
+  const variant = toPlainObject(variantInput);
+  const inferredSize = normalizeNullableText(
+    variant.screen_size ||
+      variant.size ||
+      variant.display_size ||
+      variant.variant_key,
+  );
+  const variantKey =
+    normalizeNullableText(variant.variant_key || inferredSize) ||
+    `tv_variant_${index + 1}`;
+  const screenSize = inferredSize || variantKey;
+  const screenSizeValue = parseFirstNumeric(screenSize);
+
+  const storePriceRows = normalizeTvStorePriceRows(
+    Array.isArray(variant.store_prices)
+      ? variant.store_prices
+      : Array.isArray(variant.stores)
+        ? variant.stores
+        : [],
+  );
+
+  const images = normalizeImageArray(
+    Array.isArray(variant.images)
+      ? variant.images
+      : Array.isArray(variant.images_json)
+        ? variant.images_json
+        : Array.isArray(variant.variant_images)
+          ? variant.variant_images
+          : [],
+  );
+
+  const attributes = { ...variant };
+  delete attributes.base_price;
+  delete attributes.store_prices;
+  delete attributes.stores;
+  delete attributes.variant_id;
+  delete attributes.images;
+  delete attributes.images_json;
+  delete attributes.variant_images;
+
+  if (!attributes.screen_size && screenSize) {
+    attributes.screen_size = screenSize;
+  }
+
+  return {
+    variant_key: variantKey,
+    screen_size: screenSize,
+    screen_size_value: screenSizeValue,
+    base_price: toNumericPrice(variant.base_price ?? variant.price),
+    store_prices: storePriceRows,
+    images,
+    attributes,
+  };
+};
+
+const normalizeTvVariantsInput = (variants = []) => {
+  if (!Array.isArray(variants)) return [];
+  return variants.map((variant, index) => normalizeTvVariantInput(variant, index));
+};
+
 const normalizeTvPayloadInput = (input = {}) => {
   const body = toPlainObject(input);
   const nestedTv = toPlainObject(body.tv);
@@ -3645,6 +3786,9 @@ const normalizeTvPayloadInput = (input = {}) => {
     Array.isArray(normalized.variants)
   ) {
     normalized.variants_json = normalized.variants;
+  }
+  if (Array.isArray(normalized.variants_json)) {
+    normalized.variants_json = normalizeTvVariantsInput(normalized.variants_json);
   }
 
   // Backward compatibility: map legacy home_appliance payload into TV sections.
@@ -3777,9 +3921,18 @@ app.post("/api/tvs", authenticate, async (req, res) => {
     const imagesJson = Array.isArray(payload.images_json)
       ? payload.images_json
       : [];
-    const variantsJson = Array.isArray(payload.variants_json)
-      ? payload.variants_json
-      : [];
+    const variantsJson = normalizeTvVariantsInput(
+      Array.isArray(payload.variants_json) ? payload.variants_json : [],
+    );
+    const variantsJsonForRow = variantsJson.map((variant) => ({
+      variant_key: variant.variant_key,
+      screen_size: variant.screen_size,
+      screen_size_value: variant.screen_size_value,
+      base_price: variant.base_price,
+      store_prices: variant.store_prices,
+      images: variant.images,
+      ...toPlainObject(variant.attributes),
+    }));
 
     await client.query("BEGIN");
 
@@ -3847,7 +4000,7 @@ app.post("/api/tvs", authenticate, async (req, res) => {
         toJSON(sectionValues.in_the_box_json),
         toJSON(sectionValues.warranty_json),
         toJSON(imagesJson),
-        toJSON(variantsJson),
+        toJSON(variantsJsonForRow),
       ],
     );
 
@@ -3862,17 +4015,7 @@ app.post("/api/tvs", authenticate, async (req, res) => {
     }
 
     for (let i = 0; i < variantsJson.length; i++) {
-      const variant = toPlainObject(variantsJson[i]);
-      const variantKey =
-        normalizeNullableText(
-          variant.variant_key || variant.screen_size || variant.size,
-        ) || `tv_variant_${i + 1}`;
-
-      const attributes = { ...variant };
-      delete attributes.base_price;
-      delete attributes.store_prices;
-      delete attributes.variant_id;
-
+      const variant = variantsJson[i];
       const variantRes = await client.query(
         `
         INSERT INTO product_variants (product_id, variant_key, attributes, base_price)
@@ -3881,40 +4024,49 @@ app.post("/api/tvs", authenticate, async (req, res) => {
         `,
         [
           productId,
-          variantKey,
-          JSON.stringify(attributes),
-          toNumericPrice(variant.base_price),
+          variant.variant_key,
+          JSON.stringify(variant.attributes),
+          variant.base_price,
         ],
       );
 
       const variantId = variantRes.rows[0].id;
-      const storePrices = Array.isArray(variant.store_prices)
-        ? variant.store_prices
-        : Array.isArray(variant.stores)
-          ? variant.stores
-          : [];
-
-      for (const storeRow of storePrices) {
-        const store = toPlainObject(storeRow);
-        const storeName = normalizeNullableText(
-          store.store_name || store.store,
-        );
-        if (!storeName) continue;
+      for (const store of variant.store_prices) {
+        if (!store.store_name) continue;
 
         await client.query(
           `
           INSERT INTO variant_store_prices
             (variant_id, store_name, price, url, offer_text, delivery_info)
           VALUES ($1,$2,$3,$4,$5,$6)
+          ON CONFLICT (variant_id, store_name)
+          DO UPDATE SET
+            price = EXCLUDED.price,
+            url = EXCLUDED.url,
+            offer_text = EXCLUDED.offer_text,
+            delivery_info = EXCLUDED.delivery_info
           `,
           [
             variantId,
-            storeName,
-            toNumericPrice(store.price),
-            normalizeNullableText(store.url),
-            normalizeNullableText(store.offer_text),
-            normalizeNullableText(store.delivery_info),
+            store.store_name,
+            store.price,
+            store.url,
+            store.offer_text,
+            store.delivery_info,
           ],
+        );
+      }
+
+      for (let imageIndex = 0; imageIndex < variant.images.length; imageIndex++) {
+        const imageUrl = variant.images[imageIndex];
+        await client.query(
+          `
+          INSERT INTO product_variant_images (variant_id, image_url, position)
+          VALUES ($1,$2,$3)
+          ON CONFLICT (variant_id, image_url)
+          DO UPDATE SET position = EXCLUDED.position
+          `,
+          [variantId, imageUrl, imageIndex + 1],
         );
       }
     }
@@ -3987,9 +4139,35 @@ app.get("/api/tvs", async (req, res) => {
           (
             SELECT json_agg(
               jsonb_build_object(
+                'variant_key', v.variant_key,
                 'screen_size', COALESCE(v.attributes->>'screen_size', v.attributes->>'size'),
+                'screen_size_value', NULLIF(
+                  regexp_replace(
+                    COALESCE(v.attributes->>'screen_size', v.attributes->>'size', v.variant_key, ''),
+                    '[^0-9.]',
+                    '',
+                    'g'
+                  ),
+                  ''
+                )::numeric,
                 'base_price', v.base_price,
                 'variant_id', v.id,
+                'images', (
+                  CASE
+                    WHEN EXISTS (
+                      SELECT 1 FROM product_variant_images pvi0 WHERE pvi0.variant_id = v.id
+                    )
+                    THEN (
+                      SELECT COALESCE(
+                        json_agg(pvi.image_url ORDER BY pvi.position ASC NULLS LAST, pvi.id ASC),
+                        '[]'::json
+                      )
+                      FROM product_variant_images pvi
+                      WHERE pvi.variant_id = v.id
+                    )
+                    ELSE COALESCE(v.attributes->'images', v.attributes->'images_json', '[]'::jsonb)::json
+                  END
+                ),
                 'store_prices', (
                   SELECT COALESCE(
                     json_agg(
@@ -4001,7 +4179,7 @@ app.get("/api/tvs", async (req, res) => {
                         'offer_text', sp.offer_text,
                         'delivery_info', sp.delivery_info
                       )
-                      ORDER BY sp.id ASC
+                      ORDER BY sp.price ASC NULLS LAST, sp.id ASC
                     ),
                     '[]'::json
                   )
@@ -5112,15 +5290,44 @@ app.get("/api/tvs/:id", authenticate, async (req, res) => {
     const variantsJson = [];
     for (const variant of variantsRes.rows) {
       const storesRes = await db.query(
-        "SELECT * FROM variant_store_prices WHERE variant_id = $1 ORDER BY id ASC",
+        "SELECT * FROM variant_store_prices WHERE variant_id = $1 ORDER BY price ASC NULLS LAST, id ASC",
         [variant.id],
       );
+      const imagesResByVariant = await db.query(
+        "SELECT image_url FROM product_variant_images WHERE variant_id = $1 ORDER BY position ASC NULLS LAST, id ASC",
+        [variant.id],
+      );
+      const attributeObject = toPlainObject(variant.attributes);
+      const fallbackVariantImages = normalizeImageArray(
+        Array.isArray(attributeObject.images)
+          ? attributeObject.images
+          : Array.isArray(attributeObject.images_json)
+            ? attributeObject.images_json
+            : [],
+      );
+      const variantImages =
+        imagesResByVariant.rows.map((row) => row.image_url).filter(Boolean)
+          .length > 0
+          ? imagesResByVariant.rows.map((row) => row.image_url).filter(Boolean)
+          : fallbackVariantImages;
 
       variantsJson.push({
-        ...toPlainObject(variant.attributes),
+        ...attributeObject,
         variant_id: variant.id,
         variant_key: variant.variant_key,
+        screen_size:
+          normalizeNullableText(
+            attributeObject.screen_size ||
+              attributeObject.size ||
+              variant.variant_key,
+          ) || null,
+        screen_size_value: parseFirstNumeric(
+          attributeObject.screen_size ||
+            attributeObject.size ||
+            variant.variant_key,
+        ),
         base_price: variant.base_price,
+        images: variantImages,
         store_prices: storesRes.rows,
       });
     }
@@ -5216,17 +5423,28 @@ app.put("/api/tvs/:id", authenticate, async (req, res) => {
           ? tvRow.images_json
           : [];
 
-    const variantsJson = hasOwn(payload, "variants_json")
-      ? Array.isArray(payload.variants_json)
-        ? payload.variants_json
-        : []
-      : hasOwn(payload, "variants")
-        ? Array.isArray(payload.variants)
-          ? payload.variants
+    const variantsJson = normalizeTvVariantsInput(
+      hasOwn(payload, "variants_json")
+        ? Array.isArray(payload.variants_json)
+          ? payload.variants_json
           : []
-        : Array.isArray(tvRow.variants_json)
-          ? tvRow.variants_json
-          : [];
+        : hasOwn(payload, "variants")
+          ? Array.isArray(payload.variants)
+            ? payload.variants
+            : []
+          : Array.isArray(tvRow.variants_json)
+            ? tvRow.variants_json
+            : [],
+    );
+    const variantsJsonForRow = variantsJson.map((variant) => ({
+      variant_key: variant.variant_key,
+      screen_size: variant.screen_size,
+      screen_size_value: variant.screen_size_value,
+      base_price: variant.base_price,
+      store_prices: variant.store_prices,
+      images: variant.images,
+      ...toPlainObject(variant.attributes),
+    }));
 
     const publish = hasOwn(payload, "publish")
       ? Boolean(payload.publish)
@@ -5295,7 +5513,7 @@ app.put("/api/tvs/:id", authenticate, async (req, res) => {
         toJSON(sectionValues.in_the_box_json),
         toJSON(sectionValues.warranty_json),
         toJSON(imagesJson),
-        toJSON(variantsJson),
+        toJSON(variantsJsonForRow),
         productId,
       ],
     );
@@ -5327,17 +5545,7 @@ app.put("/api/tvs/:id", authenticate, async (req, res) => {
     ]);
 
     for (let i = 0; i < variantsJson.length; i++) {
-      const variant = toPlainObject(variantsJson[i]);
-      const variantKey =
-        normalizeNullableText(
-          variant.variant_key || variant.screen_size || variant.size,
-        ) || `tv_variant_${i + 1}`;
-
-      const attributes = { ...variant };
-      delete attributes.base_price;
-      delete attributes.store_prices;
-      delete attributes.variant_id;
-
+      const variant = variantsJson[i];
       const variantRes = await client.query(
         `
         INSERT INTO product_variants (product_id, variant_key, attributes, base_price)
@@ -5346,40 +5554,49 @@ app.put("/api/tvs/:id", authenticate, async (req, res) => {
         `,
         [
           productId,
-          variantKey,
-          JSON.stringify(attributes),
-          toNumericPrice(variant.base_price),
+          variant.variant_key,
+          JSON.stringify(variant.attributes),
+          variant.base_price,
         ],
       );
 
       const variantId = variantRes.rows[0].id;
-      const storePrices = Array.isArray(variant.store_prices)
-        ? variant.store_prices
-        : Array.isArray(variant.stores)
-          ? variant.stores
-          : [];
-
-      for (const storeRow of storePrices) {
-        const store = toPlainObject(storeRow);
-        const storeName = normalizeNullableText(
-          store.store_name || store.store,
-        );
-        if (!storeName) continue;
+      for (const store of variant.store_prices) {
+        if (!store.store_name) continue;
 
         await client.query(
           `
           INSERT INTO variant_store_prices
             (variant_id, store_name, price, url, offer_text, delivery_info)
           VALUES ($1,$2,$3,$4,$5,$6)
+          ON CONFLICT (variant_id, store_name)
+          DO UPDATE SET
+            price = EXCLUDED.price,
+            url = EXCLUDED.url,
+            offer_text = EXCLUDED.offer_text,
+            delivery_info = EXCLUDED.delivery_info
           `,
           [
             variantId,
-            storeName,
-            toNumericPrice(store.price),
-            normalizeNullableText(store.url),
-            normalizeNullableText(store.offer_text),
-            normalizeNullableText(store.delivery_info),
+            store.store_name,
+            store.price,
+            store.url,
+            store.offer_text,
+            store.delivery_info,
           ],
+        );
+      }
+
+      for (let imageIndex = 0; imageIndex < variant.images.length; imageIndex++) {
+        const imageUrl = variant.images[imageIndex];
+        await client.query(
+          `
+          INSERT INTO product_variant_images (variant_id, image_url, position)
+          VALUES ($1,$2,$3)
+          ON CONFLICT (variant_id, image_url)
+          DO UPDATE SET position = EXCLUDED.position
+          `,
+          [variantId, imageUrl, imageIndex + 1],
         );
       }
     }
@@ -7167,8 +7384,34 @@ app.get("/api/public/trending/tvs", async (req, res) => {
             SELECT json_agg(
               jsonb_build_object(
                 'variant_id', v.id,
+                'variant_key', v.variant_key,
                 'screen_size', COALESCE(v.attributes->>'screen_size', v.attributes->>'size'),
+                'screen_size_value', NULLIF(
+                  regexp_replace(
+                    COALESCE(v.attributes->>'screen_size', v.attributes->>'size', v.variant_key, ''),
+                    '[^0-9.]',
+                    '',
+                    'g'
+                  ),
+                  ''
+                )::numeric,
                 'base_price', v.base_price,
+                'images', (
+                  CASE
+                    WHEN EXISTS (
+                      SELECT 1 FROM product_variant_images pvi0 WHERE pvi0.variant_id = v.id
+                    )
+                    THEN (
+                      SELECT COALESCE(
+                        json_agg(pvi.image_url ORDER BY pvi.position ASC NULLS LAST, pvi.id ASC),
+                        '[]'::json
+                      )
+                      FROM product_variant_images pvi
+                      WHERE pvi.variant_id = v.id
+                    )
+                    ELSE COALESCE(v.attributes->'images', v.attributes->'images_json', '[]'::jsonb)::json
+                  END
+                ),
                 'store_prices', (
                   SELECT COALESCE(
                     json_agg(
@@ -7180,7 +7423,7 @@ app.get("/api/public/trending/tvs", async (req, res) => {
                         'offer_text', sp.offer_text,
                         'delivery_info', sp.delivery_info
                       )
-                      ORDER BY sp.id ASC
+                      ORDER BY sp.price ASC NULLS LAST, sp.id ASC
                     ),
                     '[]'::json
                   )
@@ -7394,13 +7637,93 @@ app.get("/api/public/new/tvs", async (req, res) => {
       SELECT
         p.id AS product_id,
         p.name AS product_name,
+        p.product_type,
+        b.name AS brand_name,
         b.name AS brand,
+        t.category,
+        t.model,
         COALESCE(t.created_at, p.created_at) AS launch_date,
+        t.key_specs_json,
+        t.basic_info_json,
+        t.display_json,
+        t.audio_json,
+        t.smart_tv_json,
+        t.connectivity_json,
+        t.ports_json,
+        t.power_json,
+        t.warranty_json,
+        COALESCE(
+          (
+            SELECT json_agg(pi.image_url ORDER BY pi.position ASC NULLS LAST, pi.id ASC)
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+          ),
+          COALESCE(t.images_json, '[]'::jsonb)::json
+        ) AS images_json,
+        COALESCE(
+          (
+            SELECT json_agg(
+              jsonb_build_object(
+                'variant_id', v.id,
+                'variant_key', v.variant_key,
+                'screen_size', COALESCE(v.attributes->>'screen_size', v.attributes->>'size'),
+                'screen_size_value', NULLIF(
+                  regexp_replace(
+                    COALESCE(v.attributes->>'screen_size', v.attributes->>'size', v.variant_key, ''),
+                    '[^0-9.]',
+                    '',
+                    'g'
+                  ),
+                  ''
+                )::numeric,
+                'base_price', v.base_price,
+                'images', (
+                  CASE
+                    WHEN EXISTS (
+                      SELECT 1 FROM product_variant_images pvi0 WHERE pvi0.variant_id = v.id
+                    )
+                    THEN (
+                      SELECT COALESCE(
+                        json_agg(pvi.image_url ORDER BY pvi.position ASC NULLS LAST, pvi.id ASC),
+                        '[]'::json
+                      )
+                      FROM product_variant_images pvi
+                      WHERE pvi.variant_id = v.id
+                    )
+                    ELSE COALESCE(v.attributes->'images', v.attributes->'images_json', '[]'::jsonb)::json
+                  END
+                ),
+                'store_prices', (
+                  SELECT COALESCE(
+                    json_agg(
+                      jsonb_build_object(
+                        'id', sp.id,
+                        'store_name', sp.store_name,
+                        'price', sp.price,
+                        'url', sp.url,
+                        'offer_text', sp.offer_text,
+                        'delivery_info', sp.delivery_info
+                      )
+                      ORDER BY sp.price ASC NULLS LAST, sp.id ASC
+                    ),
+                    '[]'::json
+                  )
+                  FROM variant_store_prices sp
+                  WHERE sp.variant_id = v.id
+                )
+              )
+              ORDER BY v.id ASC
+            )
+            FROM product_variants v
+            WHERE v.product_id = p.id
+          ),
+          COALESCE(t.variants_json, '[]'::jsonb)::json
+        ) AS variants_json,
         (
-          SELECT MIN(sp.price)
+          SELECT COALESCE(MIN(sp.price), MIN(v.base_price))
           FROM product_variants v
           LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
-          WHERE v.product_id = p.id AND sp.price IS NOT NULL
+          WHERE v.product_id = p.id
         ) AS price
       FROM products p
       LEFT JOIN brands b ON b.id = p.brand_id
