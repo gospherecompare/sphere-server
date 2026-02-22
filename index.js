@@ -32,15 +32,23 @@ const app = express();
 
 app.set("trust proxy", 1);
 
+const ALLOWED_ORIGINS = new Set([
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "https://main.d2jgd4xy0rohx4.amplifyapp.com",
+  "https://www.tryhook.shop",
+  "https://tryhook.shop",
+]);
+
 app.use(
   cors({
-    origin: [
-      "http://localhost:3000",
-      "http://localhost:5173",
-      "https://main.d2jgd4xy0rohx4.amplifyapp.com",
-      "https://www.tryhook.shop/",
-      "https://www.tryhook.shop",
-    ],
+    origin(origin, callback) {
+      // Allow non-browser clients (no Origin header) and explicitly allow known web origins.
+      if (!origin) return callback(null, true);
+      const normalizedOrigin = String(origin).replace(/\/$/, "");
+      if (ALLOWED_ORIGINS.has(normalizedOrigin)) return callback(null, true);
+      return callback(new Error("Not allowed by CORS"));
+    },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
@@ -8237,39 +8245,22 @@ app.get("/api/public/product/:id", async (req, res) => {
   }
 });
 
-// Simple global search endpoint with suggestions
-app.get("/api/search", async (req, res) => {
-  try {
-    const q = (req.query.q || "").trim();
-    if (!q) return res.json({ results: [] });
+async function runGlobalSearch(queryText, { publishedOnly = true } = {}) {
+  const q = (queryText || "").trim();
+  if (!q) return [];
 
-    const term = `%${q}%`;
+  const term = `%${q}%`;
 
-    // Search products by name and brand with image (simplified query)
-    const products = await db.query(
-      `SELECT DISTINCT
-        p.id, 
-        p.name, 
-        p.product_type,
-        b.name AS brand_name,
-        (SELECT image_url FROM product_images WHERE product_id = p.id AND position = 1 LIMIT 1) AS image_url
-       FROM products p
+  const publishJoin = publishedOnly
+    ? `
        INNER JOIN product_publish pub
          ON pub.product_id = p.id
         AND pub.is_published = true
-       LEFT JOIN brands b ON b.id = p.brand_id
-       WHERE p.name ILIKE $1 
-          OR b.name ILIKE $1
-       ORDER BY p.name ASC
-       LIMIT 10`,
-      [term],
-    );
+      `
+    : "";
 
-    // Search brands only
-    const brands = await db.query(
-      `SELECT b.id, b.name
-       FROM brands b
-       WHERE b.name ILIKE $1
+  const brandExistsClause = publishedOnly
+    ? `
          AND EXISTS (
            SELECT 1
            FROM products p
@@ -8278,191 +8269,244 @@ app.get("/api/search", async (req, res) => {
             AND pub.is_published = true
            WHERE p.brand_id = b.id
          )
-       ORDER BY b.name ASC
-       LIMIT 6`,
-      [term],
+      `
+    : `
+         AND EXISTS (
+           SELECT 1
+           FROM products p
+           WHERE p.brand_id = b.id
+         )
+      `;
+
+  // Search products by name and brand with image
+  const products = await db.query(
+    `SELECT DISTINCT
+      p.id,
+      p.name,
+      p.product_type,
+      b.name AS brand_name,
+      (SELECT image_url FROM product_images WHERE product_id = p.id AND position = 1 LIMIT 1) AS image_url
+     FROM products p
+     ${publishJoin}
+     LEFT JOIN brands b ON b.id = p.brand_id
+     WHERE p.name ILIKE $1
+        OR b.name ILIKE $1
+     ORDER BY p.name ASC
+     LIMIT 10`,
+    [term],
+  );
+
+  // Search brands only
+  const brands = await db.query(
+    `SELECT b.id, b.name
+     FROM brands b
+     WHERE b.name ILIKE $1
+     ${brandExistsClause}
+     ORDER BY b.name ASC
+     LIMIT 6`,
+    [term],
+  );
+
+  const safeNum = (v) => {
+    if (v === null || v === undefined || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const unique = (arr) => {
+    const out = [];
+    const seen = new Set();
+    for (const x of arr || []) {
+      const k = String(x || "").trim();
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      out.push(x);
+    }
+    return out;
+  };
+
+  const tryParseNumberFromString = (val) => {
+    if (val === null || val === undefined) return null;
+    if (typeof val === "number") return Number.isFinite(val) ? val : null;
+    const m = String(val).match(/(\d{1,6})/);
+    return m ? Number(m[1]) : null;
+  };
+
+  const extractSmartphoneHighlights = (row) => {
+    const features = [];
+    if (!row) return features;
+
+    const display = row.display || {};
+    const battery = row.battery || {};
+    const camera = row.camera || {};
+    const performance = row.performance || {};
+
+    const displaySize =
+      (display &&
+        typeof display === "object" &&
+        (display.size || display.screen_size || display.display_size)) ||
+      (display && typeof display === "string" ? display : null);
+    if (displaySize) features.push(String(displaySize));
+
+    const battMah =
+      tryParseNumberFromString(
+        battery.battery_capacity_mah ??
+          battery.capacity_mAh ??
+          battery.capacity ??
+          battery.battery_capacity ??
+          battery,
+      ) || null;
+    if (battMah) features.push(`${battMah} mAh`);
+
+    const mainMp =
+      tryParseNumberFromString(
+        camera.main_camera_megapixels ??
+          camera.rear_camera?.main?.megapixels ??
+          camera.rear_camera?.main?.resolution_mp ??
+          camera.rear_camera?.main?.resolution ??
+          camera.rear_camera?.main ??
+          camera.main ??
+          camera,
+      ) || null;
+    if (mainMp) features.push(`${mainMp} MP`);
+
+    const processor =
+      performance.processor || performance.cpu || performance.chipset || null;
+    if (processor) features.push(String(processor));
+
+    return features.filter(Boolean).slice(0, 3);
+  };
+
+  const results = [];
+
+  // Add products to results
+  for (const r of products.rows) {
+    let minPrice = null;
+    let variantTypes = [];
+    let keyFeatures = [];
+
+    try {
+      const variantsRes = await db.query(
+        `SELECT variant_key, attributes, base_price
+         FROM product_variants
+         WHERE product_id = $1
+         ORDER BY id ASC`,
+        [r.id],
+      );
+
+      const basePrices = variantsRes.rows
+        .map((v) => safeNum(v.base_price))
+        .filter((n) => n !== null);
+
+      const minBase = basePrices.length > 0 ? Math.min(...basePrices) : null;
+
+      const storeMinRes = await db.query(
+        `SELECT MIN(vsp.price) AS min_price
+         FROM variant_store_prices vsp
+         INNER JOIN product_variants pv ON pv.id = vsp.variant_id
+         WHERE pv.product_id = $1`,
+        [r.id],
+      );
+
+      const minStore = safeNum(storeMinRes.rows?.[0]?.min_price);
+      minPrice =
+        minStore !== null && minBase !== null
+          ? Math.min(minStore, minBase)
+          : (minStore ?? minBase);
+
+      variantTypes = unique(
+        variantsRes.rows.map((v) => {
+          const ram =
+            v.attributes && typeof v.attributes === "object"
+              ? v.attributes.ram || v.attributes.RAM || null
+              : null;
+          const storage =
+            v.attributes && typeof v.attributes === "object"
+              ? v.attributes.storage ||
+                v.attributes.ROM_storage ||
+                v.attributes.rom ||
+                null
+              : null;
+
+          if (ram && storage) return `${ram}/${storage}`;
+          if (ram) return String(ram);
+          if (storage) return String(storage);
+          return v.variant_key || null;
+        }),
+      ).slice(0, 3);
+    } catch (e) {
+      // defensive: search suggestions should not fail because of variant lookups
+    }
+
+    if (String(r.product_type).toLowerCase() === "smartphone") {
+      try {
+        const smRes = await db.query(
+          `SELECT display, battery, camera, performance
+           FROM smartphones
+           WHERE product_id = $1
+           LIMIT 1`,
+          [r.id],
+        );
+        keyFeatures = extractSmartphoneHighlights(smRes.rows?.[0]);
+      } catch (e) {
+        // ignore highlight extraction errors
+      }
+    }
+
+    results.push({
+      type: "product",
+      id: r.id,
+      name: r.name,
+      product_type: r.product_type,
+      brand_name: r.brand_name || null,
+      image_url: r.image_url || null,
+      min_price: minPrice,
+      variant_types: variantTypes,
+      key_features: keyFeatures,
+    });
+  }
+
+  // Add brands to results (avoid duplicates)
+  for (const b of brands.rows) {
+    const brandExists = results.some(
+      (item) => item.type === "brand" && item.name === b.name,
+    );
+    const productExists = results.some(
+      (item) => item.type === "product" && item.brand_name === b.name,
     );
 
-    const safeNum = (v) => {
-      if (v === null || v === undefined || v === "") return null;
-      const n = Number(v);
-      return Number.isFinite(n) ? n : null;
-    };
-
-    const unique = (arr) => {
-      const out = [];
-      const seen = new Set();
-      for (const x of arr || []) {
-        const k = String(x || "").trim();
-        if (!k || seen.has(k)) continue;
-        seen.add(k);
-        out.push(x);
-      }
-      return out;
-    };
-
-    const tryParseNumberFromString = (val) => {
-      if (val === null || val === undefined) return null;
-      if (typeof val === "number") return Number.isFinite(val) ? val : null;
-      const m = String(val).match(/(\d{1,6})/);
-      return m ? Number(m[1]) : null;
-    };
-
-    const extractSmartphoneHighlights = (row) => {
-      const features = [];
-      if (!row) return features;
-
-      const display = row.display || {};
-      const battery = row.battery || {};
-      const camera = row.camera || {};
-      const performance = row.performance || {};
-
-      const displaySize =
-        (display &&
-          typeof display === "object" &&
-          (display.size || display.screen_size || display.display_size)) ||
-        (display && typeof display === "string" ? display : null);
-      if (displaySize) features.push(String(displaySize));
-
-      const battMah =
-        tryParseNumberFromString(
-          battery.battery_capacity_mah ??
-            battery.capacity_mAh ??
-            battery.capacity ??
-            battery.battery_capacity ??
-            battery,
-        ) || null;
-      if (battMah) features.push(`${battMah} mAh`);
-
-      const mainMp =
-        tryParseNumberFromString(
-          camera.main_camera_megapixels ??
-            camera.rear_camera?.main?.megapixels ??
-            camera.rear_camera?.main?.resolution_mp ??
-            camera.rear_camera?.main?.resolution ??
-            camera.rear_camera?.main ??
-            camera.main ??
-            camera,
-        ) || null;
-      if (mainMp) features.push(`${mainMp} MP`);
-
-      const processor =
-        performance.processor || performance.cpu || performance.chipset || null;
-      if (processor) features.push(String(processor));
-
-      return features.filter(Boolean).slice(0, 3);
-    };
-
-    const results = [];
-
-    // Add products to results
-    for (const r of products.rows) {
-      let minPrice = null;
-      let variantTypes = [];
-      let keyFeatures = [];
-
-      try {
-        const variantsRes = await db.query(
-          `SELECT variant_key, attributes, base_price
-           FROM product_variants
-           WHERE product_id = $1
-           ORDER BY id ASC`,
-          [r.id],
-        );
-
-        const basePrices = variantsRes.rows
-          .map((v) => safeNum(v.base_price))
-          .filter((n) => n !== null);
-
-        const minBase = basePrices.length > 0 ? Math.min(...basePrices) : null;
-
-        const storeMinRes = await db.query(
-          `SELECT MIN(vsp.price) AS min_price
-           FROM variant_store_prices vsp
-           INNER JOIN product_variants pv ON pv.id = vsp.variant_id
-           WHERE pv.product_id = $1`,
-          [r.id],
-        );
-
-        const minStore = safeNum(storeMinRes.rows?.[0]?.min_price);
-        minPrice =
-          minStore !== null && minBase !== null
-            ? Math.min(minStore, minBase)
-            : (minStore ?? minBase);
-
-        variantTypes = unique(
-          variantsRes.rows.map((v) => {
-            const ram =
-              v.attributes && typeof v.attributes === "object"
-                ? v.attributes.ram || v.attributes.RAM || null
-                : null;
-            const storage =
-              v.attributes && typeof v.attributes === "object"
-                ? v.attributes.storage ||
-                  v.attributes.ROM_storage ||
-                  v.attributes.rom ||
-                  null
-                : null;
-
-            if (ram && storage) return `${ram}/${storage}`;
-            if (ram) return String(ram);
-            if (storage) return String(storage);
-            return v.variant_key || null;
-          }),
-        ).slice(0, 3);
-      } catch (e) {
-        // defensive: search suggestions should not fail because of variant lookups
-      }
-
-      if (String(r.product_type).toLowerCase() === "smartphone") {
-        try {
-          const smRes = await db.query(
-            `SELECT display, battery, camera, performance
-             FROM smartphones
-             WHERE product_id = $1
-             LIMIT 1`,
-            [r.id],
-          );
-          keyFeatures = extractSmartphoneHighlights(smRes.rows?.[0]);
-        } catch (e) {
-          // ignore highlight extraction errors
-        }
-      }
-
+    if (!brandExists && !productExists) {
       results.push({
-        type: "product",
-        id: r.id,
-        name: r.name,
-        product_type: r.product_type,
-        brand_name: r.brand_name || null,
-        image_url: r.image_url || null,
-        min_price: minPrice,
-        variant_types: variantTypes,
-        key_features: keyFeatures,
+        type: "brand",
+        id: b.id,
+        name: b.name,
       });
     }
+  }
 
-    // Add brands to results (avoid duplicates)
-    for (const b of brands.rows) {
-      const brandExists = results.some(
-        (item) => item.type === "brand" && item.name === b.name,
-      );
-      const productExists = results.some(
-        (item) => item.type === "product" && item.brand_name === b.name,
-      );
+  return results;
+}
 
-      if (!brandExists && !productExists) {
-        results.push({
-          type: "brand",
-          id: b.id,
-          name: b.name,
-        });
-      }
-    }
-
+// Public search: published products only
+app.get("/api/search", async (req, res) => {
+  try {
+    const results = await runGlobalSearch(req.query.q, { publishedOnly: true });
     res.json({ results });
   } catch (err) {
     console.error("GET /api/search error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin search: includes published + unpublished products
+app.get("/api/search/admin", authenticate, async (req, res) => {
+  try {
+    const results = await runGlobalSearch(req.query.q, {
+      publishedOnly: false,
+    });
+    res.json({ results });
+  } catch (err) {
+    console.error("GET /api/search/admin error:", err);
     res.status(500).json({ error: err.message });
   }
 });
