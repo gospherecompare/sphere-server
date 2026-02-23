@@ -1424,6 +1424,48 @@ async function runMigrations() {
       
       `);
 
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS career_applications (
+        id SERIAL PRIMARY KEY,
+        role TEXT NOT NULL,
+        gender TEXT,
+        first_name TEXT NOT NULL,
+        last_name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        phone TEXT NOT NULL,
+        dob DATE,
+        education JSONB,
+        experience_level TEXT,
+        employment_status TEXT,
+        current_company TEXT,
+        current_role TEXT,
+        notice_period TEXT,
+        preferred_location TEXT,
+        expected_ctc NUMERIC,
+        skills TEXT,
+        projects TEXT,
+        cover_letter TEXT,
+        application_place TEXT NOT NULL,
+        application_date DATE,
+        agree_terms BOOLEAN NOT NULL DEFAULT false,
+        status TEXT NOT NULL DEFAULT 'new',
+        source TEXT,
+        payload JSONB,
+        created_at TIMESTAMP DEFAULT now(),
+        updated_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_career_applications_created_at
+      ON career_applications (created_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_career_applications_email
+      ON career_applications (email);
+    `);
+
     // Popular feature clicks (analytics) - aggregated per day
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS feature_click_stats (
@@ -2078,6 +2120,170 @@ app.post("/api/change-password", authenticateCustomer, async (req, res) => {
   } catch (err) {
     console.error("Change password error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---- Careers (Public Apply + Admin View) ---- */
+app.post("/api/careers", async (req, res) => {
+  try {
+    const b = req.body || {};
+
+    const cleanText = (value) => {
+      if (value === undefined || value === null) return null;
+      const text = String(value).trim();
+      return text.length ? text : null;
+    };
+
+    const cleanDate = (value) => {
+      const text = cleanText(value);
+      if (!text) return null;
+      const parsed = new Date(text);
+      if (Number.isNaN(parsed.getTime())) return null;
+      return parsed.toISOString().slice(0, 10);
+    };
+
+    const cleanNumber = (value) => {
+      if (value === undefined || value === null || value === "") return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+
+    const role = cleanText(b.role || b.applied_role);
+    const gender = cleanText(b.gender);
+    const firstName = cleanText(b.first_name || b.firstName);
+    const lastName = cleanText(b.last_name || b.lastName);
+    const email = cleanText(b.email);
+    const phone = cleanText(b.phone);
+    const dob = cleanDate(b.dob);
+    const education =
+      b.education && typeof b.education === "object" ? b.education : null;
+    const experienceLevel = cleanText(b.experience_level || b.experienceLevel);
+    const employmentStatus = cleanText(
+      b.employment_status || b.employmentStatus,
+    );
+    const currentCompany = cleanText(b.current_company || b.currentCompany);
+    const currentRole = cleanText(b.current_role || b.currentRole);
+    const noticePeriod = cleanText(b.notice_period || b.noticePeriod);
+    const preferredLocation = cleanText(
+      b.preferred_location || b.preferredLocation,
+    );
+    const expectedCtc = cleanNumber(b.expected_ctc ?? b.expectedCtc);
+    const skills = cleanText(b.skills);
+    const projects = cleanText(b.projects);
+    const coverLetter = cleanText(b.cover_letter || b.coverLetter);
+    const applicationPlace = cleanText(
+      b.application_place || b.applicationPlace,
+    );
+    const applicationDate = cleanDate(
+      b.application_date ?? b.applicationDate,
+    );
+    const agreeTerms = Boolean(b.agree_terms ?? b.agreeTerms);
+    const source = cleanText(b.source || "hooks-web-careers");
+
+    if (
+      !role ||
+      !firstName ||
+      !lastName ||
+      !email ||
+      !phone ||
+      !applicationPlace ||
+      !applicationDate ||
+      !agreeTerms
+    ) {
+      return res.status(400).json({
+        message:
+          "role, first name, last name, email, phone, application place, application date and consent are required",
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ message: "Invalid email address" });
+    }
+
+    const inserted = await db.query(
+      `INSERT INTO career_applications (
+         role, gender, first_name, last_name, email, phone, dob, education,
+         experience_level, employment_status, current_company, current_role,
+         notice_period, preferred_location, expected_ctc, skills, projects,
+         cover_letter, application_place, application_date, agree_terms, source,
+         payload
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8,
+         $9, $10, $11, $12, $13, $14, $15, $16, $17,
+         $18, $19, $20, $21, $22, $23
+       )
+       RETURNING id, created_at`,
+      [
+        role,
+        gender,
+        firstName,
+        lastName,
+        email.toLowerCase(),
+        phone,
+        dob,
+        education,
+        experienceLevel,
+        employmentStatus,
+        currentCompany,
+        currentRole,
+        noticePeriod,
+        preferredLocation,
+        expectedCtc,
+        skills,
+        projects,
+        coverLetter,
+        applicationPlace,
+        applicationDate,
+        agreeTerms,
+        source,
+        b,
+      ],
+    );
+
+    return res.status(201).json({
+      message: "Application submitted successfully",
+      application: inserted.rows[0],
+    });
+  } catch (err) {
+    console.error("Create career application error:", err);
+    return res.status(500).json({ message: "Failed to submit application" });
+  }
+});
+
+app.get("/api/admin/careers", authenticate, async (req, res) => {
+  try {
+    const pageRaw = Number(req.query.page);
+    const limitRaw = Number(req.query.limit);
+    const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+    const limit =
+      Number.isFinite(limitRaw) && limitRaw > 0
+        ? Math.min(limitRaw, 100)
+        : 25;
+    const offset = (page - 1) * limit;
+
+    const [rowsResult, countResult] = await Promise.all([
+      db.query(
+        `SELECT id, role, first_name, last_name, email, phone,
+                experience_level, employment_status, notice_period,
+                preferred_location, expected_ctc, status, created_at
+         FROM career_applications
+         ORDER BY created_at DESC
+         LIMIT $1 OFFSET $2`,
+        [limit, offset],
+      ),
+      db.query(`SELECT COUNT(*)::int AS total FROM career_applications`),
+    ]);
+
+    return res.json({
+      page,
+      limit,
+      total: countResult.rows[0]?.total || 0,
+      rows: rowsResult.rows,
+    });
+  } catch (err) {
+    console.error("List career applications error:", err);
+    return res.status(500).json({ message: "Failed to fetch applications" });
   }
 });
 
