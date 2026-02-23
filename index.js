@@ -1438,7 +1438,7 @@ async function runMigrations() {
         experience_level TEXT,
         employment_status TEXT,
         current_company TEXT,
-        current_role TEXT,
+        current_designation TEXT,
         notice_period TEXT,
         preferred_location TEXT,
         expected_ctc NUMERIC,
@@ -2174,9 +2174,7 @@ app.post("/api/careers", async (req, res) => {
     const applicationPlace = cleanText(
       b.application_place || b.applicationPlace,
     );
-    const applicationDate = cleanDate(
-      b.application_date ?? b.applicationDate,
-    );
+    const applicationDate = cleanDate(b.application_date ?? b.applicationDate);
     const agreeTerms = Boolean(b.agree_terms ?? b.agreeTerms);
     const source = cleanText(b.source || "hooks-web-careers");
 
@@ -2204,7 +2202,7 @@ app.post("/api/careers", async (req, res) => {
     const inserted = await db.query(
       `INSERT INTO career_applications (
          role, gender, first_name, last_name, email, phone, dob, education,
-         experience_level, employment_status, current_company, current_role,
+         experience_level, employment_status, current_company, current_designation,
          notice_period, preferred_location, expected_ctc, skills, projects,
          cover_letter, application_place, application_date, agree_terms, source,
          payload
@@ -2257,9 +2255,7 @@ app.get("/api/admin/careers", authenticate, async (req, res) => {
     const limitRaw = Number(req.query.limit);
     const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
     const limit =
-      Number.isFinite(limitRaw) && limitRaw > 0
-        ? Math.min(limitRaw, 100)
-        : 25;
+      Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 100) : 25;
     const offset = (page - 1) * limit;
 
     const [rowsResult, countResult] = await Promise.all([
@@ -3969,7 +3965,9 @@ const normalizeTvVariantInput = (variantInput = {}, index = 0) => {
 
 const normalizeTvVariantsInput = (variants = []) => {
   if (!Array.isArray(variants)) return [];
-  return variants.map((variant, index) => normalizeTvVariantInput(variant, index));
+  return variants.map((variant, index) =>
+    normalizeTvVariantInput(variant, index),
+  );
 };
 
 const normalizeTvPayloadInput = (input = {}) => {
@@ -4002,7 +4000,9 @@ const normalizeTvPayloadInput = (input = {}) => {
     normalized.variants_json = normalized.variants;
   }
   if (Array.isArray(normalized.variants_json)) {
-    normalized.variants_json = normalizeTvVariantsInput(normalized.variants_json);
+    normalized.variants_json = normalizeTvVariantsInput(
+      normalized.variants_json,
+    );
   }
 
   // Backward compatibility: map legacy home_appliance payload into TV sections.
@@ -4271,7 +4271,11 @@ app.post("/api/tvs", authenticate, async (req, res) => {
         );
       }
 
-      for (let imageIndex = 0; imageIndex < variant.images.length; imageIndex++) {
+      for (
+        let imageIndex = 0;
+        imageIndex < variant.images.length;
+        imageIndex++
+      ) {
         const imageUrl = variant.images[imageIndex];
         await client.query(
           `
@@ -5554,13 +5558,15 @@ app.get("/api/tvs/:id", authenticate, async (req, res) => {
       ? publishRes.rows[0].is_published
       : false;
 
-    return res.json(stripScoreRecursively({
-      product,
-      tv,
-      images_json: imagesJson,
-      variants_json: variantsJson,
-      published,
-    }));
+    return res.json(
+      stripScoreRecursively({
+        product,
+        tv,
+        images_json: imagesJson,
+        variants_json: variantsJson,
+        published,
+      }),
+    );
   } catch (err) {
     console.error("GET /api/tvs/:id error:", err);
     return res.status(500).json({ error: err.message });
@@ -5801,7 +5807,11 @@ app.put("/api/tvs/:id", authenticate, async (req, res) => {
         );
       }
 
-      for (let imageIndex = 0; imageIndex < variant.images.length; imageIndex++) {
+      for (
+        let imageIndex = 0;
+        imageIndex < variant.images.length;
+        imageIndex++
+      ) {
         const imageUrl = variant.images[imageIndex];
         await client.query(
           `
