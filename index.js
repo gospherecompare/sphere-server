@@ -863,6 +863,207 @@ const toCanonicalLaptopProductResponse = (row) => {
 };
 
 const DEFAULT_COMPARE_SCORING_CONFIG = normalizeCompareScoreConfig({});
+const DEVICE_PROFILE_TYPES = ["smartphone", "laptop", "tv"];
+const DEFAULT_DEVICE_FIELD_PROFILES = {
+  smartphone: {
+    mandatory: {
+      name: ["name", "product_name", "model"],
+      brand: ["brand_name", "brand"],
+      processor: ["performance.processor", "processor", "specs.processor"],
+      battery: [
+        "battery.capacity",
+        "battery.battery_capacity",
+        "battery.battery_capacity_mah",
+        "battery",
+      ],
+      display: ["display.size", "display.display_size", "display"],
+      camera: [
+        "camera.rear_camera.main_camera.resolution",
+        "camera.rear_camera.main.resolution",
+        "camera.main_camera_megapixels",
+        "camera.main_camera",
+      ],
+      price: ["variants[].base_price", "variants[].store_prices[].price", "price"],
+      image: ["images[]", "image"],
+    },
+    display: {
+      processor: ["performance.processor", "processor", "specs.processor"],
+      ram: ["performance.ram", "variants[].ram", "specs.ram"],
+      storage: ["performance.storage", "variants[].storage", "specs.storage"],
+      battery: [
+        "battery.capacity",
+        "battery.battery_capacity",
+        "battery.battery_capacity_mah",
+      ],
+      main_camera: [
+        "camera.rear_camera.main_camera.resolution",
+        "camera.rear_camera.main.resolution",
+        "camera.main_camera_megapixels",
+        "camera.main_camera",
+      ],
+      display_size: ["display.size", "display.display_size", "specs.display"],
+      refresh_rate: ["display.refresh_rate", "display.refreshRate"],
+      os: [
+        "performance.operating_system",
+        "performance.operatingSystem",
+        "performance.os",
+      ],
+      network: [
+        "connectivity.network_type",
+        "network.network_type",
+        "network.5g_support",
+      ],
+    },
+  },
+  laptop: {
+    mandatory: {
+      name: ["name", "product_name", "basic_info.product_name", "model"],
+      brand: ["brand_name", "brand", "basic_info.brand_name"],
+      processor: [
+        "performance.processor",
+        "cpu.processor",
+        "specifications.processor",
+      ],
+      ram: ["memory.ram", "variants[].ram", "specifications.ram"],
+      storage: ["storage.capacity", "variants[].storage", "specifications.storage"],
+      display: ["display.size", "display.display_size", "specifications.display"],
+      battery: ["battery.capacity", "specifications.battery"],
+      price: ["variants[].base_price", "variants[].store_prices[].price", "price"],
+      image: ["images[]", "image"],
+    },
+    display: {
+      processor: [
+        "performance.processor",
+        "cpu.processor",
+        "specifications.processor",
+      ],
+      ram: ["memory.ram", "variants[].ram", "specifications.ram"],
+      storage: ["storage.capacity", "variants[].storage", "specifications.storage"],
+      display_size: [
+        "display.size",
+        "display.display_size",
+        "specifications.display_size",
+      ],
+      resolution: ["display.resolution", "specifications.resolution"],
+      battery: ["battery.capacity", "specifications.battery"],
+      os: ["software.operating_system", "software.os", "specifications.operating_system"],
+      graphics: ["performance.gpu", "specifications.graphics", "graphics.model"],
+      weight: ["physical.weight", "specifications.weight"],
+    },
+  },
+  tv: {
+    mandatory: {
+      name: ["name", "product_name", "basic_info_json.title", "model"],
+      brand: ["brand_name", "brand", "basic_info_json.brand_name"],
+      screen_size: [
+        "key_specs_json.screen_size",
+        "display_json.screen_size",
+        "specs.screenSize",
+      ],
+      resolution: ["key_specs_json.resolution", "display_json.resolution", "specs.resolution"],
+      os: [
+        "key_specs_json.operating_system",
+        "smart_tv_json.operating_system",
+        "specs.operatingSystem",
+      ],
+      refresh_rate: [
+        "key_specs_json.refresh_rate",
+        "display_json.refresh_rate",
+        "specs.refreshRate",
+      ],
+      price: ["variants[].base_price", "variants[].store_prices[].price", "price"],
+      image: ["images[]", "image"],
+    },
+    display: {
+      screen_size: [
+        "key_specs_json.screen_size",
+        "display_json.screen_size",
+        "specs.screenSize",
+      ],
+      resolution: ["key_specs_json.resolution", "display_json.resolution", "specs.resolution"],
+      refresh_rate: [
+        "key_specs_json.refresh_rate",
+        "display_json.refresh_rate",
+        "specs.refreshRate",
+      ],
+      panel_type: [
+        "key_specs_json.panel_type",
+        "display_json.panel_type",
+        "specs.displayType",
+      ],
+      os: [
+        "key_specs_json.operating_system",
+        "smart_tv_json.operating_system",
+        "specs.operatingSystem",
+      ],
+      audio_output: ["key_specs_json.audio_output", "audio_json.output_power", "specs.audioOutput"],
+      energy_rating: [
+        "power_json.energy_rating",
+        "power_json.energy_star_rating",
+        "specs.energyRating",
+      ],
+      smart_features: [
+        "smart_tv_json.supported_apps",
+        "smart_tv_json.voice_assistant",
+        "key_specs_json.ai_features",
+      ],
+    },
+  },
+};
+
+const normalizeFieldPathList = (value, fallback = []) => {
+  const list = Array.isArray(value) ? value : value ? [value] : [];
+  const cleaned = list
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .slice(0, 30);
+  return cleaned.length ? cleaned : fallback;
+};
+
+const normalizeFieldMap = (value, fallback = {}) => {
+  const source =
+    value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const output = {};
+  const keys = new Set([
+    ...Object.keys(fallback || {}),
+    ...Object.keys(source || {}),
+  ]);
+
+  keys.forEach((key) => {
+    output[key] = normalizeFieldPathList(source[key], fallback[key] || []);
+  });
+
+  return output;
+};
+
+const normalizeSingleDeviceProfile = (value, fallback) => {
+  const source =
+    value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    mandatory: normalizeFieldMap(source.mandatory, fallback.mandatory),
+    display: normalizeFieldMap(source.display, fallback.display),
+  };
+};
+
+const normalizeDeviceFieldProfilesConfig = (value) => {
+  const source =
+    value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const out = {};
+
+  DEVICE_PROFILE_TYPES.forEach((type) => {
+    out[type] = normalizeSingleDeviceProfile(
+      source[type],
+      DEFAULT_DEVICE_FIELD_PROFILES[type],
+    );
+  });
+
+  return out;
+};
+
+const toDeviceFieldProfilesResponse = (config) => ({
+  profiles: normalizeDeviceFieldProfilesConfig(config?.profiles),
+  updated_at: config?.updated_at || null,
+});
 
 const toCompareScoringAdminResponse = (config) => ({
   weights: weightsToPercent(
@@ -897,6 +1098,790 @@ async function readCompareScoringConfig() {
     updated_at: row.updated_at || null,
   };
 }
+
+async function readDeviceFieldProfilesConfig() {
+  const result = await db.query(
+    `SELECT profiles, updated_at
+     FROM device_field_profiles_config
+     WHERE id = 1
+     LIMIT 1`,
+  );
+
+  if (!result.rows.length) {
+    return {
+      profiles: normalizeDeviceFieldProfilesConfig(DEFAULT_DEVICE_FIELD_PROFILES),
+      updated_at: null,
+    };
+  }
+
+  const row = result.rows[0];
+  return {
+    profiles: normalizeDeviceFieldProfilesConfig(row.profiles),
+    updated_at: row.updated_at || null,
+  };
+}
+
+const parseJsonLikeValue = (value) => {
+  if (typeof value !== "string") return value;
+  const text = value.trim();
+  if (!text) return value;
+  if (
+    (text.startsWith("{") && text.endsWith("}")) ||
+    (text.startsWith("[") && text.endsWith("]"))
+  ) {
+    try {
+      return JSON.parse(text);
+    } catch (_err) {
+      return value;
+    }
+  }
+  return value;
+};
+
+const profileHasValue = (value) => {
+  const normalized = parseJsonLikeValue(value);
+  if (normalized === null || normalized === undefined) return false;
+  if (typeof normalized === "string") return normalized.trim().length > 0;
+  if (typeof normalized === "number") return Number.isFinite(normalized);
+  if (typeof normalized === "boolean") return true;
+  if (Array.isArray(normalized))
+    return normalized.some((item) => profileHasValue(item));
+  if (normalized && typeof normalized === "object")
+    return Object.values(normalized).some((item) => profileHasValue(item));
+  return true;
+};
+
+const toProfileDisplayValue = (value) => {
+  const normalized = parseJsonLikeValue(value);
+  if (normalized === null || normalized === undefined) return null;
+  if (Array.isArray(normalized)) {
+    const flattened = normalized
+      .map((item) => toProfileDisplayValue(item))
+      .filter((item) => profileHasValue(item));
+    return flattened.length ? flattened.join(", ") : null;
+  }
+  if (normalized && typeof normalized === "object") {
+    const entries = Object.entries(normalized)
+      .map(([key, val]) => {
+        const rendered = toProfileDisplayValue(val);
+        return profileHasValue(rendered) ? `${key}: ${rendered}` : null;
+      })
+      .filter(Boolean);
+    return entries.length ? entries.join(" | ") : null;
+  }
+  return String(normalized).trim();
+};
+
+const collectProfilePathValues = (source, path) => {
+  if (!path || !source) return [];
+  const segments = String(path)
+    .split(".")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  if (!segments.length) return [];
+
+  const walk = (current, index) => {
+    const value = parseJsonLikeValue(current);
+    if (index >= segments.length) return [value];
+    if (value === null || value === undefined) return [];
+
+    const segment = segments[index];
+
+    if (segment === "*") {
+      if (Array.isArray(value)) {
+        return value.flatMap((item) => walk(item, index + 1));
+      }
+      if (value && typeof value === "object") {
+        return Object.values(value).flatMap((item) => walk(item, index + 1));
+      }
+      return [];
+    }
+
+    if (segment.endsWith("[]")) {
+      const key = segment.slice(0, -2);
+      const target = key ? parseJsonLikeValue(value?.[key]) : value;
+      if (!Array.isArray(target)) return [];
+      return target.flatMap((item) => walk(item, index + 1));
+    }
+
+    if (/^\d+$/.test(segment)) {
+      const idx = Number(segment);
+      if (!Array.isArray(value) || idx >= value.length) return [];
+      return walk(value[idx], index + 1);
+    }
+
+    return walk(value?.[segment], index + 1);
+  };
+
+  return walk(source, 0).filter((item) => profileHasValue(item));
+};
+
+const resolveProfileValueByPaths = (source, paths = []) => {
+  for (const path of paths || []) {
+    const values = collectProfilePathValues(source, path);
+    if (!values.length) continue;
+    const first = values.find((item) => profileHasValue(item));
+    if (profileHasValue(first)) return first;
+  }
+  return null;
+};
+
+const normalizeProfileDeviceType = (type) => {
+  const normalized = String(type || "")
+    .trim()
+    .toLowerCase();
+  if (["smartphone", "smartphones", "mobile", "mobiles"].includes(normalized)) {
+    return "smartphone";
+  }
+  if (["laptop", "laptops", "notebook", "notebooks"].includes(normalized)) {
+    return "laptop";
+  }
+  if (
+    [
+      "tv",
+      "tvs",
+      "television",
+      "televisions",
+      "home-appliance",
+      "home_appliance",
+      "homeappliance",
+      "appliance",
+      "appliances",
+    ].includes(normalized)
+  ) {
+    return "tv";
+  }
+  return "smartphone";
+};
+
+const resolveDeviceFieldProfileScore = (type, device, profiles) => {
+  const normalizedProfiles = normalizeDeviceFieldProfilesConfig(profiles);
+  const normalizedType = normalizeProfileDeviceType(type || device?.product_type);
+  const profile = normalizedProfiles[normalizedType] || normalizedProfiles.smartphone;
+
+  const mandatoryValues = {};
+  const displayValues = {};
+  const missingMandatory = [];
+
+  Object.entries(profile.mandatory || {}).forEach(([key, paths]) => {
+    const resolved = resolveProfileValueByPaths(device, paths);
+    mandatoryValues[key] = resolved;
+    if (!profileHasValue(resolved)) missingMandatory.push(key);
+  });
+
+  Object.entries(profile.display || {}).forEach(([key, paths]) => {
+    displayValues[key] = resolveProfileValueByPaths(device, paths);
+  });
+
+  const mandatoryTotal = Object.keys(profile.mandatory || {}).length;
+  const mandatoryAvailable = mandatoryTotal - missingMandatory.length;
+  const displayTotal = Object.keys(profile.display || {}).length;
+  const displayAvailable = Object.values(displayValues).filter((value) =>
+    profileHasValue(value),
+  ).length;
+
+  const mandatoryCoverage =
+    mandatoryTotal > 0 ? (mandatoryAvailable / mandatoryTotal) * 100 : 0;
+  const displayCoverage =
+    displayTotal > 0 ? (displayAvailable / displayTotal) * 100 : 0;
+
+  const score = Number(
+    Math.max(0, Math.min(100, mandatoryCoverage * 0.75 + displayCoverage * 0.25)).toFixed(1),
+  );
+
+  return {
+    type: normalizedType,
+    mandatory_values: mandatoryValues,
+    display_values: displayValues,
+    mandatory_display: Object.fromEntries(
+      Object.entries(mandatoryValues).map(([key, value]) => [
+        key,
+        toProfileDisplayValue(value),
+      ]),
+    ),
+    display_display: Object.fromEntries(
+      Object.entries(displayValues).map(([key, value]) => [
+        key,
+        toProfileDisplayValue(value),
+      ]),
+    ),
+    missing_mandatory: missingMandatory,
+    mandatory_coverage: Number(mandatoryCoverage.toFixed(1)),
+    display_coverage: Number(displayCoverage.toFixed(1)),
+    section_scores: {
+      core: Number(mandatoryCoverage.toFixed(1)),
+      display: Number(displayCoverage.toFixed(1)),
+    },
+    score,
+  };
+};
+
+const toFiniteScore100 = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(100, n));
+};
+
+const buildSpecScoreSource = (type, row) => {
+  const item = toPlainObject(row);
+  const normalizedType = normalizeProfileDeviceType(type || item.product_type);
+
+  if (normalizedType === "laptop") {
+    const basicInfo = toPlainObject(
+      parseJsonLikeValue(item.basic_info || item.basicInfo),
+    );
+    const metadata = toPlainObject(parseJsonLikeValue(item.metadata || item.meta));
+    const specSections = toPlainObject(parseJsonLikeValue(item.spec_sections));
+    const variants = Array.isArray(item.variants)
+      ? item.variants
+      : Array.isArray(metadata.variants)
+        ? metadata.variants
+        : Array.isArray(specSections.variants_json)
+          ? specSections.variants_json
+          : [];
+    const images = Array.isArray(item.images)
+      ? item.images
+      : Array.isArray(metadata.images)
+        ? metadata.images
+        : Array.isArray(specSections.images_json)
+          ? specSections.images_json
+          : [];
+
+    return {
+      ...item,
+      name: item.name || basicInfo.product_name || basicInfo.title || null,
+      brand_name: item.brand_name || basicInfo.brand_name || basicInfo.brand || null,
+      model: item.model || basicInfo.model || null,
+      performance: toPlainObject(item.performance || item.cpu),
+      display: toPlainObject(item.display),
+      memory: toPlainObject(item.memory),
+      storage: toPlainObject(item.storage),
+      battery: toPlainObject(item.battery),
+      software: toPlainObject(item.software),
+      physical: toPlainObject(item.physical),
+      variants,
+      images,
+    };
+  }
+
+  if (normalizedType === "tv") {
+    const variants = Array.isArray(item.variants)
+      ? item.variants
+      : Array.isArray(item.variants_json)
+        ? item.variants_json
+        : [];
+    const images = Array.isArray(item.images)
+      ? item.images
+      : Array.isArray(item.images_json)
+        ? item.images_json
+        : [];
+    return {
+      ...item,
+      name: item.name || item.product_name || null,
+      brand_name: item.brand_name || item.brand || null,
+      variants,
+      images,
+    };
+  }
+
+  return {
+    ...item,
+    variants: Array.isArray(item.variants)
+      ? item.variants
+      : Array.isArray(item.variants_json)
+        ? item.variants_json
+        : [],
+    images: Array.isArray(item.images)
+      ? item.images
+      : Array.isArray(item.images_json)
+        ? item.images_json
+        : [],
+  };
+};
+
+const applySpecScoreToRow = (type, row, profiles) => {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+
+  const source = buildSpecScoreSource(type, row);
+  const fieldProfile = resolveDeviceFieldProfileScore(type, source, profiles);
+  const specScore =
+    toFiniteScore100(row.spec_score ?? row.specScore) ?? fieldProfile.score;
+  const overallScore =
+    toFiniteScore100(row.overall_score ?? row.overallScore) ?? specScore;
+
+  return {
+    ...row,
+    field_profile: fieldProfile,
+    spec_score: specScore,
+    overall_score: overallScore,
+  };
+};
+
+const applySpecScoreToRows = (type, rows, profiles) =>
+  (rows || []).map((row) => applySpecScoreToRow(type, row, profiles));
+
+const BLOG_ALLOWED_PRODUCT_TYPES = new Set(["smartphone", "laptop", "tv"]);
+const BLOG_ALLOWED_STATUSES = new Set(["draft", "published", "archived"]);
+const BLOG_DEFAULT_THRESHOLDS = {
+  minHookScore: 75,
+  minCompleteness: 0.75,
+  minViews7d: 300,
+  minCompares7d: 50,
+  minTrendVelocity: 0,
+};
+
+const toSafeFiniteNumber = (value, fallback = 0) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const toPositiveInt = (value, fallback) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+};
+
+const toBlogSlug = (value, fallback = "blog") => {
+  const base = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+  return base || fallback;
+};
+
+const normalizeBlogTokenKey = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+const formatBlogValue = (value) => {
+  const rendered = toProfileDisplayValue(value);
+  if (!profileHasValue(rendered)) return "";
+  return String(rendered).trim();
+};
+
+const formatBlogPrice = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  return `₹${Math.round(n).toLocaleString("en-IN")}`;
+};
+
+const extractLowestVariantPrice = (variants = []) => {
+  const numeric = [];
+  for (const variant of Array.isArray(variants) ? variants : []) {
+    const base = Number(variant?.base_price);
+    if (Number.isFinite(base) && base > 0) numeric.push(base);
+    const stores = Array.isArray(variant?.store_prices)
+      ? variant.store_prices
+      : [];
+    for (const store of stores) {
+      const price = Number(store?.price);
+      if (Number.isFinite(price) && price > 0) numeric.push(price);
+    }
+  }
+  if (!numeric.length) return null;
+  return Math.min(...numeric);
+};
+
+const collectTemplateTokens = (content) => {
+  if (!content || typeof content !== "string") return [];
+  const tokenRegex = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
+  const tokens = new Set();
+  let match = tokenRegex.exec(content);
+  while (match) {
+    const key = normalizeBlogTokenKey(match[1]);
+    if (key) tokens.add(key);
+    match = tokenRegex.exec(content);
+  }
+  return Array.from(tokens);
+};
+
+const renderBlogTemplateWithTokens = (
+  content,
+  tokenMap,
+  { preserveUnknown = true } = {},
+) => {
+  const source = String(content || "");
+  const normalizedTokens = toPlainObject(tokenMap);
+  return source.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (full, key) => {
+    const normalizedKey = normalizeBlogTokenKey(key);
+    if (!normalizedKey) return preserveUnknown ? full : "";
+    const value = normalizedTokens[normalizedKey];
+    if (!profileHasValue(value)) return preserveUnknown ? full : "";
+    return String(value);
+  });
+};
+
+const normalizeBlogThresholds = (raw = {}) => {
+  const minHookScoreRaw = Number(raw.min_hook_score ?? raw.minHookScore);
+  const minCompletenessRaw = Number(
+    raw.min_completeness ?? raw.minCompleteness,
+  );
+  const minViewsRaw = Number(raw.min_views_7d ?? raw.minViews7d);
+  const minComparesRaw = Number(raw.min_compares_7d ?? raw.minCompares7d);
+  const minTrendRaw = Number(raw.min_trend_velocity ?? raw.minTrendVelocity);
+
+  const minHookScore = Number.isFinite(minHookScoreRaw)
+    ? Math.max(0, Math.min(100, minHookScoreRaw))
+    : BLOG_DEFAULT_THRESHOLDS.minHookScore;
+
+  const minCompleteness = Number.isFinite(minCompletenessRaw)
+    ? minCompletenessRaw > 1
+      ? Math.max(0, Math.min(1, minCompletenessRaw / 100))
+      : Math.max(0, Math.min(1, minCompletenessRaw))
+    : BLOG_DEFAULT_THRESHOLDS.minCompleteness;
+
+  const minViews7d = Number.isFinite(minViewsRaw)
+    ? Math.max(0, Math.floor(minViewsRaw))
+    : BLOG_DEFAULT_THRESHOLDS.minViews7d;
+
+  const minCompares7d = Number.isFinite(minComparesRaw)
+    ? Math.max(0, Math.floor(minComparesRaw))
+    : BLOG_DEFAULT_THRESHOLDS.minCompares7d;
+
+  const minTrendVelocity = Number.isFinite(minTrendRaw)
+    ? minTrendRaw
+    : BLOG_DEFAULT_THRESHOLDS.minTrendVelocity;
+
+  return {
+    minHookScore,
+    minCompleteness,
+    minViews7d,
+    minCompares7d,
+    minTrendVelocity,
+  };
+};
+
+const ensureBlogManagerAccess = (req, res) => {
+  const role = String(req?.user?.role || "")
+    .trim()
+    .toLowerCase();
+  if (role === "admin" || role === "editor") return true;
+  res.status(403).json({ message: "Admin or editor access required" });
+  return false;
+};
+
+const readBlogProductDetailsByType = async (type, productId) => {
+  if (type === "smartphone") {
+    const result = await db.query(
+      "SELECT * FROM smartphones WHERE product_id = $1 LIMIT 1",
+      [productId],
+    );
+    return result.rows[0] || {};
+  }
+
+  if (type === "laptop") {
+    const result = await db.query(
+      "SELECT * FROM laptop WHERE product_id = $1 LIMIT 1",
+      [productId],
+    );
+    return result.rows[0] || {};
+  }
+
+  if (type === "tv") {
+    const result = await db.query("SELECT * FROM tvs WHERE product_id = $1 LIMIT 1", [
+      productId,
+    ]);
+    return result.rows[0] || {};
+  }
+
+  return {};
+};
+
+const readBlogProductVariants = async (productId) => {
+  const result = await db.query(
+    `
+    SELECT
+      v.id AS variant_id,
+      v.variant_key,
+      v.attributes,
+      v.base_price,
+      COALESCE(
+        (
+          SELECT json_agg(
+            jsonb_build_object(
+              'id', sp.id,
+              'store_name', sp.store_name,
+              'price', sp.price,
+              'url', sp.url,
+              'offer_text', sp.offer_text,
+              'delivery_info', sp.delivery_info
+            )
+            ORDER BY sp.price ASC NULLS LAST, sp.id ASC
+          )
+          FROM variant_store_prices sp
+          WHERE sp.variant_id = v.id
+        ),
+        '[]'::json
+      ) AS store_prices
+    FROM product_variants v
+    WHERE v.product_id = $1
+    ORDER BY v.id ASC
+  `,
+    [productId],
+  );
+
+  return (result.rows || []).map((row) => {
+    const attributes = toPlainObject(parseJsonLikeValue(row.attributes));
+    return {
+      ...row,
+      ...attributes,
+      store_prices: Array.isArray(row.store_prices) ? row.store_prices : [],
+    };
+  });
+};
+
+const readBlogProductImages = async (productId) => {
+  const result = await db.query(
+    `
+    SELECT image_url
+    FROM product_images
+    WHERE product_id = $1
+    ORDER BY position ASC NULLS LAST, id ASC
+  `,
+    [productId],
+  );
+  return (result.rows || [])
+    .map((row) => String(row.image_url || "").trim())
+    .filter(Boolean);
+};
+
+const fetchBlogProductSnapshot = async (
+  productId,
+  profiles,
+  baseRowOverride = null,
+) => {
+  const normalizedId = Number(productId);
+  if (!Number.isInteger(normalizedId) || normalizedId <= 0) return null;
+
+  let baseRow = baseRowOverride;
+  if (!baseRow) {
+    const baseResult = await db.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name,
+        p.product_type,
+        b.name AS brand_name,
+        COALESCE(ds.hook_score, 0) AS hook_score,
+        COALESCE(ds.buyer_intent, 0) AS buyer_intent,
+        COALESCE(ds.trend_velocity, 0) AS trend_velocity,
+        COALESCE(ds.freshness, 0) AS freshness,
+        COALESCE(ts.views_7d, 0) AS views_7d,
+        COALESCE(ts.compares_7d, 0) AS compares_7d,
+        COALESCE(pub.is_published, false) AS is_published
+      FROM products p
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
+      LEFT JOIN product_trending_score ts
+        ON ts.product_id = p.id
+      LEFT JOIN product_publish pub
+        ON pub.product_id = p.id
+      WHERE p.id = $1
+      LIMIT 1
+    `,
+      [normalizedId],
+    );
+    baseRow = baseResult.rows[0] || null;
+  }
+
+  if (!baseRow) return null;
+
+  const productType = normalizeProfileDeviceType(baseRow.product_type);
+  if (!BLOG_ALLOWED_PRODUCT_TYPES.has(productType)) return null;
+
+  const [detailRow, variants, images] = await Promise.all([
+    readBlogProductDetailsByType(productType, normalizedId),
+    readBlogProductVariants(normalizedId),
+    readBlogProductImages(normalizedId),
+  ]);
+
+  const source = stripScoreRecursively({
+    ...toPlainObject(detailRow),
+    product_id: normalizedId,
+    product_type: productType,
+    name: baseRow.name || null,
+    brand_name: baseRow.brand_name || null,
+    hook_score: baseRow.hook_score ?? null,
+    buyer_intent: baseRow.buyer_intent ?? null,
+    trend_velocity: baseRow.trend_velocity ?? null,
+    freshness: baseRow.freshness ?? null,
+    variants,
+    images,
+  });
+
+  const scored = applySpecScoreToRow(productType, source, profiles);
+  const lowestPrice = extractLowestVariantPrice(variants);
+
+  return {
+    product_id: normalizedId,
+    product_type: productType,
+    core: {
+      ...baseRow,
+      product_type: productType,
+      views_7d: toSafeFiniteNumber(baseRow.views_7d, 0),
+      compares_7d: toSafeFiniteNumber(baseRow.compares_7d, 0),
+      hook_score: toSafeFiniteNumber(baseRow.hook_score, 0),
+      buyer_intent: toSafeFiniteNumber(baseRow.buyer_intent, 0),
+      trend_velocity: toSafeFiniteNumber(baseRow.trend_velocity, 0),
+      freshness: toSafeFiniteNumber(baseRow.freshness, 0),
+    },
+    scored,
+    variants,
+    images,
+    lowest_price: lowestPrice,
+    hero_image: images[0] || null,
+  };
+};
+
+const evaluateBlogEligibility = (snapshot, thresholdsInput = {}) => {
+  const thresholds = normalizeBlogThresholds(thresholdsInput);
+  const hookScore =
+    toFiniteScore100(snapshot?.core?.hook_score ?? snapshot?.scored?.hook_score) ??
+    0;
+  const trendVelocity = toSafeFiniteNumber(snapshot?.core?.trend_velocity, 0);
+  const views7d = toSafeFiniteNumber(snapshot?.core?.views_7d, 0);
+  const compares7d = toSafeFiniteNumber(snapshot?.core?.compares_7d, 0);
+  const completenessPct =
+    toFiniteScore100(snapshot?.scored?.field_profile?.mandatory_coverage) ?? 0;
+  const completeness = completenessPct / 100;
+
+  const momentumPass =
+    trendVelocity >= thresholds.minTrendVelocity ||
+    compares7d >= thresholds.minCompares7d ||
+    views7d >= thresholds.minViews7d;
+
+  const eligible =
+    hookScore >= thresholds.minHookScore &&
+    completeness >= thresholds.minCompleteness &&
+    momentumPass;
+
+  return {
+    eligible,
+    hook_score: Number(hookScore.toFixed(1)),
+    completeness: Number(completeness.toFixed(4)),
+    mandatory_coverage: Number(completenessPct.toFixed(1)),
+    views_7d: views7d,
+    compares_7d: compares7d,
+    trend_velocity: Number(trendVelocity.toFixed(4)),
+    thresholds,
+    reasons: {
+      hook_ok: hookScore >= thresholds.minHookScore,
+      completeness_ok: completeness >= thresholds.minCompleteness,
+      momentum_ok: momentumPass,
+    },
+  };
+};
+
+const buildBlogTokenMap = (snapshot) => {
+  const scored = toPlainObject(snapshot?.scored);
+  const display = toPlainObject(scored.field_profile?.display_display);
+  const mandatory = toPlainObject(scored.field_profile?.mandatory_display);
+  const tokenMap = {};
+
+  const setToken = (key, value) => {
+    const normalizedKey = normalizeBlogTokenKey(key);
+    if (!normalizedKey) return;
+    const formatted = formatBlogValue(value);
+    if (!formatted) return;
+    tokenMap[normalizedKey] = formatted;
+  };
+
+  setToken("product_name", scored.name || snapshot?.core?.name);
+  setToken("brand", scored.brand_name || scored.brand || snapshot?.core?.brand_name);
+  setToken("product_type", snapshot?.product_type || scored.product_type);
+  setToken("processor", display.processor || mandatory.processor);
+  setToken("ram", display.ram || mandatory.ram);
+  setToken("storage", display.storage || mandatory.storage);
+  setToken(
+    "display",
+    display.display_size || display.screen_size || mandatory.display,
+  );
+  setToken("display_size", display.display_size || display.screen_size);
+  setToken("resolution", display.resolution);
+  setToken("refresh_rate", display.refresh_rate);
+  setToken("battery", display.battery || mandatory.battery);
+  setToken("main_camera", display.main_camera || mandatory.camera);
+  setToken("os", display.os || mandatory.os);
+  setToken("network", display.network || mandatory.network);
+  setToken("panel_type", display.panel_type);
+  setToken("audio_output", display.audio_output);
+  setToken("energy_rating", display.energy_rating);
+  setToken("spec_score", `${toSafeFiniteNumber(scored.spec_score, 0).toFixed(1)}%`);
+  setToken("hook_score", `${toSafeFiniteNumber(snapshot?.core?.hook_score, 0).toFixed(1)}`);
+
+  const priceText = formatBlogPrice(snapshot?.lowest_price);
+  if (priceText) tokenMap.price = priceText;
+
+  for (const [key, value] of Object.entries(display)) {
+    setToken(key, value);
+  }
+  for (const [key, value] of Object.entries(mandatory)) {
+    setToken(key, value);
+  }
+
+  return tokenMap;
+};
+
+const buildBlogSuggestions = (snapshot, tokenMap) => {
+  const type = normalizeProfileDeviceType(snapshot?.product_type);
+  const templates = [];
+
+  if (type === "smartphone") {
+    templates.push(
+      "{{product_name}} is powered by {{processor}} and features {{display}}.",
+      "With {{battery}} battery and {{main_camera}} main camera, {{product_name}} is built for all-day use.",
+      "At {{price}}, {{product_name}} offers a balanced mix of performance and value.",
+    );
+  } else if (type === "laptop") {
+    templates.push(
+      "{{product_name}} runs on {{processor}} with {{ram}} RAM and {{storage}} storage.",
+      "It comes with {{display}} and is designed for daily productivity workloads.",
+      "{{product_name}} is currently listed around {{price}}.",
+    );
+  } else if (type === "tv") {
+    templates.push(
+      "{{product_name}} offers {{display_size}} display with {{resolution}} resolution.",
+      "With {{refresh_rate}} refresh rate and {{panel_type}} panel, it targets smooth everyday viewing.",
+      "{{product_name}} is priced around {{price}} in current listings.",
+    );
+  }
+
+  return templates.map((template, index) => ({
+    id: index + 1,
+    template,
+    rendered: renderBlogTemplateWithTokens(template, tokenMap, {
+      preserveUnknown: true,
+    }),
+  }));
+};
+
+const resolveUniqueBlogSlug = async (requestedSlug, productId) => {
+  const baseSlug = toBlogSlug(
+    requestedSlug,
+    `product-${toPositiveInt(productId, Date.now())}`,
+  );
+  let slug = baseSlug;
+  let counter = 2;
+
+  while (true) {
+    const existing = await db.query(
+      "SELECT product_id FROM blogs WHERE slug = $1 LIMIT 1",
+      [slug],
+    );
+    if (!existing.rows.length) return slug;
+
+    const existingProductId = Number(existing.rows[0]?.product_id);
+    if (existingProductId === Number(productId)) return slug;
+    slug = `${baseSlug}-${counter}`;
+    counter += 1;
+  }
+};
 
 /* -----------------------
   Migrations (all tables with   suffix)
@@ -1407,6 +2392,21 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
+      CREATE TABLE IF NOT EXISTS device_field_profiles_config (
+        id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        profiles JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_by INT REFERENCES "user"(id),
+        updated_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      INSERT INTO device_field_profiles_config (id)
+      VALUES (1)
+      ON CONFLICT (id) DO NOTHING;
+    `);
+
+    await safeQuery(`
       CREATE TABLE IF NOT EXISTS wishlist (
         id SERIAL PRIMARY KEY,
         customer_id INT NOT NULL
@@ -1464,6 +2464,44 @@ async function runMigrations() {
     await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_career_applications_email
       ON career_applications (email);
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS blogs (
+        id SERIAL PRIMARY KEY,
+        product_id INT NOT NULL UNIQUE
+          REFERENCES products(id)
+          ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        slug TEXT NOT NULL UNIQUE,
+        excerpt TEXT,
+        content_template TEXT NOT NULL,
+        content_rendered TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft',
+        blog_eligible BOOLEAN NOT NULL DEFAULT false,
+        eligibility_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+        token_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+        meta_title TEXT,
+        meta_description TEXT,
+        hero_image TEXT,
+        created_by INT REFERENCES "user"(id),
+        updated_by INT REFERENCES "user"(id),
+        published_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT now(),
+        updated_at TIMESTAMP DEFAULT now(),
+        CONSTRAINT blogs_status_check
+          CHECK (status IN ('draft', 'published', 'archived'))
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_blogs_status_published_at
+      ON blogs (status, published_at DESC, updated_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_blogs_product
+      ON blogs (product_id);
     `);
 
     // Popular feature clicks (analytics) - aggregated per day
@@ -2262,7 +3300,9 @@ app.get("/api/admin/careers", authenticate, async (req, res) => {
       db.query(
         `SELECT id, role, first_name, last_name, email, phone,
                 experience_level, employment_status, notice_period,
-                preferred_location, expected_ctc, status, created_at
+                preferred_location, expected_ctc, status, created_at,
+                updated_at, current_company, current_designation,
+                application_date
          FROM career_applications
          ORDER BY created_at DESC
          LIMIT $1 OFFSET $2`,
@@ -2280,6 +3320,554 @@ app.get("/api/admin/careers", authenticate, async (req, res) => {
   } catch (err) {
     console.error("List career applications error:", err);
     return res.status(500).json({ message: "Failed to fetch applications" });
+  }
+});
+
+const CAREER_APPLICATION_STATUSES = new Set([
+  "new",
+  "screening",
+  "shortlisted",
+  "interview_scheduled",
+  "offered",
+  "hired",
+  "rejected",
+]);
+
+app.patch("/api/admin/careers/:id/status", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const rawStatus = String(req.body?.status || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "_")
+      .replace(/[^a-z_]/g, "");
+
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    if (!rawStatus) {
+      return res.status(400).json({ message: "status is required" });
+    }
+
+    if (!CAREER_APPLICATION_STATUSES.has(rawStatus)) {
+      return res.status(400).json({
+        message:
+          "Invalid status. Allowed values: new, screening, shortlisted, interview_scheduled, offered, hired, rejected",
+      });
+    }
+
+    const result = await db.query(
+      `UPDATE career_applications
+       SET status = $1, updated_at = now()
+       WHERE id = $2
+       RETURNING id, status, updated_at`,
+      [rawStatus, id],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Application not found" });
+    }
+
+    return res.json({
+      message: "Application status updated",
+      application: result.rows[0],
+    });
+  } catch (err) {
+    console.error("Update career application status error:", err);
+    return res.status(500).json({ message: "Failed to update status" });
+  }
+});
+
+/* ---- Blogs (Eligibility + Suggestions + Editor) ---- */
+app.get("/api/admin/blogs/candidates", authenticate, async (req, res) => {
+  try {
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const rawType = String(req.query.type || "smartphone")
+      .trim()
+      .toLowerCase();
+    const type = normalizeProfileDeviceType(rawType);
+    if (!BLOG_ALLOWED_PRODUCT_TYPES.has(type)) {
+      return res.status(400).json({ message: "Invalid product type" });
+    }
+
+    const limit = Math.min(100, toPositiveInt(req.query.limit, 25));
+    const thresholds = normalizeBlogThresholds(req.query || {});
+    const profileConfig = await readDeviceFieldProfilesConfig();
+
+    const baseResult = await db.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name,
+        p.product_type,
+        b.name AS brand_name,
+        COALESCE(ds.hook_score, 0) AS hook_score,
+        COALESCE(ds.buyer_intent, 0) AS buyer_intent,
+        COALESCE(ds.trend_velocity, 0) AS trend_velocity,
+        COALESCE(ds.freshness, 0) AS freshness,
+        COALESCE(ts.views_7d, 0) AS views_7d,
+        COALESCE(ts.compares_7d, 0) AS compares_7d,
+        COALESCE(pub.is_published, false) AS is_published
+      FROM products p
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
+      LEFT JOIN product_trending_score ts
+        ON ts.product_id = p.id
+      LEFT JOIN product_publish pub
+        ON pub.product_id = p.id
+      WHERE p.product_type = $1
+      ORDER BY COALESCE(ds.hook_score, 0) DESC, p.id DESC
+      LIMIT $2
+    `,
+      [type, limit],
+    );
+
+    const rows = [];
+    for (const baseRow of baseResult.rows || []) {
+      const snapshot = await fetchBlogProductSnapshot(
+        baseRow.product_id,
+        profileConfig.profiles,
+        baseRow,
+      );
+      if (!snapshot) continue;
+
+      const eligibility = evaluateBlogEligibility(snapshot, thresholds);
+      const price = formatBlogPrice(snapshot.lowest_price);
+      rows.push({
+        product_id: baseRow.product_id,
+        product_type: type,
+        name: baseRow.name || "",
+        brand_name: baseRow.brand_name || "",
+        is_published: Boolean(baseRow.is_published),
+        hook_score: eligibility.hook_score,
+        spec_score: toSafeFiniteNumber(snapshot?.scored?.spec_score, 0),
+        buyer_intent: toSafeFiniteNumber(baseRow.buyer_intent, 0),
+        trend_velocity: toSafeFiniteNumber(baseRow.trend_velocity, 0),
+        views_7d: toSafeFiniteNumber(baseRow.views_7d, 0),
+        compares_7d: toSafeFiniteNumber(baseRow.compares_7d, 0),
+        mandatory_coverage: eligibility.mandatory_coverage,
+        data_completeness: Number((eligibility.completeness * 100).toFixed(1)),
+        eligible: eligibility.eligible,
+        eligibility,
+        price: price || null,
+        image: snapshot.hero_image || null,
+      });
+    }
+
+    return res.json({
+      type,
+      limit,
+      thresholds,
+      total: rows.length,
+      rows,
+    });
+  } catch (err) {
+    console.error("GET /api/admin/blogs/candidates error:", err);
+    return res.status(500).json({ message: "Failed to fetch blog candidates" });
+  }
+});
+
+app.get("/api/admin/blogs/suggestions/:productId", authenticate, async (req, res) => {
+  try {
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const productId = Number(req.params.productId);
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ message: "Invalid product id" });
+    }
+
+    const thresholds = normalizeBlogThresholds(req.query || {});
+    const profileConfig = await readDeviceFieldProfilesConfig();
+    const snapshot = await fetchBlogProductSnapshot(productId, profileConfig.profiles);
+    if (!snapshot) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    const tokenMap = buildBlogTokenMap(snapshot);
+    const suggestions = buildBlogSuggestions(snapshot, tokenMap);
+    const eligibility = evaluateBlogEligibility(snapshot, thresholds);
+    const existing = await db.query(
+      `
+      SELECT
+        id,
+        product_id,
+        title,
+        slug,
+        excerpt,
+        content_template,
+        content_rendered,
+        status,
+        blog_eligible,
+        meta_title,
+        meta_description,
+        hero_image,
+        published_at,
+        created_at,
+        updated_at
+      FROM blogs
+      WHERE product_id = $1
+      LIMIT 1
+    `,
+      [productId],
+    );
+
+    return res.json({
+      product: {
+        product_id: snapshot.product_id,
+        product_type: snapshot.product_type,
+        name: snapshot.core?.name || "",
+        brand_name: snapshot.core?.brand_name || "",
+        hook_score: snapshot.core?.hook_score ?? 0,
+        spec_score: snapshot.scored?.spec_score ?? 0,
+        price: formatBlogPrice(snapshot.lowest_price) || null,
+        image: snapshot.hero_image || null,
+      },
+      eligibility,
+      token_map: tokenMap,
+      token_keys: Object.keys(tokenMap).sort(),
+      suggestions,
+      existing_blog: existing.rows[0] || null,
+    });
+  } catch (err) {
+    console.error("GET /api/admin/blogs/suggestions/:productId error:", err);
+    return res.status(500).json({ message: "Failed to fetch blog suggestions" });
+  }
+});
+
+app.post("/api/admin/blogs/preview", authenticate, async (req, res) => {
+  try {
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const productId = Number(req.body?.product_id);
+    const content = String(req.body?.content || "");
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ message: "product_id is required" });
+    }
+    if (!content.trim()) {
+      return res.status(400).json({ message: "content is required" });
+    }
+
+    const profileConfig = await readDeviceFieldProfilesConfig();
+    const snapshot = await fetchBlogProductSnapshot(productId, profileConfig.profiles);
+    if (!snapshot) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    const tokenMap = buildBlogTokenMap(snapshot);
+    const rendered = renderBlogTemplateWithTokens(content, tokenMap, {
+      preserveUnknown: true,
+    });
+    const unresolved = collectTemplateTokens(rendered);
+
+    return res.json({
+      rendered_content: rendered,
+      unresolved_tokens: unresolved,
+      token_map: tokenMap,
+    });
+  } catch (err) {
+    console.error("POST /api/admin/blogs/preview error:", err);
+    return res.status(500).json({ message: "Failed to preview blog content" });
+  }
+});
+
+app.post("/api/admin/blogs", authenticate, async (req, res) => {
+  try {
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const productId = Number(req.body?.product_id);
+    const title = String(req.body?.title || "").trim();
+    const excerpt = String(req.body?.excerpt || "").trim();
+    const contentTemplate = String(req.body?.content_template || "").trim();
+    const requestedSlug = String(req.body?.slug || "").trim();
+    const requestedStatus = String(req.body?.status || "draft")
+      .trim()
+      .toLowerCase();
+    const status = BLOG_ALLOWED_STATUSES.has(requestedStatus)
+      ? requestedStatus
+      : "draft";
+    const metaTitle = String(req.body?.meta_title || "").trim();
+    const metaDescription = String(req.body?.meta_description || "").trim();
+
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ message: "product_id is required" });
+    }
+    if (!title) return res.status(400).json({ message: "title is required" });
+    if (!contentTemplate) {
+      return res.status(400).json({ message: "content_template is required" });
+    }
+
+    const profileConfig = await readDeviceFieldProfilesConfig();
+    const snapshot = await fetchBlogProductSnapshot(productId, profileConfig.profiles);
+    if (!snapshot) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    const thresholds = normalizeBlogThresholds(req.body || {});
+    const eligibility = evaluateBlogEligibility(snapshot, thresholds);
+    if (status === "published" && !eligibility.eligible) {
+      return res.status(400).json({
+        message:
+          "Product does not meet blog eligibility thresholds for publish status",
+        eligibility,
+      });
+    }
+
+    const tokenMap = buildBlogTokenMap(snapshot);
+    const contentRendered = renderBlogTemplateWithTokens(contentTemplate, tokenMap, {
+      preserveUnknown: true,
+    });
+    const slug = await resolveUniqueBlogSlug(
+      requestedSlug || title || snapshot.core?.name,
+      productId,
+    );
+    const heroImage = String(
+      req.body?.hero_image || snapshot.hero_image || "",
+    ).trim();
+    const nowPublishedAt = status === "published" ? new Date() : null;
+    const actorId =
+      Number.isInteger(Number(req.user?.id)) && Number(req.user?.id) > 0
+        ? Number(req.user.id)
+        : null;
+
+    const upsert = await db.query(
+      `
+      INSERT INTO blogs (
+        product_id,
+        title,
+        slug,
+        excerpt,
+        content_template,
+        content_rendered,
+        status,
+        blog_eligible,
+        eligibility_snapshot,
+        token_snapshot,
+        meta_title,
+        meta_description,
+        hero_image,
+        created_by,
+        updated_by,
+        published_at,
+        created_at,
+        updated_at
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16,now(),now()
+      )
+      ON CONFLICT (product_id)
+      DO UPDATE SET
+        title = EXCLUDED.title,
+        slug = EXCLUDED.slug,
+        excerpt = EXCLUDED.excerpt,
+        content_template = EXCLUDED.content_template,
+        content_rendered = EXCLUDED.content_rendered,
+        status = EXCLUDED.status,
+        blog_eligible = EXCLUDED.blog_eligible,
+        eligibility_snapshot = EXCLUDED.eligibility_snapshot,
+        token_snapshot = EXCLUDED.token_snapshot,
+        meta_title = EXCLUDED.meta_title,
+        meta_description = EXCLUDED.meta_description,
+        hero_image = EXCLUDED.hero_image,
+        updated_by = EXCLUDED.updated_by,
+        published_at = CASE
+          WHEN EXCLUDED.status = 'published'
+            THEN COALESCE(blogs.published_at, EXCLUDED.published_at)
+          ELSE NULL
+        END,
+        updated_at = now()
+      RETURNING
+        id,
+        product_id,
+        title,
+        slug,
+        excerpt,
+        content_template,
+        content_rendered,
+        status,
+        blog_eligible,
+        eligibility_snapshot,
+        token_snapshot,
+        meta_title,
+        meta_description,
+        hero_image,
+        published_at,
+        created_at,
+        updated_at
+    `,
+      [
+        productId,
+        title,
+        slug,
+        excerpt || null,
+        contentTemplate,
+        contentRendered,
+        status,
+        eligibility.eligible,
+        JSON.stringify(eligibility),
+        JSON.stringify(tokenMap),
+        metaTitle || null,
+        metaDescription || null,
+        heroImage || null,
+        actorId,
+        actorId,
+        nowPublishedAt,
+      ],
+    );
+
+    return res.status(201).json({
+      message: "Blog saved successfully",
+      blog: upsert.rows[0],
+      unresolved_tokens: collectTemplateTokens(contentRendered),
+    });
+  } catch (err) {
+    console.error("POST /api/admin/blogs error:", err);
+    return res.status(500).json({ message: "Failed to save blog" });
+  }
+});
+
+app.get("/api/admin/blogs", authenticate, async (req, res) => {
+  try {
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const page = toPositiveInt(req.query.page, 1);
+    const limit = Math.min(100, toPositiveInt(req.query.limit, 20));
+    const offset = (page - 1) * limit;
+    const rawStatus = String(req.query.status || "")
+      .trim()
+      .toLowerCase();
+    const status = BLOG_ALLOWED_STATUSES.has(rawStatus) ? rawStatus : null;
+
+    const whereSql = status ? "WHERE bl.status = $1" : "";
+    const params = status ? [status, limit, offset] : [limit, offset];
+
+    const listSql = `
+      SELECT
+        bl.id,
+        bl.product_id,
+        bl.title,
+        bl.slug,
+        bl.status,
+        bl.blog_eligible,
+        bl.hero_image,
+        bl.published_at,
+        bl.updated_at,
+        p.name AS product_name,
+        p.product_type,
+        b.name AS brand_name
+      FROM blogs bl
+      INNER JOIN products p
+        ON p.id = bl.product_id
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      ${whereSql}
+      ORDER BY bl.updated_at DESC, bl.id DESC
+      LIMIT $${status ? 2 : 1} OFFSET $${status ? 3 : 2}
+    `;
+
+    const countSql = `
+      SELECT COUNT(*)::int AS total
+      FROM blogs bl
+      ${status ? "WHERE bl.status = $1" : ""}
+    `;
+    const countParams = status ? [status] : [];
+
+    const [listRes, countRes] = await Promise.all([
+      db.query(listSql, params),
+      db.query(countSql, countParams),
+    ]);
+
+    return res.json({
+      page,
+      limit,
+      total: countRes.rows[0]?.total || 0,
+      rows: listRes.rows || [],
+    });
+  } catch (err) {
+    console.error("GET /api/admin/blogs error:", err);
+    return res.status(500).json({ message: "Failed to fetch blogs" });
+  }
+});
+
+app.get("/api/public/blogs", async (req, res) => {
+  try {
+    const limit = Math.min(50, toPositiveInt(req.query.limit, 12));
+    const result = await db.query(
+      `
+      SELECT
+        bl.slug,
+        bl.title,
+        bl.excerpt,
+        bl.hero_image,
+        bl.published_at,
+        p.name AS product_name,
+        p.product_type,
+        b.name AS brand_name
+      FROM blogs bl
+      INNER JOIN products p
+        ON p.id = bl.product_id
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      WHERE bl.status = 'published'
+      ORDER BY bl.published_at DESC NULLS LAST, bl.updated_at DESC
+      LIMIT $1
+    `,
+      [limit],
+    );
+
+    return res.json({
+      limit,
+      blogs: result.rows || [],
+    });
+  } catch (err) {
+    console.error("GET /api/public/blogs error:", err);
+    return res.status(500).json({ message: "Failed to fetch blogs" });
+  }
+});
+
+app.get("/api/public/blogs/:slug", async (req, res) => {
+  try {
+    const slug = String(req.params.slug || "").trim().toLowerCase();
+    if (!slug) return res.status(400).json({ message: "Invalid slug" });
+
+    const result = await db.query(
+      `
+      SELECT
+        bl.id,
+        bl.product_id,
+        bl.title,
+        bl.slug,
+        bl.excerpt,
+        bl.content_rendered,
+        bl.meta_title,
+        bl.meta_description,
+        bl.hero_image,
+        bl.published_at,
+        p.name AS product_name,
+        p.product_type,
+        b.name AS brand_name
+      FROM blogs bl
+      INNER JOIN products p
+        ON p.id = bl.product_id
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      WHERE bl.slug = $1
+        AND bl.status = 'published'
+      LIMIT $2
+    `,
+      [slug, 1],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Blog not found" });
+    }
+
+    return res.json({ blog: result.rows[0] });
+  } catch (err) {
+    console.error("GET /api/public/blogs/:slug error:", err);
+    return res.status(500).json({ message: "Failed to fetch blog" });
   }
 });
 
@@ -2887,6 +4475,7 @@ app.post("/api/products", authenticate, async (req, res) => {
 // Get published smartphones (public) - nested structure
 app.get("/api/smartphones", async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const result = await db.query(`
       SELECT
         p.id AS product_id,
@@ -2989,10 +4578,14 @@ app.get("/api/smartphones", async (req, res) => {
       ORDER BY COALESCE(MAX(ds.hook_score), 0) DESC, p.id DESC;
     `);
 
-    const smartphones = (result.rows || []).map((row) => {
-      const item = { ...(row || {}) };
-      return stripScoreRecursively(item);
-    });
+    const smartphones = applySpecScoreToRows(
+      "smartphone",
+      (result.rows || []).map((row) => {
+        const item = { ...(row || {}) };
+        return stripScoreRecursively(item);
+      }),
+      profileConfig.profiles,
+    );
 
     res.json({ smartphones });
   } catch (err) {
@@ -3004,6 +4597,7 @@ app.get("/api/smartphones", async (req, res) => {
 // Get all smartphones (authenticated) — full data
 app.get("/api/smartphone", authenticate, async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const result = await db.query(`
       SELECT
         p.id AS product_id,
@@ -3097,8 +4691,12 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
       ORDER BY p.id DESC;
     `);
 
-    const smartphones = (result.rows || []).map((row) =>
-      stripScoreRecursively(row || {}),
+    const smartphones = applySpecScoreToRows(
+      "smartphone",
+      (result.rows || []).map((row) =>
+        stripScoreRecursively(row || {}),
+      ),
+      profileConfig.profiles,
     );
 
     res.json({ smartphones });
@@ -3112,6 +4710,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
 // Accept either internal `smartphones.id` or `product_id` (product's id).
 app.get("/api/smartphone/:id", async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const rawId = req.params.id;
     const sid = Number(rawId);
     if (!rawId || rawId.trim() === "")
@@ -3207,7 +4806,13 @@ app.get("/api/smartphone/:id", async (req, res) => {
     sanitized.launch_date = smartphone.launch_date || null;
     sanitized.created_at = smartphone.created_at || null;
 
-    return res.json({ data: sanitized });
+    const scored = applySpecScoreToRow(
+      "smartphone",
+      sanitized,
+      profileConfig.profiles,
+    );
+
+    return res.json({ data: scored });
   } catch (err) {
     console.error("GET /api/smartphone/:id error:", err);
     return res.status(500).json({ error: err.message });
@@ -3434,6 +5039,7 @@ app.post("/api/laptops", authenticate, async (req, res) => {
 
 app.get("/api/laptops", async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const result = await db.query(
       `
       SELECT
@@ -3539,7 +5145,11 @@ app.get("/api/laptops", async (req, res) => {
     `,
     );
 
-    const laptops = (result.rows || []).map(toCanonicalLaptopProductResponse);
+    const laptops = applySpecScoreToRows(
+      "laptop",
+      (result.rows || []).map(toCanonicalLaptopProductResponse),
+      profileConfig.profiles,
+    );
     res.json({ laptops });
   } catch (err) {
     console.error("GET /api/laptops error:", err);
@@ -3550,6 +5160,7 @@ app.get("/api/laptops", async (req, res) => {
 // Get laptop by id (accepts internal laptop.id or product_id)
 app.get("/api/laptops/:id", authenticate, async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const rawId = req.params.id;
     const lid = Number(rawId);
     if (!rawId || rawId.trim() === "")
@@ -3622,10 +5233,15 @@ app.get("/api/laptops/:id", authenticate, async (req, res) => {
 
     const sanitized = sanitize(laptop, variants);
     sanitized.name = productName;
+    const scoredLaptop = applySpecScoreToRow(
+      "laptop",
+      sanitized,
+      profileConfig.profiles,
+    );
 
     return res.json({
       product: { name: productName, brand_id: productBrandId },
-      laptop: sanitized,
+      laptop: scoredLaptop,
       images,
       variants,
       published,
@@ -4314,6 +5930,7 @@ app.post("/api/tvs", authenticate, async (req, res) => {
 
 app.get("/api/tvs", async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const result = await db.query(`
       SELECT
         p.id AS product_id,
@@ -4427,8 +6044,12 @@ app.get("/api/tvs", async (req, res) => {
       ORDER BY COALESCE(ds.hook_score, 0) DESC, p.id DESC
     `);
 
-    const tvs = (result.rows || []).map((row) =>
-      stripScoreRecursively(row || {}),
+    const tvs = applySpecScoreToRows(
+      "tv",
+      (result.rows || []).map((row) =>
+        stripScoreRecursively(row || {}),
+      ),
+      profileConfig.profiles,
     );
     return res.json({ tvs });
   } catch (err) {
@@ -5369,6 +6990,7 @@ app.delete("/api/tvs/:id", authenticate, async (req, res) => {
 // Delete a color from a smartphone's colors JSONB by index
 app.get("/api/laptop", authenticate, async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const result = await db.query(`
       SELECT
         p.id AS product_id,
@@ -5408,7 +7030,13 @@ app.get("/api/laptop", authenticate, async (req, res) => {
       ORDER BY p.id DESC
     `);
 
-    const laptops = (result.rows || []).map(enrichLaptopResponse);
+    const laptops = applySpecScoreToRows(
+      "laptop",
+      (result.rows || []).map((row) =>
+        stripScoreRecursively(enrichLaptopResponse(row || {})),
+      ),
+      profileConfig.profiles,
+    );
     res.json({ laptops });
   } catch (err) {
     console.error("GET /api/laptop error:", err);
@@ -5418,6 +7046,7 @@ app.get("/api/laptop", authenticate, async (req, res) => {
 
 app.get("/api/tv", authenticate, async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const result = await db.query(`
       SELECT
         p.id AS product_id,
@@ -5458,8 +7087,12 @@ app.get("/api/tv", authenticate, async (req, res) => {
       ORDER BY p.id DESC
     `);
 
-    const tvs = (result.rows || []).map((row) =>
-      stripScoreRecursively(row || {}),
+    const tvs = applySpecScoreToRows(
+      "tv",
+      (result.rows || []).map((row) =>
+        stripScoreRecursively(row || {}),
+      ),
+      profileConfig.profiles,
     );
     return res.json({ tvs });
   } catch (err) {
@@ -5470,6 +7103,7 @@ app.get("/api/tv", authenticate, async (req, res) => {
 
 app.get("/api/tvs/:id", authenticate, async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const rawId = req.params.id;
     const pid = Number(rawId);
     if (!rawId || rawId.trim() === "") {
@@ -5488,11 +7122,19 @@ app.get("/api/tvs/:id", authenticate, async (req, res) => {
     const productId = tv.product_id;
 
     const productRes = await db.query(
-      "SELECT name, brand_id FROM products WHERE id = $1 LIMIT 1",
+      `SELECT p.name, p.brand_id, b.name AS brand_name
+       FROM products p
+       LEFT JOIN brands b ON b.id = p.brand_id
+       WHERE p.id = $1
+       LIMIT 1`,
       [productId],
     );
 
-    const product = productRes.rows[0] || { name: null, brand_id: null };
+    const product = productRes.rows[0] || {
+      name: null,
+      brand_id: null,
+      brand_name: null,
+    };
 
     const imagesRes = await db.query(
       "SELECT image_url FROM product_images WHERE product_id = $1 ORDER BY position ASC, id ASC",
@@ -5558,15 +7200,27 @@ app.get("/api/tvs/:id", authenticate, async (req, res) => {
       ? publishRes.rows[0].is_published
       : false;
 
-    return res.json(
+    const scoredTv = applySpecScoreToRow(
+      "tv",
       stripScoreRecursively({
-        product,
-        tv,
+        ...tv,
+        name: product.name || null,
+        brand_name: product.brand_name || null,
+        images: imagesJson,
         images_json: imagesJson,
+        variants: variantsJson,
         variants_json: variantsJson,
-        published,
       }),
+      profileConfig.profiles,
     );
+
+    return res.json({
+      product,
+      tv: scoredTv,
+      images_json: imagesJson,
+      variants_json: variantsJson,
+      published,
+    });
   } catch (err) {
     console.error("GET /api/tvs/:id error:", err);
     return res.status(500).json({ error: err.message });
@@ -6875,6 +8529,73 @@ app.get("/api/admin/compare-scoring", authenticate, async (req, res) => {
   }
 });
 
+app.get("/api/public/device-field-profiles", async (_req, res) => {
+  try {
+    const config = await readDeviceFieldProfilesConfig();
+    return res.json(toDeviceFieldProfilesResponse(config));
+  } catch (err) {
+    console.error("GET /api/public/device-field-profiles error:", err);
+    return res.status(500).json({
+      message: "Failed to load device field profiles",
+      profiles: normalizeDeviceFieldProfilesConfig(DEFAULT_DEVICE_FIELD_PROFILES),
+      updated_at: null,
+    });
+  }
+});
+
+app.get("/api/admin/device-field-profiles", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const config = await readDeviceFieldProfilesConfig();
+    return res.json(toDeviceFieldProfilesResponse(config));
+  } catch (err) {
+    console.error("GET /api/admin/device-field-profiles error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to load device field profiles" });
+  }
+});
+
+app.put("/api/admin/device-field-profiles", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const body = req.body || {};
+    const normalizedProfiles = normalizeDeviceFieldProfilesConfig(
+      body.profiles || body,
+    );
+
+    await db.query(
+      `
+      INSERT INTO device_field_profiles_config (id, profiles, updated_by, updated_at)
+      VALUES (1, $1::jsonb, $2, now())
+      ON CONFLICT (id)
+      DO UPDATE SET
+        profiles = EXCLUDED.profiles,
+        updated_by = EXCLUDED.updated_by,
+        updated_at = now()
+      `,
+      [JSON.stringify(normalizedProfiles), req.user?.id ?? null],
+    );
+
+    const updated = await readDeviceFieldProfilesConfig();
+    return res.json({
+      success: true,
+      ...toDeviceFieldProfilesResponse(updated),
+    });
+  } catch (err) {
+    console.error("PUT /api/admin/device-field-profiles error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to update device field profiles" });
+  }
+});
+
 app.put("/api/admin/compare-scoring", authenticate, async (req, res) => {
   try {
     if (req.user?.role !== "admin") {
@@ -7205,6 +8926,7 @@ const combineMemoryValues = (values) => {
 
 const handleTrendingSmartphones = async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const limitRaw = Number(req.query?.limit ?? 20);
     const limit = Number.isFinite(limitRaw)
       ? Math.min(50, Math.max(1, Math.floor(limitRaw)))
@@ -7217,6 +8939,17 @@ const handleTrendingSmartphones = async (req, res) => {
         p.name,
         b.name AS brand,
         s.model,
+        s.launch_date,
+        s.display,
+        s.performance,
+        s.camera,
+        s.battery,
+        s.connectivity,
+        s.network,
+        s.build_design,
+        s.audio,
+        s.multimedia,
+        s.sensors,
         MAX(ts.trending_score) AS trending_score,
         MAX(ts.views_7d) AS views_7d,
         MAX(ts.views_prev_7d) AS views_prev_7d,
@@ -7302,7 +9035,22 @@ const handleTrendingSmartphones = async (req, res) => {
       LEFT JOIN product_variants v ON v.product_id = p.id
       LEFT JOIN product_trending_score ts ON ts.product_id = p.id
       WHERE p.product_type = 'smartphone'
-      GROUP BY p.id, p.name, b.name, s.model
+      GROUP BY
+        p.id,
+        p.name,
+        b.name,
+        s.model,
+        s.launch_date,
+        s.display,
+        s.performance,
+        s.camera,
+        s.battery,
+        s.connectivity,
+        s.network,
+        s.build_design,
+        s.audio,
+        s.multimedia,
+        s.sensors
       ORDER BY
         COALESCE(MAX(ts.manual_priority), 0) DESC,
         COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
@@ -7314,38 +9062,57 @@ const handleTrendingSmartphones = async (req, res) => {
     );
 
     const rows = result.rows || [];
-    const trending = rows.map((row) => ({
-      id: row.product_id,
-      product_id: row.product_id,
-      name: row.name,
-      brand: row.brand || null,
-      model: row.model || null,
-      image_url: row.image_url || null,
-      starting_price: row.starting_price ?? null,
-      ram: combineMemoryValues(row.ram_values || []),
-      storage: combineMemoryValues(row.storage_values || []),
-      trend_score:
-        Number.isFinite(Number(row?.trending_score)) &&
-        row?.trending_score !== null
-          ? Number(row.trending_score)
-          : null,
-      trend_views_7d: Number.isFinite(Number(row?.views_7d))
-        ? Number(row.views_7d)
-        : 0,
-      trend_views_prev_7d: Number.isFinite(Number(row?.views_prev_7d))
-        ? Number(row.views_prev_7d)
-        : 0,
-      trend_velocity:
-        Number.isFinite(Number(row?.velocity)) && row?.velocity !== null
-          ? Number(row.velocity)
-          : null,
-      trend_manual_boost: Boolean(Number(row?.manual_boost ?? 0)),
-      trend_manual_priority: Number.isFinite(Number(row?.manual_priority))
-        ? Number(row.manual_priority)
-        : 0,
-      trend_manual_badge: row?.manual_badge || null,
-      trend_calculated_at: row?.trending_calculated_at ?? null,
-    }));
+    const trending = applySpecScoreToRows(
+      "smartphone",
+      rows.map((row) => ({
+        id: row.product_id,
+        product_id: row.product_id,
+        name: row.name,
+        brand: row.brand || null,
+        brand_name: row.brand || null,
+        model: row.model || null,
+        launch_date: row.launch_date || null,
+        display: row.display || null,
+        performance: row.performance || null,
+        camera: row.camera || null,
+        battery: row.battery || null,
+        connectivity: row.connectivity || null,
+        network: row.network || null,
+        build_design: row.build_design || null,
+        audio: row.audio || null,
+        multimedia: row.multimedia || null,
+        sensors: row.sensors || null,
+        images: row.image_url ? [row.image_url] : [],
+        image_url: row.image_url || null,
+        variants: [],
+        price: row.starting_price ?? null,
+        starting_price: row.starting_price ?? null,
+        ram: combineMemoryValues(row.ram_values || []),
+        storage: combineMemoryValues(row.storage_values || []),
+        trend_score:
+          Number.isFinite(Number(row?.trending_score)) &&
+          row?.trending_score !== null
+            ? Number(row.trending_score)
+            : null,
+        trend_views_7d: Number.isFinite(Number(row?.views_7d))
+          ? Number(row.views_7d)
+          : 0,
+        trend_views_prev_7d: Number.isFinite(Number(row?.views_prev_7d))
+          ? Number(row.views_prev_7d)
+          : 0,
+        trend_velocity:
+          Number.isFinite(Number(row?.velocity)) && row?.velocity !== null
+            ? Number(row.velocity)
+            : null,
+        trend_manual_boost: Boolean(Number(row?.manual_boost ?? 0)),
+        trend_manual_priority: Number.isFinite(Number(row?.manual_priority))
+          ? Number(row.manual_priority)
+          : 0,
+        trend_manual_badge: row?.manual_badge || null,
+        trend_calculated_at: row?.trending_calculated_at ?? null,
+      })),
+      profileConfig.profiles,
+    );
 
     return res.json({
       success: true,
@@ -7371,6 +9138,7 @@ app.get("/api/public/trending/smartphones", handleTrendingSmartphones);
 // Trending Laptops
 app.get("/api/public/trending/laptops", async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const limitRaw = Number(req.query?.limit ?? 50);
     const limit = Number.isFinite(limitRaw)
       ? Math.min(100, Math.max(1, Math.floor(limitRaw)))
@@ -7502,37 +9270,41 @@ app.get("/api/public/trending/laptops", async (req, res) => {
       return "Gaining Attention";
     };
 
-    const laptops = (result.rows || []).map((row) => {
-      const trendScoreRaw = Number(row?.trending_score);
-      const trendScore = Number.isFinite(trendScoreRaw) ? trendScoreRaw : null;
-      const views7dRaw = Number(row?.views_7d);
-      const viewsPrevRaw = Number(row?.views_prev_7d);
-      const views7d = Number.isFinite(views7dRaw) ? views7dRaw : 0;
-      const viewsPrev7d = Number.isFinite(viewsPrevRaw) ? viewsPrevRaw : 0;
-      const manualBoost = Boolean(Number(row?.manual_boost ?? 0));
-      const manualBadge = row?.manual_badge
-        ? String(row.manual_badge).trim()
-        : "";
+    const laptops = applySpecScoreToRows(
+      "laptop",
+      (result.rows || []).map((row) => {
+        const trendScoreRaw = Number(row?.trending_score);
+        const trendScore = Number.isFinite(trendScoreRaw) ? trendScoreRaw : null;
+        const views7dRaw = Number(row?.views_7d);
+        const viewsPrevRaw = Number(row?.views_prev_7d);
+        const views7d = Number.isFinite(views7dRaw) ? views7dRaw : 0;
+        const viewsPrev7d = Number.isFinite(viewsPrevRaw) ? viewsPrevRaw : 0;
+        const manualBoost = Boolean(Number(row?.manual_boost ?? 0));
+        const manualBadge = row?.manual_badge
+          ? String(row.manual_badge).trim()
+          : "";
 
-      return {
-        ...toCanonicalLaptopProductResponse(row),
-        trend_score: trendScore,
-        trend_views_7d: views7d,
-        trend_views_prev_7d: viewsPrev7d,
-        trend_delta: views7d - viewsPrev7d,
-        trend_velocity: row?.velocity ?? null,
-        trend_manual_boost: manualBoost,
-        trend_manual_priority: row?.manual_priority ?? 0,
-        trend_manual_badge: manualBadge || null,
-        trend_badge:
-          manualBoost && manualBadge
-            ? manualBadge
-            : manualBoost
-              ? "Editor Pick"
-              : badgeForScore(trendScore),
-        trend_calculated_at: row?.trending_calculated_at ?? null,
-      };
-    });
+        return {
+          ...toCanonicalLaptopProductResponse(row),
+          trend_score: trendScore,
+          trend_views_7d: views7d,
+          trend_views_prev_7d: viewsPrev7d,
+          trend_delta: views7d - viewsPrev7d,
+          trend_velocity: row?.velocity ?? null,
+          trend_manual_boost: manualBoost,
+          trend_manual_priority: row?.manual_priority ?? 0,
+          trend_manual_badge: manualBadge || null,
+          trend_badge:
+            manualBoost && manualBadge
+              ? manualBadge
+              : manualBoost
+                ? "Editor Pick"
+                : badgeForScore(trendScore),
+          trend_calculated_at: row?.trending_calculated_at ?? null,
+        };
+      }),
+      profileConfig.profiles,
+    );
 
     return res.json({
       period: "7d",
@@ -7551,6 +9323,7 @@ app.get("/api/public/trending/laptops", async (req, res) => {
 // Trending TVs
 app.get("/api/public/trending/tvs", async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const limitRaw = Number(req.query?.limit ?? 50);
     const limit = Number.isFinite(limitRaw)
       ? Math.min(100, Math.max(1, Math.floor(limitRaw)))
@@ -7566,6 +9339,20 @@ app.get("/api/public/trending/tvs", async (req, res) => {
         b.name AS brand_name,
         b.name AS brand,
         COALESCE(t.model, p.name) AS model,
+        t.key_specs_json,
+        t.basic_info_json,
+        t.display_json,
+        t.video_engine_json,
+        t.audio_json,
+        t.smart_tv_json,
+        t.gaming_json,
+        t.connectivity_json,
+        t.ports_json,
+        t.power_json,
+        t.physical_json,
+        t.product_details_json,
+        t.in_the_box_json,
+        t.warranty_json,
 
         MAX(ts.trending_score) AS trending_score,
         MAX(ts.views_7d) AS views_7d,
@@ -7678,7 +9465,21 @@ app.get("/api/public/trending/tvs", async (req, res) => {
         p.name,
         p.product_type,
         b.name,
-        t.model
+        t.model,
+        t.key_specs_json,
+        t.basic_info_json,
+        t.display_json,
+        t.video_engine_json,
+        t.audio_json,
+        t.smart_tv_json,
+        t.gaming_json,
+        t.connectivity_json,
+        t.ports_json,
+        t.power_json,
+        t.physical_json,
+        t.product_details_json,
+        t.in_the_box_json,
+        t.warranty_json
       ORDER BY
         COALESCE(MAX(ts.manual_priority), 0) DESC,
         COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
@@ -7697,37 +9498,41 @@ app.get("/api/public/trending/tvs", async (req, res) => {
       return "Gaining Attention";
     };
 
-    const tvs = (result.rows || []).map((row) => {
-      const trendScoreRaw = Number(row?.trending_score);
-      const trendScore = Number.isFinite(trendScoreRaw) ? trendScoreRaw : null;
-      const views7dRaw = Number(row?.views_7d);
-      const viewsPrevRaw = Number(row?.views_prev_7d);
-      const views7d = Number.isFinite(views7dRaw) ? views7dRaw : 0;
-      const viewsPrev7d = Number.isFinite(viewsPrevRaw) ? viewsPrevRaw : 0;
-      const manualBoost = Boolean(Number(row?.manual_boost ?? 0));
-      const manualBadge = row?.manual_badge
-        ? String(row.manual_badge).trim()
-        : "";
+    const tvs = applySpecScoreToRows(
+      "tv",
+      (result.rows || []).map((row) => {
+        const trendScoreRaw = Number(row?.trending_score);
+        const trendScore = Number.isFinite(trendScoreRaw) ? trendScoreRaw : null;
+        const views7dRaw = Number(row?.views_7d);
+        const viewsPrevRaw = Number(row?.views_prev_7d);
+        const views7d = Number.isFinite(views7dRaw) ? views7dRaw : 0;
+        const viewsPrev7d = Number.isFinite(viewsPrevRaw) ? viewsPrevRaw : 0;
+        const manualBoost = Boolean(Number(row?.manual_boost ?? 0));
+        const manualBadge = row?.manual_badge
+          ? String(row.manual_badge).trim()
+          : "";
 
-      return {
-        ...row,
-        trend_score: trendScore,
-        trend_views_7d: views7d,
-        trend_views_prev_7d: viewsPrev7d,
-        trend_delta: views7d - viewsPrev7d,
-        trend_velocity: row?.velocity ?? null,
-        trend_manual_boost: manualBoost,
-        trend_manual_priority: row?.manual_priority ?? 0,
-        trend_manual_badge: manualBadge || null,
-        trend_badge:
-          manualBoost && manualBadge
-            ? manualBadge
-            : manualBoost
-              ? "Editor Pick"
-              : badgeForScore(trendScore),
-        trend_calculated_at: row?.trending_calculated_at ?? null,
-      };
-    });
+        return {
+          ...row,
+          trend_score: trendScore,
+          trend_views_7d: views7d,
+          trend_views_prev_7d: viewsPrev7d,
+          trend_delta: views7d - viewsPrev7d,
+          trend_velocity: row?.velocity ?? null,
+          trend_manual_boost: manualBoost,
+          trend_manual_priority: row?.manual_priority ?? 0,
+          trend_manual_badge: manualBadge || null,
+          trend_badge:
+            manualBoost && manualBadge
+              ? manualBadge
+              : manualBoost
+                ? "Editor Pick"
+                : badgeForScore(trendScore),
+          trend_calculated_at: row?.trending_calculated_at ?? null,
+        };
+      }),
+      profileConfig.profiles,
+    );
 
     return res.json({
       period: "7d",
@@ -7794,13 +9599,30 @@ app.get("/api/public/trending/networking", async (req, res) => {
 // New Launches - Smartphones
 app.get("/api/public/new/smartphones", async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const result = await db.query(`
       SELECT
         p.id AS product_id,
         p.name AS product_name,
+        p.name AS name,
+        p.product_type,
         b.name AS brand,
+        b.name AS brand_name,
         s.model AS model,
         s.launch_date,
+        s.display,
+        s.performance,
+        s.camera,
+        s.battery,
+        s.connectivity,
+        s.network,
+        (
+          SELECT pi.image_url
+          FROM product_images pi
+          WHERE pi.product_id = p.id
+          ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+          LIMIT 1
+        ) AS image,
         (
           SELECT MIN(sp.price)
           FROM product_variants v
@@ -7816,7 +9638,17 @@ app.get("/api/public/new/smartphones", async (req, res) => {
       LIMIT 20;
     `);
 
-    return res.json({ new: result.rows });
+    const launches = applySpecScoreToRows(
+      "smartphone",
+      (result.rows || []).map((row) => ({
+        ...row,
+        images: row?.image ? [row.image] : [],
+        variants: [],
+      })),
+      profileConfig.profiles,
+    );
+
+    return res.json({ new: launches });
   } catch (err) {
     console.error("GET /api/public/new/smartphones error:", err);
     return res.status(500).json({ error: err.message });
@@ -7826,12 +9658,32 @@ app.get("/api/public/new/smartphones", async (req, res) => {
 // New Launches - Laptops
 app.get("/api/public/new/laptops", async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const result = await db.query(`
       SELECT
         p.id AS product_id,
         p.name AS product_name,
+        p.name,
+        p.product_type,
         b.name AS brand,
+        b.name AS brand_name,
+        l.cpu,
+        l.display,
+        l.memory,
+        l.storage,
+        l.battery,
+        l.software,
+        l.physical,
+        l.meta,
+        l.spec_sections,
         l.created_at AS launch_date,
+        (
+          SELECT pi.image_url
+          FROM product_images pi
+          WHERE pi.product_id = p.id
+          ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+          LIMIT 1
+        ) AS image,
         (
           SELECT MIN(sp.price)
           FROM product_variants v
@@ -7847,7 +9699,17 @@ app.get("/api/public/new/laptops", async (req, res) => {
       LIMIT 20;
     `);
 
-    return res.json({ new: result.rows });
+    const launches = applySpecScoreToRows(
+      "laptop",
+      (result.rows || []).map((row) => ({
+        ...row,
+        images: row?.image ? [row.image] : [],
+        variants: [],
+      })),
+      profileConfig.profiles,
+    );
+
+    return res.json({ new: launches });
   } catch (err) {
     console.error("GET /api/public/new/laptops error:", err);
     return res.status(500).json({ error: err.message });
@@ -7857,6 +9719,7 @@ app.get("/api/public/new/laptops", async (req, res) => {
 // New Launches - TVs
 app.get("/api/public/new/tvs", async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const result = await db.query(`
       SELECT
         p.id AS product_id,
@@ -7958,7 +9821,13 @@ app.get("/api/public/new/tvs", async (req, res) => {
       LIMIT 20;
     `);
 
-    return res.json({ new: result.rows });
+    const launches = applySpecScoreToRows(
+      "tv",
+      result.rows || [],
+      profileConfig.profiles,
+    );
+
+    return res.json({ new: launches });
   } catch (err) {
     console.error("GET /api/public/new/tvs error:", err);
     return res.status(500).json({ error: err.message });
@@ -8365,6 +10234,7 @@ app.get("/api/variant/:id/store-prices", async (req, res) => {
 // PUBLIC: Get smartphone/product details by ID (no auth required)
 app.get("/api/public/product/:id", async (req, res) => {
   try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ message: "Invalid id" });
 
@@ -8454,7 +10324,13 @@ app.get("/api/public/product/:id", async (req, res) => {
       smartphone: smartphoneDetails,
     };
 
-    res.json(stripScoreRecursively(responseData));
+    const scoredResponse = applySpecScoreToRow(
+      product.product_type || "smartphone",
+      stripScoreRecursively(responseData),
+      profileConfig.profiles,
+    );
+
+    res.json(scoredResponse);
   } catch (err) {
     console.error("GET /api/public/product/:id error:", err);
     res.status(500).json({ error: err.message });
