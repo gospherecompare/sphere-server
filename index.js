@@ -10303,6 +10303,474 @@ app.get("/api/variant/:id/store-prices", async (req, res) => {
   }
 });
 
+const SMARTPHONE_DISCOVERY_BUDGET_SEGMENTS = [
+  { key: "under_10000", label: "Under ₹10,000", path: "/smartphones/filter/under-10000" },
+  { key: "under_15000", label: "Under ₹15,000", path: "/smartphones/filter/under-15000" },
+  { key: "under_20000", label: "Under ₹20,000", path: "/smartphones/filter/under-20000" },
+  { key: "under_25000", label: "Under ₹25,000", path: "/smartphones/filter/under-25000" },
+  { key: "under_30000", label: "Under ₹30,000", path: "/smartphones/filter/under-30000" },
+  { key: "under_40000", label: "Under ₹40,000", path: "/smartphones/filter/under-40000" },
+  { key: "under_50000", label: "Under ₹50,000", path: "/smartphones/filter/under-50000" },
+  { key: "above_50000", label: "Above ₹50,000", path: "/smartphones/filter/above-50000" },
+];
+
+const toSafeNumeric = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const toProductSlug = (name, id) => {
+  const slug = String(name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+  return slug || `product-${id}`;
+};
+
+const toIsoDateOrNull = (value) => {
+  if (!value) return null;
+  const dt = new Date(value);
+  if (Number.isNaN(dt.getTime())) return null;
+  return dt.toISOString();
+};
+
+const mapDiscoveryProductRow = (row) => ({
+  id: Number(row.product_id),
+  name: row.name || row.product_name || "Device",
+  slug: toProductSlug(row.name || row.product_name, row.product_id),
+  brand_name: row.brand_name || null,
+  image_url: row.image_url || null,
+  price: toSafeNumeric(row.price),
+  launch_date: toIsoDateOrNull(row.launch_date || row.created_at),
+});
+
+// PUBLIC: Product discovery sections (rule-based and cached-friendly)
+app.get("/api/public/product/:id/discovery", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const brandLimitRaw = Number(req.query?.brand_limit);
+    const latestLimitRaw = Number(req.query?.latest_limit);
+    const brandHubLimitRaw = Number(req.query?.brand_hub_limit);
+    const smartLinksLimitRaw = Number(req.query?.smart_links_limit);
+
+    const brandLimit = Number.isFinite(brandLimitRaw)
+      ? Math.min(12, Math.max(1, Math.floor(brandLimitRaw)))
+      : 6;
+    const latestLimit = Number.isFinite(latestLimitRaw)
+      ? Math.min(12, Math.max(1, Math.floor(latestLimitRaw)))
+      : 8;
+    const brandHubLimit = Number.isFinite(brandHubLimitRaw)
+      ? Math.min(20, Math.max(4, Math.floor(brandHubLimitRaw)))
+      : 10;
+    const smartLinksLimit = Number.isFinite(smartLinksLimitRaw)
+      ? Math.min(12, Math.max(4, Math.floor(smartLinksLimitRaw)))
+      : 8;
+
+    const baseRes = await db.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name,
+        p.created_at,
+        p.brand_id,
+        b.name AS brand_name,
+        s.category,
+        s.launch_date,
+        COALESCE(
+          (
+            SELECT MIN(vsp.price)::numeric
+            FROM product_variants pv
+            INNER JOIN variant_store_prices vsp
+              ON vsp.variant_id = pv.id
+            WHERE pv.product_id = p.id
+              AND vsp.price IS NOT NULL
+          ),
+          (
+            SELECT MIN(pv.base_price)::numeric
+            FROM product_variants pv
+            WHERE pv.product_id = p.id
+              AND pv.base_price IS NOT NULL
+          )
+        ) AS price
+      FROM products p
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      LEFT JOIN smartphones s
+        ON s.product_id = p.id
+      WHERE p.id = $1
+        AND p.product_type = 'smartphone'
+      LIMIT 1
+      `,
+      [id],
+    );
+
+    if (!baseRes.rows.length) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    const current = baseRes.rows[0];
+    const currentBrandId = Number(current.brand_id);
+    const currentBrandName = String(current.brand_name || "").trim();
+    const currentPrice = toSafeNumeric(current.price);
+
+    let newFromBrandRows = [];
+    if (Number.isInteger(currentBrandId) && currentBrandId > 0) {
+      const brandRecentRes = await db.query(
+        `
+        SELECT
+          p.id AS product_id,
+          p.name,
+          b.name AS brand_name,
+          s.launch_date,
+          p.created_at,
+          (
+            SELECT pi.image_url
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+            LIMIT 1
+          ) AS image_url,
+          COALESCE(
+            (
+              SELECT MIN(vsp.price)::numeric
+              FROM product_variants pv
+              INNER JOIN variant_store_prices vsp
+                ON vsp.variant_id = pv.id
+              WHERE pv.product_id = p.id
+                AND vsp.price IS NOT NULL
+            ),
+            (
+              SELECT MIN(pv.base_price)::numeric
+              FROM product_variants pv
+              WHERE pv.product_id = p.id
+                AND pv.base_price IS NOT NULL
+            )
+          ) AS price
+        FROM products p
+        INNER JOIN product_publish pub
+          ON pub.product_id = p.id
+         AND pub.is_published = true
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        LEFT JOIN smartphones s
+          ON s.product_id = p.id
+        WHERE p.product_type = 'smartphone'
+          AND p.brand_id = $2
+          AND p.id <> $1
+          AND COALESCE(s.launch_date, p.created_at::date) >= CURRENT_DATE - INTERVAL '18 months'
+        ORDER BY COALESCE(s.launch_date, p.created_at::date) DESC, p.id DESC
+        LIMIT $3
+        `,
+        [id, currentBrandId, brandLimit],
+      );
+
+      newFromBrandRows = brandRecentRes.rows || [];
+      if (!newFromBrandRows.length) {
+        const brandFallbackRes = await db.query(
+          `
+          SELECT
+            p.id AS product_id,
+            p.name,
+            b.name AS brand_name,
+            s.launch_date,
+            p.created_at,
+            (
+              SELECT pi.image_url
+              FROM product_images pi
+              WHERE pi.product_id = p.id
+              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+              LIMIT 1
+            ) AS image_url,
+            COALESCE(
+              (
+                SELECT MIN(vsp.price)::numeric
+                FROM product_variants pv
+                INNER JOIN variant_store_prices vsp
+                  ON vsp.variant_id = pv.id
+                WHERE pv.product_id = p.id
+                  AND vsp.price IS NOT NULL
+              ),
+              (
+                SELECT MIN(pv.base_price)::numeric
+                FROM product_variants pv
+                WHERE pv.product_id = p.id
+                  AND pv.base_price IS NOT NULL
+              )
+            ) AS price
+          FROM products p
+          INNER JOIN product_publish pub
+            ON pub.product_id = p.id
+           AND pub.is_published = true
+          LEFT JOIN brands b
+            ON b.id = p.brand_id
+          LEFT JOIN smartphones s
+            ON s.product_id = p.id
+          WHERE p.product_type = 'smartphone'
+            AND p.brand_id = $2
+            AND p.id <> $1
+          ORDER BY COALESCE(s.launch_date, p.created_at::date) DESC, p.id DESC
+          LIMIT $3
+          `,
+          [id, currentBrandId, brandLimit],
+        );
+        newFromBrandRows = brandFallbackRes.rows || [];
+      }
+    }
+
+    const latestRes = await db.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name,
+        b.name AS brand_name,
+        s.launch_date,
+        p.created_at,
+        (
+          SELECT pi.image_url
+          FROM product_images pi
+          WHERE pi.product_id = p.id
+          ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+          LIMIT 1
+        ) AS image_url,
+        COALESCE(
+          (
+            SELECT MIN(vsp.price)::numeric
+            FROM product_variants pv
+            INNER JOIN variant_store_prices vsp
+              ON vsp.variant_id = pv.id
+            WHERE pv.product_id = p.id
+              AND vsp.price IS NOT NULL
+          ),
+          (
+            SELECT MIN(pv.base_price)::numeric
+            FROM product_variants pv
+            WHERE pv.product_id = p.id
+              AND pv.base_price IS NOT NULL
+          )
+        ) AS price
+      FROM products p
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      LEFT JOIN smartphones s
+        ON s.product_id = p.id
+      WHERE p.product_type = 'smartphone'
+        AND p.id <> $1
+      ORDER BY COALESCE(s.launch_date, p.created_at::date) DESC, p.id DESC
+      LIMIT $2
+      `,
+      [id, latestLimit],
+    );
+
+    const budgetCountsRes = await db.query(
+      `
+      WITH priced AS (
+        SELECT
+          p.id,
+          COALESCE(
+            (
+              SELECT MIN(vsp.price)::numeric
+              FROM product_variants pv
+              INNER JOIN variant_store_prices vsp
+                ON vsp.variant_id = pv.id
+              WHERE pv.product_id = p.id
+                AND vsp.price IS NOT NULL
+            ),
+            (
+              SELECT MIN(pv.base_price)::numeric
+              FROM product_variants pv
+              WHERE pv.product_id = p.id
+                AND pv.base_price IS NOT NULL
+            )
+          ) AS price
+        FROM products p
+        INNER JOIN product_publish pub
+          ON pub.product_id = p.id
+         AND pub.is_published = true
+        WHERE p.product_type = 'smartphone'
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE price IS NOT NULL AND price <= 10000)::int AS under_10000,
+        COUNT(*) FILTER (WHERE price IS NOT NULL AND price <= 15000)::int AS under_15000,
+        COUNT(*) FILTER (WHERE price IS NOT NULL AND price <= 20000)::int AS under_20000,
+        COUNT(*) FILTER (WHERE price IS NOT NULL AND price <= 25000)::int AS under_25000,
+        COUNT(*) FILTER (WHERE price IS NOT NULL AND price <= 30000)::int AS under_30000,
+        COUNT(*) FILTER (WHERE price IS NOT NULL AND price <= 40000)::int AS under_40000,
+        COUNT(*) FILTER (WHERE price IS NOT NULL AND price <= 50000)::int AS under_50000,
+        COUNT(*) FILTER (WHERE price IS NOT NULL AND price > 50000)::int AS above_50000
+      FROM priced
+      `,
+    );
+
+    const budgetCounts = budgetCountsRes.rows?.[0] || {};
+    const budgetSegments = SMARTPHONE_DISCOVERY_BUDGET_SEGMENTS.map((segment) => ({
+      key: segment.key,
+      label: segment.label,
+      path: segment.path,
+      product_count: Number(budgetCounts[segment.key]) || 0,
+      active_for_current:
+        currentPrice != null
+          ? segment.key === "above_50000"
+            ? currentPrice > 50000
+            : currentPrice <= Number(segment.key.replace("under_", ""))
+          : false,
+    })).filter((item) => item.product_count > 0);
+
+    const brandHubRes = await db.query(
+      `
+      WITH view_counts AS (
+        SELECT product_id, COUNT(*)::int AS views_30d
+        FROM product_views
+        WHERE viewed_at >= now() - INTERVAL '30 days'
+        GROUP BY product_id
+      ),
+      brand_rollup AS (
+        SELECT
+          b.id AS brand_id,
+          b.name AS brand_name,
+          COUNT(DISTINCT p.id)::int AS product_count,
+          COALESCE(SUM(vc.views_30d), 0)::int AS views_30d
+        FROM brands b
+        INNER JOIN products p
+          ON p.brand_id = b.id
+         AND p.product_type = 'smartphone'
+        INNER JOIN product_publish pub
+          ON pub.product_id = p.id
+         AND pub.is_published = true
+        LEFT JOIN view_counts vc
+          ON vc.product_id = p.id
+        GROUP BY b.id, b.name
+      )
+      SELECT
+        brand_id,
+        brand_name,
+        product_count,
+        views_30d,
+        (views_30d * 2 + product_count)::int AS popularity_score
+      FROM brand_rollup
+      ORDER BY views_30d DESC, product_count DESC, brand_name ASC
+      LIMIT $1
+      `,
+      [brandHubLimit],
+    );
+
+    const brandHub = (brandHubRes.rows || []).map((row) => ({
+      brand_id: Number(row.brand_id),
+      brand_name: row.brand_name,
+      slug: String(row.brand_name || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, ""),
+      product_count: Number(row.product_count) || 0,
+      views_30d: Number(row.views_30d) || 0,
+      popularity_score: Number(row.popularity_score) || 0,
+      is_current_brand:
+        currentBrandName &&
+        String(row.brand_name || "").toLowerCase() === currentBrandName.toLowerCase(),
+    }));
+
+    const nearestBudget = (() => {
+      if (currentPrice == null) return null;
+      if (currentPrice > 50000) {
+        return SMARTPHONE_DISCOVERY_BUDGET_SEGMENTS.find(
+          (segment) => segment.key === "above_50000",
+        );
+      }
+      for (const segment of SMARTPHONE_DISCOVERY_BUDGET_SEGMENTS) {
+        if (!segment.key.startsWith("under_")) continue;
+        const max = Number(segment.key.replace("under_", ""));
+        if (currentPrice <= max) return segment;
+      }
+      return null;
+    })();
+
+    const smartDiscoveriesRaw = [];
+    if (currentBrandName) {
+      const brandQuery = encodeURIComponent(currentBrandName);
+      smartDiscoveriesRaw.push({
+        key: "brand-latest",
+        label: `Latest ${currentBrandName} Phones`,
+        path: `/smartphones?brand=${brandQuery}&sort=latest`,
+      });
+      smartDiscoveriesRaw.push({
+        key: "brand-5g",
+        label: `${currentBrandName} 5G Phones`,
+        path: `/smartphones?brand=${brandQuery}&network=5G`,
+      });
+      if (nearestBudget) {
+        smartDiscoveriesRaw.push({
+          key: "brand-budget",
+          label: `${currentBrandName} ${nearestBudget.label}`,
+          path: `${nearestBudget.path}?brand=${brandQuery}`,
+        });
+      }
+    }
+    if (nearestBudget) {
+      smartDiscoveriesRaw.push({
+        key: "budget-nearby",
+        label: `Top Picks ${nearestBudget.label}`,
+        path: nearestBudget.path,
+      });
+    }
+    smartDiscoveriesRaw.push({
+      key: "trending",
+      label: "Trending Smartphones",
+      path: "/trending/smartphones",
+    });
+    smartDiscoveriesRaw.push({
+      key: "new-launches",
+      label: "Latest Smartphone Launches",
+      path: "/smartphones?filter=new",
+    });
+    smartDiscoveriesRaw.push({
+      key: "compare",
+      label: "Compare Smartphones",
+      path: "/compare",
+    });
+    smartDiscoveriesRaw.push({
+      key: "all-smartphones",
+      label: "Explore All Smartphones",
+      path: "/smartphones",
+    });
+
+    const seenSmartLinks = new Set();
+    const smartDiscoveries = [];
+    for (const item of smartDiscoveriesRaw) {
+      const key = `${item.label}|${item.path}`;
+      if (seenSmartLinks.has(key)) continue;
+      seenSmartLinks.add(key);
+      smartDiscoveries.push(item);
+      if (smartDiscoveries.length >= smartLinksLimit) break;
+    }
+
+    return res.json({
+      product_id: id,
+      product_name: current.name,
+      brand_name: currentBrandName || null,
+      generated_at: new Date().toISOString(),
+      sections: {
+        new_from_brand: newFromBrandRows.map(mapDiscoveryProductRow),
+        latest_releases: (latestRes.rows || []).map(mapDiscoveryProductRow),
+        budget_segments: budgetSegments,
+        brand_hub: brandHub,
+        smart_discoveries: smartDiscoveries,
+      },
+    });
+  } catch (err) {
+    console.error("GET /api/public/product/:id/discovery error:", err);
+    return res.status(500).json({ message: "Failed to load discovery sections" });
+  }
+});
+
 // PUBLIC: Product competitor cards (precomputed competitor_analysis)
 app.get("/api/public/product/:id/competitors", async (req, res) => {
   try {
