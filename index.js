@@ -10637,6 +10637,7 @@ app.get("/api/public/product/:id/discovery", async (req, res) => {
         SELECT
           b.id AS brand_id,
           b.name AS brand_name,
+          b.logo AS logo_url,
           COUNT(DISTINCT p.id)::int AS product_count,
           COALESCE(SUM(vc.views_30d), 0)::int AS views_30d
         FROM brands b
@@ -10648,11 +10649,12 @@ app.get("/api/public/product/:id/discovery", async (req, res) => {
          AND pub.is_published = true
         LEFT JOIN view_counts vc
           ON vc.product_id = p.id
-        GROUP BY b.id, b.name
+        GROUP BY b.id, b.name, b.logo
       )
       SELECT
         brand_id,
         brand_name,
+        logo_url,
         product_count,
         views_30d,
         (views_30d * 2 + product_count)::int AS popularity_score
@@ -10666,6 +10668,7 @@ app.get("/api/public/product/:id/discovery", async (req, res) => {
     const brandHub = (brandHubRes.rows || []).map((row) => ({
       brand_id: Number(row.brand_id),
       brand_name: row.brand_name,
+      logo_url: row.logo_url || null,
       slug: String(row.brand_name || "")
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "-")
