@@ -8,6 +8,7 @@
     "dev": "nodemon index.js",
     "recompute:hookscore": "node scripts/recomputeHookScores.js",
     "recompute:trending": "node scripts/recomputeTrendingScores.js",
+    "recompute:competitors": "node scripts/recomputeCompetitors.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

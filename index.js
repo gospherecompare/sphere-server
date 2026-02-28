@@ -21,6 +21,9 @@ const {
   buildCompareRanking,
   weightsToPercent,
 } = require("./utils/compareScoring");
+const {
+  recomputeSmartphoneCompetitorAnalysis,
+} = require("./utils/competitorAnalysis");
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
@@ -2254,6 +2257,27 @@ async function runMigrations() {
         compared_at TIMESTAMP DEFAULT now()
       );
       `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS competitor_analysis (
+        id SERIAL PRIMARY KEY,
+        product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        competitor_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        competition_score NUMERIC NOT NULL DEFAULT 0,
+        spec_similarity_score NUMERIC NOT NULL DEFAULT 0,
+        price_proximity_score NUMERIC NOT NULL DEFAULT 0,
+        compare_frequency_score NUMERIC NOT NULL DEFAULT 0,
+        reason TEXT,
+        analysis_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        computed_at TIMESTAMP DEFAULT now(),
+        UNIQUE (product_id, competitor_id)
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_competitor_analysis_product_score
+      ON competitor_analysis (product_id, competition_score DESC);
+    `);
 
     // Hook Dynamic Score (precomputed ranking signals)
     await safeQuery(`
@@ -8332,6 +8356,48 @@ app.post("/api/admin/trending/recompute", authenticate, async (req, res) => {
   }
 });
 
+// Recompute competitor analysis (admin) - designed for daily cron runs.
+app.post("/api/admin/competitors/recompute", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const body = req.body || {};
+    const limitRaw = Number(body.limit ?? req.query?.limit);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(10, Math.max(1, Math.floor(limitRaw)))
+      : 3;
+
+    const rawIds = Array.isArray(body.product_ids)
+      ? body.product_ids
+      : Array.isArray(body.productIds)
+        ? body.productIds
+        : [];
+
+    const productIds = Array.from(
+      new Set(
+        rawIds
+          .map((value) => Number(value))
+          .filter((value) => Number.isInteger(value) && value > 0),
+      ),
+    );
+
+    const result = await recomputeSmartphoneCompetitorAnalysis(db, {
+      limit,
+      productIds,
+    });
+
+    return res.json({
+      ok: true,
+      ...result,
+    });
+  } catch (err) {
+    console.error("POST /api/admin/competitors/recompute error:", err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // Admin: Inspect trending scores + signals (for debugging)
 app.get("/api/admin/trending", authenticate, async (req, res) => {
   try {
@@ -10237,6 +10303,179 @@ app.get("/api/variant/:id/store-prices", async (req, res) => {
   }
 });
 
+// PUBLIC: Product competitor cards (precomputed competitor_analysis)
+app.get("/api/public/product/:id/competitors", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid id" });
+
+    const limitRaw = Number(req.query?.limit);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(10, Math.max(1, Math.floor(limitRaw)))
+      : 3;
+
+    const productRes = await db.query(
+      `
+      SELECT p.id, p.name, p.product_type
+      FROM products p
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+      WHERE p.id = $1
+      LIMIT 1
+      `,
+      [id],
+    );
+
+    if (!productRes.rows.length) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    const product = productRes.rows[0];
+    if (product.product_type !== "smartphone") {
+      return res.status(400).json({
+        message: "Competitor cards are currently available for smartphones only",
+      });
+    }
+
+    const fetchRows = async () => {
+      const result = await db.query(
+        `
+        SELECT
+          ca.product_id,
+          ca.competitor_id,
+          ca.competition_score,
+          ca.spec_similarity_score,
+          ca.price_proximity_score,
+          ca.compare_frequency_score,
+          ca.reason,
+          ca.analysis_json,
+          ca.computed_at,
+          p.name,
+          b.name AS brand_name,
+          COALESCE(ds.hook_score, 0) AS hook_score,
+          (
+            SELECT pi.image_url
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+            LIMIT 1
+          ) AS image_url,
+          (
+            SELECT MIN(vsp.price)::numeric
+            FROM product_variants pv
+            INNER JOIN variant_store_prices vsp
+              ON vsp.variant_id = pv.id
+            WHERE pv.product_id = p.id
+              AND vsp.price IS NOT NULL
+          ) AS min_store_price,
+          (
+            SELECT MIN(pv.base_price)::numeric
+            FROM product_variants pv
+            WHERE pv.product_id = p.id
+              AND pv.base_price IS NOT NULL
+          ) AS min_base_price
+        FROM competitor_analysis ca
+        INNER JOIN products p
+          ON p.id = ca.competitor_id
+         AND p.product_type = 'smartphone'
+        INNER JOIN product_publish pub
+          ON pub.product_id = p.id
+         AND pub.is_published = true
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        LEFT JOIN product_dynamic_score ds
+          ON ds.product_id = p.id
+        WHERE ca.product_id = $1
+        ORDER BY ca.competition_score DESC, ca.competitor_id ASC
+        LIMIT $2
+        `,
+        [id, limit],
+      );
+      return result.rows || [];
+    };
+
+    let rows = await fetchRows();
+    if (!rows.length) {
+      try {
+        await recomputeSmartphoneCompetitorAnalysis(db, {
+          limit,
+          productIds: [id],
+        });
+      } catch (err) {
+        console.error("On-demand competitor recompute failed:", err);
+      }
+      rows = await fetchRows();
+    }
+
+    const toSafeNumber = (value, fallback = 0) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    };
+    const toOneDecimal = (value, fallback = 0) =>
+      Number(toSafeNumber(value, fallback).toFixed(1));
+
+    const competitors = rows.map((row) => {
+      const storePrice = Number(row.min_store_price);
+      const basePrice = Number(row.min_base_price);
+      const price = Number.isFinite(storePrice)
+        ? Number.isFinite(basePrice)
+          ? Math.min(storePrice, basePrice)
+          : storePrice
+        : Number.isFinite(basePrice)
+          ? basePrice
+          : null;
+
+      const analysis =
+        row.analysis_json && typeof row.analysis_json === "object"
+          ? row.analysis_json
+          : {};
+
+      return {
+        id: Number(row.competitor_id),
+        name: row.name,
+        brand_name: row.brand_name || null,
+        image_url: row.image_url || null,
+        price,
+        hook_score: toOneDecimal(row.hook_score, 0),
+        competition_score: toOneDecimal(row.competition_score, 0),
+        spec_similarity_score: toOneDecimal(row.spec_similarity_score, 0),
+        price_proximity_score: toOneDecimal(row.price_proximity_score, 0),
+        compare_frequency_score: toOneDecimal(row.compare_frequency_score, 0),
+        reason:
+          row.reason ||
+          (typeof analysis.reason === "string" ? analysis.reason : null) ||
+          "Similar price and specification profile",
+        advantages: Array.isArray(analysis.advantages)
+          ? analysis.advantages.slice(0, 3)
+          : [],
+        disadvantages: Array.isArray(analysis.disadvantages)
+          ? analysis.disadvantages.slice(0, 3)
+          : [],
+        common_features: Array.isArray(analysis.common_features)
+          ? analysis.common_features.slice(0, 3)
+          : [],
+        compare_count: Number(analysis.compare_count) || 0,
+      };
+    });
+
+    return res.json({
+      product_id: id,
+      product_name: product.name,
+      generated_at:
+        rows[0]?.computed_at != null
+          ? new Date(rows[0].computed_at).toISOString()
+          : new Date().toISOString(),
+      top_competitor: competitors[0] || null,
+      other_competitors: competitors.slice(1),
+      competitors,
+    });
+  } catch (err) {
+    console.error("GET /api/public/product/:id/competitors error:", err);
+    return res.status(500).json({ message: "Failed to load competitors" });
+  }
+});
+
 // PUBLIC: Get smartphone/product details by ID (no auth required)
 app.get("/api/public/product/:id", async (req, res) => {
   try {
@@ -10913,6 +11152,35 @@ async function start() {
       const timer = setInterval(run, intervalMs);
       if (typeof timer.unref === "function") timer.unref();
       console.log("Trending score cron enabled:", { intervalMs });
+    }
+
+    // Optional: periodically recompute smartphone competitor analysis.
+    // In production, prefer an external scheduler invoking the admin endpoint.
+    if (process.env.COMPETITOR_ANALYSIS_CRON_ENABLED === "true") {
+      const defaultMs = 24 * 60 * 60 * 1000; // daily
+      const intervalRaw = Number(process.env.COMPETITOR_ANALYSIS_CRON_INTERVAL_MS);
+      const intervalMs = Number.isFinite(intervalRaw)
+        ? Math.max(30 * 60 * 1000, Math.floor(intervalRaw))
+        : defaultMs;
+
+      const run = async () => {
+        try {
+          const limitRaw = Number(process.env.COMPETITOR_ANALYSIS_LIMIT);
+          const limit = Number.isFinite(limitRaw)
+            ? Math.min(10, Math.max(1, Math.floor(limitRaw)))
+            : 3;
+
+          const result = await recomputeSmartphoneCompetitorAnalysis(db, { limit });
+          console.log("Competitor analysis recompute:", result);
+        } catch (err) {
+          console.error("Competitor analysis recompute failed:", err);
+        }
+      };
+
+      void run();
+      const timer = setInterval(run, intervalMs);
+      if (typeof timer.unref === "function") timer.unref();
+      console.log("Competitor analysis cron enabled:", { intervalMs });
     }
   } catch (err) {
     console.error("Migrations failed:", err);
