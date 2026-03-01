@@ -10702,7 +10702,7 @@ app.get("/api/public/product/:id/discovery", async (req, res) => {
       smartDiscoveriesRaw.push({
         key: "brand-latest",
         label: `Latest ${currentBrandName} Phones`,
-        path: `/smartphones?brand=${brandQuery}&sort=latest`,
+        path: `/smartphones?brand=${brandQuery}&sort=newest`,
       });
       smartDiscoveriesRaw.push({
         key: "brand-5g",
