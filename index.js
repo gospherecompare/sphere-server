@@ -1325,6 +1325,25 @@ const toFiniteScore100 = (value) => {
   return Math.max(0, Math.min(100, n));
 };
 
+const mapScoreToDisplayBand = (
+  score,
+  minTarget = 80,
+  maxTarget = 98,
+  precision = 1,
+) => {
+  const normalized = toFiniteScore100(score);
+  if (normalized == null) return null;
+
+  const minValue = Number(minTarget);
+  const maxValue = Number(maxTarget);
+  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue) || maxValue <= minValue) {
+    return normalized;
+  }
+
+  const mapped = minValue + (normalized / 100) * (maxValue - minValue);
+  return Number(mapped.toFixed(precision));
+};
+
 const buildSpecScoreSource = (type, row) => {
   const item = toPlainObject(row);
   const normalizedType = normalizeProfileDeviceType(type || item.product_type);
@@ -1772,6 +1791,8 @@ const applySpecScoreToRow = (type, row, profiles) => {
   let specScorePrice = null;
   let specScorePriceBand = "unknown";
   let specFeatureCoverage = null;
+  let specScoreV2Display8098 = null;
+  let overallScoreV2Display8098 = null;
 
   if (normalizedType === "smartphone") {
     const v2 = computeSmartphoneRawSpecScoreV2(source, fieldProfile);
@@ -1783,6 +1804,8 @@ const applySpecScoreToRow = (type, row, profiles) => {
     specScorePrice = toFiniteNumberOrNull(v2.price);
     specScorePriceBand = v2.priceBand || "unknown";
     specFeatureCoverage = toFiniteNumberOrNull(v2.featureCoverage);
+    specScoreV2Display8098 = mapScoreToDisplayBand(specScoreV2);
+    overallScoreV2Display8098 = specScoreV2Display8098;
   }
 
   return {
@@ -1797,6 +1820,8 @@ const applySpecScoreToRow = (type, row, profiles) => {
     spec_score_v2_source: specScoreV2Source,
     overall_score_v2: overallScoreV2,
     overall_score_v2_source: overallScoreV2Source,
+    spec_score_v2_display_80_98: specScoreV2Display8098,
+    overall_score_v2_display_80_98: overallScoreV2Display8098,
     spec_score_price: specScorePrice,
     spec_score_price_band: specScorePriceBand,
     spec_score_feature_coverage: specFeatureCoverage,
@@ -1844,12 +1869,15 @@ const applySpecScoreToRows = (type, rows, profiles) => {
       const compressed = Number(
         (Math.pow(Math.max(0, Math.min(100, blended)) / 100, 1.06) * 100).toFixed(1),
       );
+      const display8098 = mapScoreToDisplayBand(compressed);
 
       updated.set(index, {
         spec_score_v2: compressed,
         overall_score_v2: compressed,
         spec_score_v2_source: "model_v2_segment_percentile",
         overall_score_v2_source: "model_v2_segment_percentile",
+        spec_score_v2_display_80_98: display8098,
+        overall_score_v2_display_80_98: display8098,
         spec_tier_v2: toSpecTier(compressed),
       });
     });
