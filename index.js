@@ -1407,16 +1407,32 @@ const applySpecScoreToRow = (type, row, profiles) => {
 
   const source = buildSpecScoreSource(type, row);
   const fieldProfile = resolveDeviceFieldProfileScore(type, source, profiles);
+
+  const providedSpecScore = toFiniteScore100(row.spec_score ?? row.specScore);
   const specScore =
-    toFiniteScore100(row.spec_score ?? row.specScore) ?? fieldProfile.score;
+    providedSpecScore != null ? providedSpecScore : fieldProfile.score;
+  const specScoreSource =
+    providedSpecScore != null ? "provided" : "profile_fallback";
+
+  const providedOverallScore = toFiniteScore100(
+    row.overall_score ?? row.overallScore,
+  );
   const overallScore =
-    toFiniteScore100(row.overall_score ?? row.overallScore) ?? specScore;
+    providedOverallScore != null ? providedOverallScore : specScore;
+  const overallScoreSource =
+    providedOverallScore != null
+      ? "provided"
+      : providedSpecScore != null
+        ? "derived_from_spec_score"
+        : "profile_fallback";
 
   return {
     ...row,
     field_profile: fieldProfile,
     spec_score: specScore,
+    spec_score_source: specScoreSource,
     overall_score: overallScore,
+    overall_score_source: overallScoreSource,
   };
 };
 
