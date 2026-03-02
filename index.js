@@ -11351,6 +11351,104 @@ app.get("/api/public/product/:id/competitors", async (req, res) => {
     };
     const toOneDecimal = (value, fallback = 0) =>
       Number(toSafeNumber(value, fallback).toFixed(1));
+    const toNullableOneDecimal = (value) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? Number(parsed.toFixed(1)) : null;
+    };
+
+    const competitorIds = rows
+      .map((row) => Number(row?.competitor_id))
+      .filter((value) => Number.isInteger(value) && value > 0);
+
+    let scoredByProductId = new Map();
+    if (competitorIds.length) {
+      const profileConfig = await readDeviceFieldProfilesConfig();
+      const scoreRes = await db.query(
+        `
+        SELECT
+          p.id AS product_id,
+          p.name,
+          p.product_type,
+
+          b.name AS brand_name,
+
+          s.category,
+          s.model,
+          s.launch_date,
+          s.colors,
+          s.build_design,
+          s.display,
+          s.performance,
+          s.camera,
+          s.battery,
+          s.connectivity,
+          s.network,
+          s.ports,
+          s.audio,
+          s.multimedia,
+          s.sensors,
+          s.created_at,
+
+          COALESCE(
+            json_agg(
+              DISTINCT jsonb_build_object(
+                'variant_id', v.id,
+                'ram', v.attributes->>'ram',
+                'storage', v.attributes->>'storage',
+                'base_price', v.base_price,
+                'store_prices', (
+                  SELECT COALESCE(
+                    json_agg(
+                      jsonb_build_object(
+                        'id', sp.id,
+                        'store_name', sp.store_name,
+                        'price', sp.price,
+                        'url', sp.url,
+                        'offer_text', sp.offer_text,
+                        'delivery_info', sp.delivery_info
+                      )
+                    ),
+                    '[]'::json
+                  )
+                  FROM variant_store_prices sp
+                  WHERE sp.variant_id = v.id
+                )
+              )
+            ) FILTER (WHERE v.id IS NOT NULL),
+            '[]'::json
+          ) AS variants
+        FROM products p
+        INNER JOIN smartphones s
+          ON s.product_id = p.id
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        LEFT JOIN product_variants v
+          ON v.product_id = p.id
+        WHERE p.product_type = 'smartphone'
+          AND p.id = ANY($1::int[])
+        GROUP BY
+          p.id, b.name,
+          s.category, s.model, s.launch_date,
+          s.colors, s.build_design, s.display, s.performance,
+          s.camera, s.battery, s.connectivity, s.network,
+          s.ports, s.audio, s.multimedia, s.sensors, s.created_at
+        `,
+        [competitorIds],
+      );
+
+      const scoredRows = applySpecScoreToRows(
+        "smartphone",
+        (scoreRes.rows || []).map((row) => {
+          const item = { ...(row || {}) };
+          return stripScoreRecursively(item);
+        }),
+        profileConfig?.profiles,
+      );
+
+      scoredByProductId = new Map(
+        scoredRows.map((row) => [Number(row?.product_id), row]),
+      );
+    }
 
     const competitors = rows.map((row) => {
       const storePrice = Number(row.min_store_price);
@@ -11367,6 +11465,7 @@ app.get("/api/public/product/:id/competitors", async (req, res) => {
         row.analysis_json && typeof row.analysis_json === "object"
           ? row.analysis_json
           : {};
+      const scored = scoredByProductId.get(Number(row.competitor_id)) || null;
 
       return {
         id: Number(row.competitor_id),
@@ -11379,6 +11478,33 @@ app.get("/api/public/product/:id/competitors", async (req, res) => {
         spec_similarity_score: toOneDecimal(row.spec_similarity_score, 0),
         price_proximity_score: toOneDecimal(row.price_proximity_score, 0),
         compare_frequency_score: toOneDecimal(row.compare_frequency_score, 0),
+        spec_score: toNullableOneDecimal(
+          scored?.spec_score ?? scored?.specScore ?? null,
+        ),
+        overall_score: toNullableOneDecimal(
+          scored?.overall_score ?? scored?.overallScore ?? null,
+        ),
+        spec_score_v2: toNullableOneDecimal(
+          scored?.spec_score_v2 ?? scored?.specScoreV2 ?? null,
+        ),
+        overall_score_v2: toNullableOneDecimal(
+          scored?.overall_score_v2 ?? scored?.overallScoreV2 ?? null,
+        ),
+        spec_score_v2_display_80_98: toNullableOneDecimal(
+          scored?.spec_score_v2_display_80_98 ??
+            scored?.specScoreV2Display8098 ??
+            null,
+        ),
+        overall_score_v2_display_80_98: toNullableOneDecimal(
+          scored?.overall_score_v2_display_80_98 ??
+            scored?.overallScoreV2Display8098 ??
+            null,
+        ),
+        overall_score_display: toNullableOneDecimal(
+          scored?.overall_score_v2_display_80_98 ??
+            scored?.overallScoreV2Display8098 ??
+            null,
+        ),
         reason:
           row.reason ||
           (typeof analysis.reason === "string" ? analysis.reason : null) ||
