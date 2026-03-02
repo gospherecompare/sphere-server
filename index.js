@@ -1402,10 +1402,348 @@ const buildSpecScoreSource = (type, row) => {
   };
 };
 
+const toFiniteNumberOrNull = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+const extractLargestNumber = (value) => {
+  if (value == null) return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const matches = String(value).match(/(\d+(?:\.\d+)?)/g);
+  if (!matches || !matches.length) return null;
+  const nums = matches.map((m) => Number(m)).filter((n) => Number.isFinite(n));
+  if (!nums.length) return null;
+  return Math.max(...nums);
+};
+
+const clampScore01 = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
+};
+
+const safePowNormalize = (value, min, max, power = 1.25) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const lo = Number(min);
+  const hi = Number(max);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+  const ratio = clampScore01((n - lo) / (hi - lo));
+  return Math.pow(ratio, power) * 100;
+};
+
+const safeLogNormalize = (value, min, max, power = 1.1) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const lo = Number(min);
+  const hi = Number(max);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+  const shifted = Math.max(lo, n);
+  const top = Math.log1p(hi - lo);
+  if (!Number.isFinite(top) || top <= 0) return null;
+  const ratio = clampScore01(Math.log1p(shifted - lo) / top);
+  return Math.pow(ratio, power) * 100;
+};
+
+const readSmartphonePrice = (source) => {
+  const directCandidates = [
+    source?.price,
+    source?.base_price,
+    source?.starting_price,
+    source?.min_store_price,
+    source?.min_base_price,
+  ];
+  for (const candidate of directCandidates) {
+    const parsed = toFiniteNumberOrNull(candidate);
+    if (parsed != null && parsed > 0) return parsed;
+  }
+
+  const variants = Array.isArray(source?.variants) ? source.variants : [];
+  const prices = [];
+  for (const variant of variants) {
+    const basePrice = toFiniteNumberOrNull(
+      variant?.base_price ?? variant?.price ?? variant?.amount,
+    );
+    if (basePrice != null && basePrice > 0) prices.push(basePrice);
+
+    const stores = Array.isArray(variant?.store_prices)
+      ? variant.store_prices
+      : [];
+    for (const store of stores) {
+      const storePrice = toFiniteNumberOrNull(store?.price ?? store?.amount);
+      if (storePrice != null && storePrice > 0) prices.push(storePrice);
+    }
+  }
+
+  if (!prices.length) return null;
+  return Math.min(...prices);
+};
+
+const readSmartphoneBatteryMah = (source) => {
+  const battery = toPlainObject(source?.battery);
+  const rawCandidates = [
+    battery?.battery_capacity_mah,
+    battery?.battery_capacity,
+    battery?.capacity_mah,
+    battery?.capacity,
+    battery?.battery,
+    source?.battery_capacity_mah,
+    source?.battery_capacity,
+  ];
+  for (const candidate of rawCandidates) {
+    const num = extractLargestNumber(candidate);
+    if (num != null && num >= 1000) return num;
+  }
+  return null;
+};
+
+const readSmartphoneChargingWatt = (source) => {
+  const battery = toPlainObject(source?.battery);
+  const rawCandidates = [
+    battery?.fast_charging,
+    battery?.charging_speed,
+    battery?.charging,
+    source?.fast_charging,
+  ];
+  for (const candidate of rawCandidates) {
+    const num = extractLargestNumber(candidate);
+    if (num != null && num >= 5) return num;
+  }
+  return null;
+};
+
+const readSmartphoneRefreshRateHz = (source) => {
+  const display = toPlainObject(source?.display);
+  const rawCandidates = [
+    display?.refresh_rate,
+    display?.refreshRate,
+    display?.hz,
+  ];
+  for (const candidate of rawCandidates) {
+    const num = extractLargestNumber(candidate);
+    if (num != null && num >= 30) return num;
+  }
+  return null;
+};
+
+const readSmartphoneMainCameraMp = (source) => {
+  const camera = toPlainObject(source?.camera);
+  const rear = toPlainObject(camera?.rear_camera);
+  const main = toPlainObject(
+    rear?.main_camera || rear?.main || rear?.primary || camera?.main || {},
+  );
+
+  const rawCandidates = [
+    camera?.main_camera_megapixels,
+    camera?.main_camera,
+    main?.resolution,
+    main?.megapixels,
+    rear?.main_camera_megapixels,
+  ];
+
+  for (const candidate of rawCandidates) {
+    const num = extractLargestNumber(candidate);
+    if (num != null && num >= 2) return num;
+  }
+  return null;
+};
+
+const readSmartphoneRamGb = (source) => {
+  const perf = toPlainObject(source?.performance);
+  const candidates = [perf?.ram, source?.ram];
+  for (const candidate of candidates) {
+    const num = extractLargestNumber(candidate);
+    if (num != null && num >= 1) return num;
+  }
+
+  const variants = Array.isArray(source?.variants) ? source.variants : [];
+  const values = variants
+    .map((variant) => extractLargestNumber(variant?.ram))
+    .filter((n) => n != null && n >= 1);
+  if (!values.length) return null;
+  return Math.max(...values);
+};
+
+const readSmartphoneStorageGb = (source) => {
+  const perf = toPlainObject(source?.performance);
+  const candidates = [perf?.storage, source?.storage];
+  for (const candidate of candidates) {
+    const num = extractLargestNumber(candidate);
+    if (num != null && num >= 8) return num;
+  }
+
+  const variants = Array.isArray(source?.variants) ? source.variants : [];
+  const values = variants
+    .map((variant) => extractLargestNumber(variant?.storage))
+    .filter((n) => n != null && n >= 8);
+  if (!values.length) return null;
+  return Math.max(...values);
+};
+
+const readSmartphoneProcessorTier = (source) => {
+  const text = String(
+    source?.performance?.processor ||
+      source?.processor ||
+      source?.performance_json?.processor ||
+      "",
+  )
+    .trim()
+    .toLowerCase();
+  if (!text) return null;
+
+  const rules = [
+    { pattern: /(snapdragon\s*8|dimensity\s*9|apple\s*a1[67-9]|apple\s*a2[0-9]|tensor\s*g[45]|exynos\s*24)/i, score: 98 },
+    { pattern: /(snapdragon\s*7|dimensity\s*8|apple\s*a1[4-6]|tensor\s*g[23]|exynos\s*14)/i, score: 84 },
+    { pattern: /(snapdragon\s*[46]|dimensity\s*[67]|helio\s*g9|apple\s*a1[12])/i, score: 68 },
+    { pattern: /(helio|unisoc|t6|g8)/i, score: 52 },
+  ];
+
+  for (const rule of rules) {
+    if (rule.pattern.test(text)) return rule.score;
+  }
+
+  return 60;
+};
+
+const getSmartphonePriceBand = (price) => {
+  const value = Number(price);
+  if (!Number.isFinite(value) || value <= 0) return "unknown";
+  if (value <= 10000) return "under_10000";
+  if (value <= 15000) return "under_15000";
+  if (value <= 20000) return "under_20000";
+  if (value <= 25000) return "under_25000";
+  if (value <= 30000) return "under_30000";
+  if (value <= 40000) return "under_40000";
+  if (value <= 50000) return "under_50000";
+  return "above_50000";
+};
+
+const getSmartphonePriceCeiling = (price) => {
+  const value = Number(price);
+  if (!Number.isFinite(value) || value <= 0) return 92;
+  if (value <= 12000) return 84;
+  if (value <= 18000) return 88;
+  if (value <= 25000) return 91;
+  if (value <= 35000) return 94;
+  if (value <= 50000) return 97;
+  return 100;
+};
+
+const toSpecTier = (score) => {
+  const value = Number(score);
+  if (!Number.isFinite(value)) return "Unrated";
+  if (value >= 90) return "Elite";
+  if (value >= 80) return "Premium";
+  if (value >= 70) return "Upper Mid";
+  if (value >= 60) return "Mid";
+  return "Entry";
+};
+
+const computeSmartphoneRawSpecScoreV2 = (source, fieldProfile) => {
+  const batteryMah = readSmartphoneBatteryMah(source);
+  const chargingW = readSmartphoneChargingWatt(source);
+  const refreshHz = readSmartphoneRefreshRateHz(source);
+  const cameraMp = readSmartphoneMainCameraMp(source);
+  const ramGb = readSmartphoneRamGb(source);
+  const storageGb = readSmartphoneStorageGb(source);
+  const processorTier = readSmartphoneProcessorTier(source);
+  const price = readSmartphonePrice(source);
+
+  const featureScores = {
+    processor: toFiniteScore100(processorTier),
+    display: safePowNormalize(refreshHz, 60, 165, 1.18),
+    camera: safeLogNormalize(cameraMp, 12, 200, 1.25),
+    battery: safeLogNormalize(batteryMah, 3000, 7500, 1.32),
+    charging: safeLogNormalize(chargingW, 10, 150, 1.2),
+    ram: safeLogNormalize(ramGb, 4, 24, 1.25),
+    storage: safeLogNormalize(storageGb, 64, 1024, 1.18),
+  };
+
+  const weights = {
+    processor: 0.28,
+    display: 0.18,
+    camera: 0.2,
+    battery: 0.17,
+    charging: 0.07,
+    ram: 0.06,
+    storage: 0.04,
+  };
+
+  let weightedTotal = 0;
+  let weightTotal = 0;
+  Object.entries(weights).forEach(([key, weight]) => {
+    const score = featureScores[key];
+    if (!Number.isFinite(score)) return;
+    weightedTotal += score * weight;
+    weightTotal += weight;
+  });
+
+  const profileScore = toFiniteScore100(fieldProfile?.score);
+  let rawScore = null;
+  let sourceKey = "model_v2_feature_raw";
+
+  if (weightTotal > 0) {
+    rawScore = weightedTotal / weightTotal;
+  } else if (profileScore != null) {
+    rawScore = profileScore;
+    sourceKey = "model_v2_profile_fallback";
+  }
+
+  if (rawScore == null) {
+    return {
+      rawScore: null,
+      source: "model_v2_unavailable",
+      price,
+      priceBand: getSmartphonePriceBand(price),
+      featureCoverage: 0,
+    };
+  }
+
+  const coverageRatio = clampScore01(weightTotal);
+  const completenessMultiplier = 0.8 + 0.2 * coverageRatio;
+  let adjusted = rawScore * completenessMultiplier;
+
+  if (price != null) {
+    adjusted = Math.min(adjusted, getSmartphonePriceCeiling(price));
+  }
+
+  const finalRawScore = Number(Math.max(0, Math.min(100, adjusted)).toFixed(1));
+
+  return {
+    rawScore: finalRawScore,
+    source: sourceKey,
+    price,
+    priceBand: getSmartphonePriceBand(price),
+    featureCoverage: Number((coverageRatio * 100).toFixed(1)),
+  };
+};
+
+const computePercentileScore = (value, sortedValues) => {
+  const n = Array.isArray(sortedValues) ? sortedValues.length : 0;
+  if (!n) return null;
+  if (n === 1) return 100;
+
+  const target = Number(value);
+  if (!Number.isFinite(target)) return null;
+
+  let countLessOrEqual = 0;
+  for (const item of sortedValues) {
+    if (item <= target) countLessOrEqual += 1;
+  }
+
+  const rank = Math.max(1, countLessOrEqual);
+  const percentile = ((rank - 1) / (n - 1)) * 100;
+  return Number(Math.max(0, Math.min(100, percentile)).toFixed(1));
+};
+
 const applySpecScoreToRow = (type, row, profiles) => {
   if (!row || typeof row !== "object" || Array.isArray(row)) return row;
 
   const source = buildSpecScoreSource(type, row);
+  const normalizedType = normalizeProfileDeviceType(type || source?.product_type);
   const fieldProfile = resolveDeviceFieldProfileScore(type, source, profiles);
 
   const providedSpecScore = toFiniteScore100(row.spec_score ?? row.specScore);
@@ -1426,6 +1764,27 @@ const applySpecScoreToRow = (type, row, profiles) => {
         ? "derived_from_spec_score"
         : "profile_fallback";
 
+  let specScoreV2 = null;
+  let specScoreV2Source = "model_v2_unavailable";
+  let overallScoreV2 = null;
+  let overallScoreV2Source = "model_v2_unavailable";
+  let specScoreV2Raw = null;
+  let specScorePrice = null;
+  let specScorePriceBand = "unknown";
+  let specFeatureCoverage = null;
+
+  if (normalizedType === "smartphone") {
+    const v2 = computeSmartphoneRawSpecScoreV2(source, fieldProfile);
+    specScoreV2 = toFiniteScore100(v2.rawScore);
+    specScoreV2Raw = specScoreV2;
+    specScoreV2Source = v2.source;
+    overallScoreV2 = specScoreV2;
+    overallScoreV2Source = specScoreV2 != null ? "model_v2_raw" : "model_v2_unavailable";
+    specScorePrice = toFiniteNumberOrNull(v2.price);
+    specScorePriceBand = v2.priceBand || "unknown";
+    specFeatureCoverage = toFiniteNumberOrNull(v2.featureCoverage);
+  }
+
   return {
     ...row,
     field_profile: fieldProfile,
@@ -1433,11 +1792,74 @@ const applySpecScoreToRow = (type, row, profiles) => {
     spec_score_source: specScoreSource,
     overall_score: overallScore,
     overall_score_source: overallScoreSource,
+    spec_score_v2_raw: specScoreV2Raw,
+    spec_score_v2: specScoreV2,
+    spec_score_v2_source: specScoreV2Source,
+    overall_score_v2: overallScoreV2,
+    overall_score_v2_source: overallScoreV2Source,
+    spec_score_price: specScorePrice,
+    spec_score_price_band: specScorePriceBand,
+    spec_score_feature_coverage: specFeatureCoverage,
+    spec_tier_v2: toSpecTier(specScoreV2),
   };
 };
 
-const applySpecScoreToRows = (type, rows, profiles) =>
-  (rows || []).map((row) => applySpecScoreToRow(type, row, profiles));
+const applySpecScoreToRows = (type, rows, profiles) => {
+  const normalizedType = normalizeProfileDeviceType(type);
+  const scoredRows = (rows || []).map((row) => applySpecScoreToRow(type, row, profiles));
+
+  if (normalizedType !== "smartphone" || scoredRows.length === 0) {
+    return scoredRows;
+  }
+
+  const bandBuckets = new Map();
+  scoredRows.forEach((row, index) => {
+    const raw = toFiniteScore100(row?.spec_score_v2_raw);
+    if (raw == null) return;
+
+    const sourceKey = String(row?.spec_score_v2_source || "").toLowerCase();
+    if (sourceKey.includes("fallback") || sourceKey.includes("unavailable")) return;
+
+    const band = row?.spec_score_price_band || "unknown";
+    if (!bandBuckets.has(band)) bandBuckets.set(band, []);
+    bandBuckets.get(band).push({ index, raw });
+  });
+
+  const updated = new Map();
+  for (const [, bucket] of bandBuckets.entries()) {
+    if (!Array.isArray(bucket) || bucket.length < 8) continue;
+
+    const sortedValues = bucket
+      .map((item) => item.raw)
+      .filter((value) => Number.isFinite(value))
+      .sort((a, b) => a - b);
+
+    if (!sortedValues.length) continue;
+
+    bucket.forEach(({ index, raw }) => {
+      const percentile = computePercentileScore(raw, sortedValues);
+      if (percentile == null) return;
+
+      const blended = Number((percentile * 0.68 + raw * 0.32).toFixed(1));
+      const compressed = Number(
+        (Math.pow(Math.max(0, Math.min(100, blended)) / 100, 1.06) * 100).toFixed(1),
+      );
+
+      updated.set(index, {
+        spec_score_v2: compressed,
+        overall_score_v2: compressed,
+        spec_score_v2_source: "model_v2_segment_percentile",
+        overall_score_v2_source: "model_v2_segment_percentile",
+        spec_tier_v2: toSpecTier(compressed),
+      });
+    });
+  }
+
+  return scoredRows.map((row, index) => {
+    const patch = updated.get(index);
+    return patch ? { ...row, ...patch } : row;
+  });
+};
 
 const BLOG_ALLOWED_PRODUCT_TYPES = new Set(["smartphone", "laptop", "tv"]);
 const BLOG_ALLOWED_STATUSES = new Set(["draft", "published"]);
