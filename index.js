@@ -1570,6 +1570,88 @@ const readSmartphoneMainCameraMp = (source) => {
   return null;
 };
 
+const readSmartphoneFrontCameraMp = (source) => {
+  const camera = toPlainObject(source?.camera);
+  const front = toPlainObject(camera?.front_camera);
+  const rawCandidates = [
+    camera?.front_camera_megapixels,
+    camera?.selfie_camera,
+    front?.resolution,
+    front?.megapixels,
+    front?.main_camera_megapixels,
+    camera?.front_camera,
+  ];
+
+  for (const candidate of rawCandidates) {
+    const num = extractLargestNumber(candidate);
+    if (num != null && num >= 2) return num;
+  }
+  return null;
+};
+
+const countSmartphoneRearCameraLenses = (source) => {
+  const camera = toPlainObject(source?.camera);
+  const rear = camera?.rear_camera;
+
+  if (rear && typeof rear === "object" && !Array.isArray(rear)) {
+    const count = Object.values(rear).filter((value) => profileHasValue(value)).length;
+    if (count > 0) return count;
+  }
+
+  if (Array.isArray(rear)) {
+    const count = rear.filter((value) => profileHasValue(value)).length;
+    if (count > 0) return count;
+  }
+
+  const fallbackKeys = [
+    "main_camera",
+    "main",
+    "primary",
+    "ultra_wide",
+    "ultra_wide_camera",
+    "telephoto",
+    "periscope",
+    "macro",
+    "depth",
+  ];
+  const fallbackCount = fallbackKeys.filter((key) => profileHasValue(camera?.[key])).length;
+  if (fallbackCount > 0) return fallbackCount;
+
+  const rearText = String(rear || camera?.main_camera || camera?.main || "");
+  const mpMentions = rearText.match(/(\d+(?:\.\d+)?)\s*mp/gi);
+  if (mpMentions?.length) return mpMentions.length;
+
+  return null;
+};
+
+const computeSmartphoneCameraRawScore = (source) => {
+  const mainMp = readSmartphoneMainCameraMp(source);
+  const frontMp = readSmartphoneFrontCameraMp(source);
+  const lensCount = countSmartphoneRearCameraLenses(source);
+
+  const rearScore = safeLogNormalize(mainMp, 8, 200, 0.95);
+  const lensScore = safePowNormalize(lensCount, 1, 4, 0.72);
+  const frontScore = safeLogNormalize(frontMp, 5, 60, 1.0);
+
+  const weightedParts = [
+    { score: rearScore, weight: 0.62 },
+    { score: lensScore, weight: 0.23 },
+    { score: frontScore, weight: 0.15 },
+  ].filter((part) => Number.isFinite(part.score));
+
+  if (!weightedParts.length) return null;
+
+  const totalWeight = weightedParts.reduce((sum, part) => sum + part.weight, 0);
+  if (!Number.isFinite(totalWeight) || totalWeight <= 0) return null;
+
+  const baseScore =
+    weightedParts.reduce((sum, part) => sum + part.score * part.weight, 0) / totalWeight;
+  const lensBoost = Number.isFinite(lensCount) ? Math.min(8, Math.max(0, lensCount - 1) * 2.5) : 0;
+  const boosted = Math.min(100, baseScore + 6 + lensBoost);
+
+  return toFiniteScore100(Number(boosted.toFixed(1)));
+};
+
 const readSmartphoneRamGb = (source) => {
   const perf = toPlainObject(source?.performance);
   const candidates = [perf?.ram, source?.ram];
@@ -1666,6 +1748,7 @@ const computeSmartphoneRawSpecScoreV2 = (source, fieldProfile) => {
   const chargingW = readSmartphoneChargingWatt(source);
   const refreshHz = readSmartphoneRefreshRateHz(source);
   const cameraMp = readSmartphoneMainCameraMp(source);
+  const cameraQuality = computeSmartphoneCameraRawScore(source);
   const ramGb = readSmartphoneRamGb(source);
   const storageGb = readSmartphoneStorageGb(source);
   const processorTier = readSmartphoneProcessorTier(source);
@@ -1674,7 +1757,9 @@ const computeSmartphoneRawSpecScoreV2 = (source, fieldProfile) => {
   const featureScores = {
     processor: toFiniteScore100(processorTier),
     display: safePowNormalize(refreshHz, 60, 165, 1.18),
-    camera: safeLogNormalize(cameraMp, 12, 200, 1.25),
+    camera:
+      toFiniteScore100(cameraQuality) ??
+      safeLogNormalize(cameraMp, 12, 200, 1.25),
     battery: safeLogNormalize(batteryMah, 3000, 7500, 1.32),
     charging: safeLogNormalize(chargingW, 10, 150, 1.2),
     ram: safeLogNormalize(ramGb, 4, 24, 1.25),
@@ -1682,11 +1767,11 @@ const computeSmartphoneRawSpecScoreV2 = (source, fieldProfile) => {
   };
 
   const weights = {
-    processor: 0.28,
-    display: 0.18,
-    camera: 0.2,
-    battery: 0.17,
-    charging: 0.07,
+    processor: 0.24,
+    display: 0.16,
+    camera: 0.3,
+    battery: 0.14,
+    charging: 0.06,
     ram: 0.06,
     storage: 0.04,
   };
@@ -1793,6 +1878,8 @@ const applySpecScoreToRow = (type, row, profiles) => {
   let specFeatureCoverage = null;
   let specScoreV2Display8098 = null;
   let overallScoreV2Display8098 = null;
+  let cameraScoreV2Raw = null;
+  let cameraScoreV2Display8099 = null;
 
   if (normalizedType === "smartphone") {
     const v2 = computeSmartphoneRawSpecScoreV2(source, fieldProfile);
@@ -1806,10 +1893,31 @@ const applySpecScoreToRow = (type, row, profiles) => {
     specFeatureCoverage = toFiniteNumberOrNull(v2.featureCoverage);
     specScoreV2Display8098 = mapScoreToDisplayBand(specScoreV2);
     overallScoreV2Display8098 = specScoreV2Display8098;
+
+    cameraScoreV2Raw = computeSmartphoneCameraRawScore(source);
+    cameraScoreV2Display8099 =
+      cameraScoreV2Raw != null ? mapScoreToDisplayBand(cameraScoreV2Raw, 80, 99) : null;
   }
+
+  const cameraWithScore =
+    cameraScoreV2Display8099 != null
+      ? {
+          ...toPlainObject(row.camera || source?.camera),
+          score: cameraScoreV2Display8099,
+        }
+      : row.camera;
+  const cameraJsonWithScore =
+    cameraScoreV2Display8099 != null
+      ? {
+          ...toPlainObject(row.camera_json || row.camera || source?.camera),
+          score: cameraScoreV2Display8099,
+        }
+      : row.camera_json;
 
   return {
     ...row,
+    camera: cameraWithScore,
+    camera_json: cameraJsonWithScore,
     field_profile: fieldProfile,
     spec_score: specScore,
     spec_score_source: specScoreSource,
@@ -1825,6 +1933,8 @@ const applySpecScoreToRow = (type, row, profiles) => {
     spec_score_price: specScorePrice,
     spec_score_price_band: specScorePriceBand,
     spec_score_feature_coverage: specFeatureCoverage,
+    camera_score_v2_raw: cameraScoreV2Raw,
+    camera_score_v2_display_80_99: cameraScoreV2Display8099,
     spec_tier_v2: toSpecTier(specScoreV2),
   };
 };
