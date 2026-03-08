@@ -215,6 +215,123 @@ const toPlainObject = (value) => {
   return value;
 };
 
+const INDIA_TIME_ZONE = "Asia/Kolkata";
+
+const getIndiaDateOnly = (value = new Date()) => {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: INDIA_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+
+  const tokens = {};
+  for (const part of parts) {
+    if (part.type !== "literal") tokens[part.type] = part.value;
+  }
+
+  if (!tokens.year || !tokens.month || !tokens.day) return null;
+  return `${tokens.year}-${tokens.month}-${tokens.day}`;
+};
+
+const normalizeDateOnlyInput = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+
+    const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (isoMatch) {
+      return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+    }
+
+    const dmyMatch = trimmed.match(/^(\d{1,2})[\s\/\-](\d{1,2})[\s\/\-](\d{4})$/);
+    if (dmyMatch) {
+      const day = String(Number(dmyMatch[1])).padStart(2, "0");
+      const month = String(Number(dmyMatch[2])).padStart(2, "0");
+      const year = dmyMatch[3];
+      return `${year}-${month}-${day}`;
+    }
+  }
+
+  const parsed = parseDateForImport(value);
+  return parsed ? String(parsed).slice(0, 10) : null;
+};
+
+const toOfferPriceNumber = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  const numeric =
+    typeof value === "number"
+      ? value
+      : Number(String(value).replace(/[^0-9.]/g, ""));
+  return Number.isFinite(numeric) ? numeric : null;
+};
+
+const decorateStorePriceAvailability = (
+  storePrice,
+  todayIndia = getIndiaDateOnly(),
+) => {
+  const item = toPlainObject(storePrice);
+  const saleStartDate = normalizeDateOnlyInput(
+    item.sale_start_date ??
+      item.sale_date ??
+      item.saleStartDate ??
+      item.saleDate ??
+      null,
+  );
+  const isPrebooking = Boolean(
+    saleStartDate && todayIndia && saleStartDate > todayIndia,
+  );
+
+  return {
+    ...item,
+    sale_start_date: saleStartDate,
+    availability_status: isPrebooking ? "prebooking" : "live",
+    is_prebooking: isPrebooking,
+    is_live: !isPrebooking,
+    cta_label: isPrebooking ? "Prebook" : "Buy Now",
+  };
+};
+
+const decorateStorePriceList = (storePrices, todayIndia = getIndiaDateOnly()) =>
+  (Array.isArray(storePrices) ? storePrices : []).map((storePrice) =>
+    decorateStorePriceAvailability(storePrice, todayIndia),
+  );
+
+const resolveEffectiveSmartphonePrice = (variants, fallbackPrice = null) => {
+  const livePrices = [];
+  const prebookingPrices = [];
+  const basePrices = [];
+
+  for (const variant of Array.isArray(variants) ? variants : []) {
+    const variantObj = toPlainObject(variant);
+    const basePrice = toOfferPriceNumber(
+      variantObj.base_price ?? variantObj.price ?? null,
+    );
+    if (basePrice !== null) basePrices.push(basePrice);
+
+    const storePrices = decorateStorePriceList(
+      variantObj.store_prices ?? variantObj.storePrices ?? [],
+    );
+    for (const store of storePrices) {
+      const price = toOfferPriceNumber(store.price);
+      if (price === null) continue;
+      if (store.is_prebooking) prebookingPrices.push(price);
+      else livePrices.push(price);
+    }
+  }
+
+  if (livePrices.length) return Math.min(...livePrices);
+  if (prebookingPrices.length) return Math.min(...prebookingPrices);
+  if (basePrices.length) return Math.min(...basePrices);
+
+  return toOfferPriceNumber(fallbackPrice);
+};
+
 const hasOwn = (obj, key) =>
   Object.prototype.hasOwnProperty.call(obj || {}, key);
 
@@ -2613,10 +2730,14 @@ async function runMigrations() {
         url TEXT,
         offer_text TEXT,
         delivery_info TEXT,
+        sale_start_date DATE,
         created_at TIMESTAMP DEFAULT now(),
         UNIQUE (variant_id, store_name)
       );
     `);
+    await safeQuery(
+      `ALTER TABLE variant_store_prices ADD COLUMN IF NOT EXISTS sale_start_date DATE;`,
+    );
 
     // 8) smartphone_publish (depends on smartphones)
 
@@ -5027,13 +5148,14 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
         await client.query(
           `
           INSERT INTO variant_store_prices
-            (variant_id, store_name, price, url, offer_text)
-          VALUES ($1,$2,$3,$4,$5)
+            (variant_id, store_name, price, url, offer_text, sale_start_date)
+          VALUES ($1,$2,$3,$4,$5,$6)
           ON CONFLICT (variant_id, store_name)
           DO UPDATE SET
             price = EXCLUDED.price,
             url = EXCLUDED.url,
-            offer_text = EXCLUDED.offer_text
+            offer_text = EXCLUDED.offer_text,
+            sale_start_date = EXCLUDED.sale_start_date
           `,
           [
             variantId,
@@ -5041,6 +5163,9 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
             sp.price || null,
             sp.url || null,
             sp.offer_text || null,
+            normalizeDateOnlyInput(
+              sp.sale_start_date ?? sp.sale_date ?? sp.saleStartDate ?? null,
+            ),
           ],
         );
       }
@@ -5120,6 +5245,8 @@ app.get("/api/smartphones", async (req, res) => {
         p.product_type,
 
         b.name AS brand_name,
+        b.logo AS brand_logo,
+        b.logo AS brand_logo,
 
         s.category,
         s.model,
@@ -5172,7 +5299,8 @@ app.get("/api/smartphones", async (req, res) => {
                       'price', sp.price,
                       'url', sp.url,
                       'offer_text', sp.offer_text,
-                      'delivery_info', sp.delivery_info
+                      'delivery_info', sp.delivery_info,
+                      'sale_start_date', sp.sale_start_date
                     )
                   ),
                   '[]'::json
@@ -5206,7 +5334,7 @@ app.get("/api/smartphones", async (req, res) => {
       WHERE p.product_type = 'smartphone'
  
       GROUP BY
-        p.id, b.name,
+        p.id, b.name, b.logo,
         s.category, s.model, s.launch_date,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
@@ -5219,6 +5347,16 @@ app.get("/api/smartphones", async (req, res) => {
       "smartphone",
       (result.rows || []).map((row) => {
         const item = { ...(row || {}) };
+        const variants = (Array.isArray(item.variants) ? item.variants : []).map(
+          (variant) => ({
+            ...toPlainObject(variant),
+            store_prices: decorateStorePriceList(
+              toPlainObject(variant).store_prices || [],
+            ),
+          }),
+        );
+        item.variants = variants;
+        item.price = resolveEffectiveSmartphonePrice(variants, item.price ?? null);
         return stripScoreRecursively(item);
       }),
       profileConfig.profiles,
@@ -5289,7 +5427,8 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
                       'price', sp.price,
                       'url', sp.url,
                       'offer_text', sp.offer_text,
-                      'delivery_info', sp.delivery_info
+                      'delivery_info', sp.delivery_info,
+                      'sale_start_date', sp.sale_start_date
                     )
                   ),
                   '[]'::json
@@ -5319,7 +5458,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
       WHERE p.product_type = 'smartphone'
 
       GROUP BY
-        p.id, b.name,
+        p.id, b.name, b.logo,
         s.category, s.model, s.launch_date,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
@@ -5330,9 +5469,20 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
 
     const smartphones = applySpecScoreToRows(
       "smartphone",
-      (result.rows || []).map((row) =>
-        stripScoreRecursively(row || {}),
-      ),
+      (result.rows || []).map((row) => {
+        const item = { ...(row || {}) };
+        const variants = (Array.isArray(item.variants) ? item.variants : []).map(
+          (variant) => ({
+            ...toPlainObject(variant),
+            store_prices: decorateStorePriceList(
+              toPlainObject(variant).store_prices || [],
+            ),
+          }),
+        );
+        item.variants = variants;
+        item.price = resolveEffectiveSmartphonePrice(variants, item.price ?? null);
+        return stripScoreRecursively(item);
+      }),
       profileConfig.profiles,
     );
 
@@ -5395,6 +5545,7 @@ app.get("/api/smartphone/:id", async (req, res) => {
     );
 
     const variants = [];
+    const todayIndia = getIndiaDateOnly();
     for (const v of variantsRes.rows) {
       const stores = await db.query(
         "SELECT * FROM variant_store_prices  WHERE variant_id = $1 ORDER BY id ASC",
@@ -5402,7 +5553,12 @@ app.get("/api/smartphone/:id", async (req, res) => {
       );
       const ram = v.attributes ? v.attributes.ram || null : null;
       const storage = v.attributes ? v.attributes.storage || null : null;
-      variants.push({ ...v, ram, storage, store_prices: stores.rows });
+      variants.push({
+        ...v,
+        ram,
+        storage,
+        store_prices: decorateStorePriceList(stores.rows, todayIndia),
+      });
     }
 
     // Sanitize response (remove internal ids)
@@ -7200,25 +7356,27 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 
       const priceUpsertSQL = `
         INSERT INTO variant_store_prices 
-          (id, variant_id, store_name, price, url, offer_text)
-        VALUES ($1,$2,$3,$4,$5,$6)
+          (id, variant_id, store_name, price, url, offer_text, sale_start_date)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
         ON CONFLICT (id)
         DO UPDATE SET
           store_name=EXCLUDED.store_name,
           price=EXCLUDED.price,
           url=EXCLUDED.url,
-          offer_text=EXCLUDED.offer_text;
+          offer_text=EXCLUDED.offer_text,
+          sale_start_date=EXCLUDED.sale_start_date;
       `;
 
       const insertPriceSQL = `
         INSERT INTO variant_store_prices 
-          (variant_id, store_name, price, url, offer_text)
-        VALUES ($1,$2,$3,$4,$5)
+          (variant_id, store_name, price, url, offer_text, sale_start_date)
+        VALUES ($1,$2,$3,$4,$5,$6)
         ON CONFLICT (variant_id, store_name)
         DO UPDATE SET
           price = EXCLUDED.price,
           url = EXCLUDED.url,
-          offer_text = EXCLUDED.offer_text
+          offer_text = EXCLUDED.offer_text,
+          sale_start_date = EXCLUDED.sale_start_date
         RETURNING id;
       `;
 
@@ -7317,6 +7475,9 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 
         const url = sp.url || null;
         const offer_text = sp.offer_text || sp.offer || null;
+        const sale_start_date = normalizeDateOnlyInput(
+          sp.sale_start_date ?? sp.sale_date ?? sp.saleStartDate ?? null,
+        );
 
         if (sp.id) {
           await client.query(priceUpsertSQL, [
@@ -7326,6 +7487,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
             price,
             url,
             offer_text,
+            sale_start_date,
           ]);
         } else {
           await client.query(insertPriceSQL, [
@@ -7334,6 +7496,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
             price,
             url,
             offer_text,
+            sale_start_date,
           ]);
         }
       }
@@ -9608,6 +9771,7 @@ const handleTrendingSmartphones = async (req, res) => {
         p.id AS product_id,
         p.name,
         b.name AS brand,
+        b.logo AS brand_logo,
         s.model,
         s.launch_date,
         s.display,
@@ -9709,6 +9873,7 @@ const handleTrendingSmartphones = async (req, res) => {
         p.id,
         p.name,
         b.name,
+        b.logo,
         s.model,
         s.launch_date,
         s.display,
@@ -9740,6 +9905,7 @@ const handleTrendingSmartphones = async (req, res) => {
         name: row.name,
         brand: row.brand || null,
         brand_name: row.brand || null,
+        brand_logo: row.brand_logo || null,
         model: row.model || null,
         launch_date: row.launch_date || null,
         display: row.display || null,
@@ -9783,6 +9949,38 @@ const handleTrendingSmartphones = async (req, res) => {
       })),
       profileConfig.profiles,
     );
+
+    for (const item of trending) {
+      const variantsRes = await db.query(
+        `SELECT id, variant_key, attributes->>'ram' AS ram, attributes->>'storage' AS storage, base_price
+         FROM product_variants
+         WHERE product_id = $1
+         ORDER BY id ASC`,
+        [item.product_id],
+      );
+
+      const variants = [];
+      const todayIndia = getIndiaDateOnly();
+      for (const variant of variantsRes.rows) {
+        const storesRes = await db.query(
+          "SELECT * FROM variant_store_prices WHERE variant_id = $1 ORDER BY price ASC NULLS LAST, id ASC",
+          [variant.id],
+        );
+        variants.push({
+          ...variant,
+          variant_id: variant.id,
+          store_prices: decorateStorePriceList(storesRes.rows, todayIndia),
+        });
+      }
+
+      const effectivePrice = resolveEffectiveSmartphonePrice(
+        variants,
+        item.starting_price ?? item.price ?? null,
+      );
+      item.variants = variants;
+      item.price = effectivePrice;
+      item.starting_price = effectivePrice;
+    }
 
     return res.json({
       success: true,
@@ -10278,6 +10476,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
         p.product_type,
         b.name AS brand,
         b.name AS brand_name,
+        b.logo AS brand_logo,
         s.model AS model,
         s.launch_date,
         s.display,
@@ -10317,6 +10516,38 @@ app.get("/api/public/new/smartphones", async (req, res) => {
       })),
       profileConfig.profiles,
     );
+
+    for (const item of launches) {
+      const variantsRes = await db.query(
+        `SELECT id, variant_key, attributes->>'ram' AS ram, attributes->>'storage' AS storage, base_price
+         FROM product_variants
+         WHERE product_id = $1
+         ORDER BY id ASC`,
+        [item.product_id],
+      );
+
+      const variants = [];
+      const todayIndia = getIndiaDateOnly();
+      for (const variant of variantsRes.rows) {
+        const storesRes = await db.query(
+          "SELECT * FROM variant_store_prices WHERE variant_id = $1 ORDER BY price ASC NULLS LAST, id ASC",
+          [variant.id],
+        );
+        variants.push({
+          ...variant,
+          variant_id: variant.id,
+          store_prices: decorateStorePriceList(storesRes.rows, todayIndia),
+        });
+      }
+
+      const effectivePrice = resolveEffectiveSmartphonePrice(
+        variants,
+        item.price ?? null,
+      );
+      item.variants = variants;
+      item.price = effectivePrice;
+      item.starting_price = effectivePrice;
+    }
 
     return res.json({ new: launches });
   } catch (err) {
@@ -10894,7 +11125,7 @@ app.get("/api/variant/:id/store-prices", async (req, res) => {
       "SELECT * FROM variant_store_prices  WHERE variant_id = $1 ORDER BY id ASC",
       [vid],
     );
-    return res.json(r.rows);
+    return res.json(decorateStorePriceList(r.rows));
   } catch (err) {
     console.error("GET variant store prices error:", err);
     return res.status(500).json({ error: err.message });
@@ -11682,7 +11913,7 @@ app.get("/api/public/product/:id", async (req, res) => {
 
     // Fetch product with all details
     const pRes = await db.query(
-      `SELECT p.id, p.name, p.product_type, b.name AS brand, b.id AS brand_id
+      `SELECT p.id, p.name, p.product_type, b.name AS brand, b.id AS brand_id, b.logo AS brand_logo
        FROM products p
        INNER JOIN product_publish pub
          ON pub.product_id = p.id
@@ -11720,6 +11951,18 @@ app.get("/api/public/product/:id", async (req, res) => {
        FROM product_variants WHERE product_id = $1 ORDER BY id ASC`,
       [id],
     );
+    const variants = [];
+    const todayIndia = getIndiaDateOnly();
+    for (const variant of varRes.rows) {
+      const storesRes = await db.query(
+        "SELECT * FROM variant_store_prices WHERE variant_id = $1 ORDER BY price ASC NULLS LAST, id ASC",
+        [variant.id],
+      );
+      variants.push({
+        ...variant,
+        store_prices: decorateStorePriceList(storesRes.rows, todayIndia),
+      });
+    }
 
     // For smartphones, fetch smartphone details
     let smartphoneDetails = null;
@@ -11748,8 +11991,9 @@ app.get("/api/public/product/:id", async (req, res) => {
       product_type: product.product_type,
       brand: product.brand,
       brand_id: product.brand_id,
+      brand_logo: product.brand_logo || null,
       images: imgRes.rows.map((r) => r.image_url),
-      variants: varRes,
+      variants,
       ...(product.product_type === "smartphone"
         ? {
             hook_score: score?.hook_score ?? null,
@@ -11763,6 +12007,12 @@ app.get("/api/public/product/:id", async (req, res) => {
       // Include the smartphone object as well for backward compatibility
       smartphone: smartphoneDetails,
     };
+
+    if (product.product_type === "smartphone") {
+      const effectivePrice = resolveEffectiveSmartphonePrice(variants);
+      responseData.price = effectivePrice;
+      responseData.starting_price = effectivePrice;
+    }
 
     const scoredResponse = applySpecScoreToRow(
       product.product_type || "smartphone",
