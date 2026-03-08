@@ -2316,7 +2316,7 @@ const fetchBlogProductSnapshot = async (
         p.product_type,
         b.name AS brand_name,
         b.logo AS brand_logo,
-        b.website AS brand_website,
+        (to_jsonb(b)->>'website') AS brand_website,
         COALESCE(ds.hook_score, 0) AS hook_score,
         COALESCE(ds.buyer_intent, 0) AS buyer_intent,
         COALESCE(ds.trend_velocity, 0) AS trend_velocity,
@@ -2550,6 +2550,11 @@ async function runMigrations() {
     await safeQuery(`
       ALTER TABLE brands
       ADD COLUMN IF NOT EXISTS description TEXT;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE brands
+      ADD COLUMN IF NOT EXISTS website TEXT;
     `);
 
     // categories
@@ -4777,6 +4782,7 @@ app.get("/api/brand", async (req, res) => {
         b.id,
         b.name,
         b.logo,
+        MAX(to_jsonb(b)->>'website') AS website,
         b.description,
         b.category,
         b.status,
@@ -5248,7 +5254,7 @@ app.get("/api/smartphones", async (req, res) => {
 
         b.name AS brand_name,
         b.logo AS brand_logo,
-        b.website AS brand_website,
+        MAX(to_jsonb(b)->>'website') AS brand_website,
 
         s.category,
         s.model,
@@ -5336,7 +5342,7 @@ app.get("/api/smartphones", async (req, res) => {
       WHERE p.product_type = 'smartphone'
  
       GROUP BY
-        p.id, b.name, b.logo, b.website,
+        p.id, b.name, b.logo,
         s.category, s.model, s.launch_date,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
@@ -5460,7 +5466,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
       WHERE p.product_type = 'smartphone'
 
       GROUP BY
-        p.id, b.name, b.logo, b.website,
+        p.id, b.name,
         s.category, s.model, s.launch_date,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
@@ -5540,7 +5546,7 @@ app.get("/api/smartphone/:id", async (req, res) => {
         p.name,
         p.brand_id,
         b.logo AS brand_logo,
-        b.website AS brand_website
+        (to_jsonb(b)->>'website') AS brand_website
       FROM products p
       LEFT JOIN brands b
         ON b.id = p.brand_id
@@ -8815,6 +8821,7 @@ app.get("/api/brands", async (req, res) => {
         b.id,
         b.name,
         b.logo,
+        MAX(to_jsonb(b)->>'website') AS website,
         b.description,
         b.category,
         b.status,
@@ -8849,18 +8856,19 @@ app.get("/api/brands", async (req, res) => {
 ------------------------*/
 app.post("/api/brands", authenticate, async (req, res) => {
   try {
-    const { name, logo, category, status, description } = req.body;
+    const { name, logo, category, status, description, website } = req.body;
     if (!name) {
       return res.status(400).json({ message: "Brand name required" });
     }
 
     const r = await db.query(
       `
-      INSERT INTO brands (name, logo, category, status, description)
-      VALUES ($1,$2,$3,$4,$5)
+      INSERT INTO brands (name, logo, category, status, description, website)
+      VALUES ($1,$2,$3,$4,$5,$6)
       ON CONFLICT (name) DO UPDATE
       SET logo = EXCLUDED.logo,
-          description = EXCLUDED.description
+          description = EXCLUDED.description,
+          website = EXCLUDED.website
       RETURNING *;
       `,
       [
@@ -8869,6 +8877,7 @@ app.post("/api/brands", authenticate, async (req, res) => {
         category || null,
         status || "active",
         description || null,
+        website || null,
       ],
     );
 
@@ -8884,7 +8893,7 @@ app.put("/api/brands/:id", authenticate, async (req, res) => {
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ message: "Invalid brand id" });
 
-    const { name, logo, category, status, description } = req.body;
+    const { name, logo, category, status, description, website } = req.body;
     const updates = [];
     const values = [];
     let idx = 1;
@@ -8895,6 +8904,7 @@ app.put("/api/brands/:id", authenticate, async (req, res) => {
       category,
       status,
       description,
+      website,
     })) {
       if (v !== undefined) {
         updates.push(`${k} = $${idx++}`);
@@ -9788,7 +9798,7 @@ const handleTrendingSmartphones = async (req, res) => {
         p.name,
         b.name AS brand,
         b.logo AS brand_logo,
-        b.website AS brand_website,
+        MAX(to_jsonb(b)->>'website') AS brand_website,
         s.model,
         s.launch_date,
         s.display,
@@ -9891,7 +9901,6 @@ const handleTrendingSmartphones = async (req, res) => {
         p.name,
         b.name,
         b.logo,
-        b.website,
         s.model,
         s.launch_date,
         s.display,
@@ -10496,7 +10505,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
         b.name AS brand,
         b.name AS brand_name,
         b.logo AS brand_logo,
-        b.website AS brand_website,
+        (to_jsonb(b)->>'website') AS brand_website,
         s.model AS model,
         s.launch_date,
         s.display,
@@ -11933,7 +11942,7 @@ app.get("/api/public/product/:id", async (req, res) => {
 
     // Fetch product with all details
     const pRes = await db.query(
-      `SELECT p.id, p.name, p.product_type, b.name AS brand, b.id AS brand_id, b.logo AS brand_logo, b.website AS brand_website
+      `SELECT p.id, p.name, p.product_type, b.name AS brand, b.id AS brand_id, b.logo AS brand_logo, (to_jsonb(b)->>'website') AS brand_website
        FROM products p
        INNER JOIN product_publish pub
          ON pub.product_id = p.id
