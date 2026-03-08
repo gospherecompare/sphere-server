@@ -4648,8 +4648,39 @@ app.post(
 );
 
 app.get("/api/brand", async (req, res) => {
-  const result = await db.query(`SELECT * FROM brands`);
-  res.json(result.rows);
+  try {
+    const result = await db.query(`
+      SELECT
+        b.id,
+        b.name,
+        b.logo,
+        b.description,
+        b.category,
+        b.status,
+        b.created_at,
+        COUNT(DISTINCT p.id)::int AS product_count,
+        COUNT(DISTINCT p.id) FILTER (WHERE pp.is_published = true)::int AS published_products
+      FROM brands b
+      LEFT JOIN products p
+        ON p.brand_id = b.id
+      LEFT JOIN product_publish pp
+        ON pp.product_id = p.id
+      GROUP BY
+        b.id,
+        b.name,
+        b.logo,
+        b.description,
+        b.category,
+        b.status,
+        b.created_at
+      ORDER BY b.name ASC
+    `);
+
+    res.json({ brands: result.rows });
+  } catch (err) {
+    console.error("GET /api/brand error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get("/api/public/products/:productId/ratings", async (req, res) => {
@@ -8599,25 +8630,6 @@ app.patch("/api/products/:id/publish", authenticate, async (req, res) => {
   Brands (categories)
 ------------------------*/
 app.get("/api/brands", async (req, res) => {
-  try {
-    const result = await db.query(`
-      SELECT
-        id,
-        name,
-        logo,
-        description
-      FROM brands
-      ORDER BY name ASC
-    `);
-
-    res.json({ brands: result.rows });
-  } catch (err) {
-    console.error("GET /api/brands error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/brand", authenticate, async (req, res) => {
   try {
     const result = await db.query(`
       SELECT
