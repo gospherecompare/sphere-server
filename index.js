@@ -293,7 +293,7 @@ const decorateStorePriceAvailability = (
     availability_status: isPrebooking ? "prebooking" : "live",
     is_prebooking: isPrebooking,
     is_live: !isPrebooking,
-    cta_label: isPrebooking ? "Prebook" : "Buy Now",
+    cta_label: isPrebooking ? "Preorder" : "Buy Now",
   };
 };
 
