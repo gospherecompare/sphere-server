@@ -2315,6 +2315,8 @@ const fetchBlogProductSnapshot = async (
         p.name,
         p.product_type,
         b.name AS brand_name,
+        b.logo AS brand_logo,
+        b.website AS brand_website,
         COALESCE(ds.hook_score, 0) AS hook_score,
         COALESCE(ds.buyer_intent, 0) AS buyer_intent,
         COALESCE(ds.trend_velocity, 0) AS trend_velocity,
@@ -5246,7 +5248,7 @@ app.get("/api/smartphones", async (req, res) => {
 
         b.name AS brand_name,
         b.logo AS brand_logo,
-        b.logo AS brand_logo,
+        b.website AS brand_website,
 
         s.category,
         s.model,
@@ -5334,7 +5336,7 @@ app.get("/api/smartphones", async (req, res) => {
       WHERE p.product_type = 'smartphone'
  
       GROUP BY
-        p.id, b.name, b.logo,
+        p.id, b.name, b.logo, b.website,
         s.category, s.model, s.launch_date,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
@@ -5458,7 +5460,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
       WHERE p.product_type = 'smartphone'
 
       GROUP BY
-        p.id, b.name, b.logo,
+        p.id, b.name, b.logo, b.website,
         s.category, s.model, s.launch_date,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
@@ -5534,11 +5536,23 @@ app.get("/api/smartphone/:id", async (req, res) => {
     const productId = smartphone.product_id;
     // Fetch product name from products table and include in response
     const prodRes = await db.query(
-      "SELECT name, brand_id FROM products WHERE id = $1 LIMIT 1",
+      `SELECT
+        p.name,
+        p.brand_id,
+        b.logo AS brand_logo,
+        b.website AS brand_website
+      FROM products p
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      WHERE p.id = $1
+      LIMIT 1`,
       [productId],
     );
     const productName = prodRes.rows[0] ? prodRes.rows[0].name : null;
     const productBrandId = prodRes.rows[0] ? prodRes.rows[0].brand_id : null;
+    const productBrandLogo = prodRes.rows[0] ? prodRes.rows[0].brand_logo : null;
+    const productBrandWebsite =
+      prodRes.rows[0] ? prodRes.rows[0].brand_website : null;
     const variantsRes = await db.query(
       "SELECT * FROM product_variants WHERE product_id = $1 ORDER BY id ASC",
       [productId],
@@ -5596,6 +5610,8 @@ app.get("/api/smartphone/:id", async (req, res) => {
 
     const sanitized = sanitize(smartphone, variants);
     sanitized.name = productName;
+    sanitized.brand_logo = productBrandLogo || null;
+    sanitized.brand_website = productBrandWebsite || null;
     sanitized.launch_date = smartphone.launch_date || null;
     sanitized.created_at = smartphone.created_at || null;
 
@@ -9772,6 +9788,7 @@ const handleTrendingSmartphones = async (req, res) => {
         p.name,
         b.name AS brand,
         b.logo AS brand_logo,
+        b.website AS brand_website,
         s.model,
         s.launch_date,
         s.display,
@@ -9874,6 +9891,7 @@ const handleTrendingSmartphones = async (req, res) => {
         p.name,
         b.name,
         b.logo,
+        b.website,
         s.model,
         s.launch_date,
         s.display,
@@ -9906,6 +9924,7 @@ const handleTrendingSmartphones = async (req, res) => {
         brand: row.brand || null,
         brand_name: row.brand || null,
         brand_logo: row.brand_logo || null,
+        brand_website: row.brand_website || null,
         model: row.model || null,
         launch_date: row.launch_date || null,
         display: row.display || null,
@@ -10477,6 +10496,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
         b.name AS brand,
         b.name AS brand_name,
         b.logo AS brand_logo,
+        b.website AS brand_website,
         s.model AS model,
         s.launch_date,
         s.display,
@@ -11913,7 +11933,7 @@ app.get("/api/public/product/:id", async (req, res) => {
 
     // Fetch product with all details
     const pRes = await db.query(
-      `SELECT p.id, p.name, p.product_type, b.name AS brand, b.id AS brand_id, b.logo AS brand_logo
+      `SELECT p.id, p.name, p.product_type, b.name AS brand, b.id AS brand_id, b.logo AS brand_logo, b.website AS brand_website
        FROM products p
        INNER JOIN product_publish pub
          ON pub.product_id = p.id
@@ -11992,6 +12012,7 @@ app.get("/api/public/product/:id", async (req, res) => {
       brand: product.brand,
       brand_id: product.brand_id,
       brand_logo: product.brand_logo || null,
+      brand_website: product.brand_website || null,
       images: imgRes.rows.map((r) => r.image_url),
       variants,
       ...(product.product_type === "smartphone"
