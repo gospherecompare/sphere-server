@@ -8625,14 +8625,24 @@ app.get("/api/brand", authenticate, async (req, res) => {
         b.name,
         b.logo,
         b.description,
-        COUNT(pp.product_id) AS published_products
+        b.category,
+        b.status,
+        b.created_at,
+        COUNT(DISTINCT p.id)::int AS product_count,
+        COUNT(DISTINCT p.id) FILTER (WHERE pp.is_published = true)::int AS published_products
       FROM brands b
       LEFT JOIN products p
         ON p.brand_id = b.id
       LEFT JOIN product_publish pp
         ON pp.product_id = p.id
-       AND pp.is_published = true
-      GROUP BY b.id
+      GROUP BY
+        b.id,
+        b.name,
+        b.logo,
+        b.description,
+        b.category,
+        b.status,
+        b.created_at
       ORDER BY b.name ASC
     `);
 
