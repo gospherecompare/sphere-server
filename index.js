@@ -5363,10 +5363,35 @@ app.get("/api/smartphones", async (req, res) => {
       ORDER BY COALESCE(MAX(ds.hook_score), 0) DESC, p.id DESC;
     `);
 
+    const normalizeHookNumber = (value, fallback = null) => {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : fallback;
+    };
+    const toMillis = (value) => {
+      if (!value) return 0;
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+    };
+    const computeFallbackHookScore = (row) => {
+      const buyerIntent = normalizeHookNumber(row?.buyer_intent, 0);
+      const trendVelocity = normalizeHookNumber(row?.trend_velocity, 0);
+      const freshness = normalizeHookNumber(row?.freshness, 0);
+      return Number(
+        (buyerIntent * 0.6 + trendVelocity * 0.25 + freshness * 0.15).toFixed(2),
+      );
+    };
+
     const smartphones = applySpecScoreToRows(
       "smartphone",
       (result.rows || []).map((row) => {
         const item = { ...(row || {}) };
+        const hookScore = normalizeHookNumber(item.hook_score, null);
+        const buyerIntent = normalizeHookNumber(item.buyer_intent, 0);
+        const trendVelocity = normalizeHookNumber(item.trend_velocity, 0);
+        const freshness = normalizeHookNumber(item.freshness, 0);
+        const hookRankScore =
+          hookScore !== null ? hookScore : computeFallbackHookScore(item);
+
         const variants = (Array.isArray(item.variants) ? item.variants : []).map(
           (variant) => ({
             ...toPlainObject(variant),
@@ -5377,12 +5402,54 @@ app.get("/api/smartphones", async (req, res) => {
         );
         item.variants = variants;
         item.price = resolveEffectiveSmartphonePrice(variants, item.price ?? null);
+        item.hook_score = hookScore;
+        item.hookScore = hookScore;
+        item.Hookss_score = hookScore;
+        item.HookssScore = hookScore;
+        item.buyer_intent = buyerIntent;
+        item.buyerIntent = buyerIntent;
+        item.trend_velocity = trendVelocity;
+        item.trendVelocity = trendVelocity;
+        item.freshness = freshness;
+        item.hook_rank_score = hookRankScore;
+        item.hook_calculated_at = item.hook_calculated_at ?? null;
+        item.Hookss_calculated_at = item.hook_calculated_at;
         return stripScoreRecursively(item);
       }),
       profileConfig.profiles,
     );
 
-    res.json({ smartphones });
+    const sortedSmartphones = [...smartphones].sort((a, b) => {
+      const hookDelta =
+        normalizeHookNumber(b?.hook_rank_score, 0) -
+        normalizeHookNumber(a?.hook_rank_score, 0);
+      if (hookDelta !== 0) return hookDelta;
+
+      const buyerDelta =
+        normalizeHookNumber(b?.buyer_intent, 0) -
+        normalizeHookNumber(a?.buyer_intent, 0);
+      if (buyerDelta !== 0) return buyerDelta;
+
+      const velocityDelta =
+        normalizeHookNumber(b?.trend_velocity, 0) -
+        normalizeHookNumber(a?.trend_velocity, 0);
+      if (velocityDelta !== 0) return velocityDelta;
+
+      const freshnessDelta =
+        normalizeHookNumber(b?.freshness, 0) -
+        normalizeHookNumber(a?.freshness, 0);
+      if (freshnessDelta !== 0) return freshnessDelta;
+
+      const launchDateDelta = toMillis(b?.launch_date) - toMillis(a?.launch_date);
+      if (launchDateDelta !== 0) return launchDateDelta;
+
+      return (
+        normalizeHookNumber(b?.product_id, 0) -
+        normalizeHookNumber(a?.product_id, 0)
+      );
+    });
+
+    res.json({ smartphones: sortedSmartphones });
   } catch (err) {
     console.error("GET /api/smartphones error:", err);
     res.status(500).json({ error: err.message });
