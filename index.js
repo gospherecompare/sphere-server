@@ -64,6 +64,79 @@ app.use(helmet());
 app.use(express.json({ limit: "10kb" }));
 // Parse URL-encoded bodies (for form submissions)
 app.use(express.urlencoded({ extended: true }));
+
+const API_ALIAS_REWRITE_RULES = [
+  { alias: /^\/api\/x\/a$/i, target: "/api/smartphones" },
+  { alias: /^\/api\/x\/b$/i, target: "/api/networking" },
+  { alias: /^\/api\/x\/c$/i, target: "/api/laptops" },
+  { alias: /^\/api\/x\/d$/i, target: "/api/tvs" },
+  { alias: /^\/api\/x\/e$/i, target: "/api/brand" },
+  { alias: /^\/api\/x\/f$/i, target: "/api/category" },
+  { alias: /^\/api\/x\/g$/i, target: "/api/public/online-stores" },
+  { alias: /^\/api\/x\/h$/i, target: "/api/public/popular-features" },
+  { alias: /^\/api\/x\/i$/i, target: "/api/public/trending/smartphones" },
+  { alias: /^\/api\/x\/j$/i, target: "/api/public/trending/laptops" },
+  { alias: /^\/api\/x\/k$/i, target: "/api/public/trending/tvs" },
+  { alias: /^\/api\/x\/l$/i, target: "/api/public/trending/networking" },
+  { alias: /^\/api\/x\/m$/i, target: "/api/public/trending/most-compared" },
+  { alias: /^\/api\/x\/n$/i, target: "/api/public/trending/all" },
+  { alias: /^\/api\/x\/o$/i, target: "/api/public/new/smartphones" },
+  { alias: /^\/api\/x\/p$/i, target: "/api/public/new/laptops" },
+  { alias: /^\/api\/x\/q$/i, target: "/api/public/new/tvs" },
+  { alias: /^\/api\/x\/r$/i, target: "/api/public/new/networking" },
+  { alias: /^\/api\/x\/z$/i, target: "/api/public/feature-click" },
+  { alias: /^\/api\/x\/aa$/i, target: "/api/public/compare" },
+  { alias: /^\/api\/x\/ab$/i, target: "/api/public/compare/scores" },
+  { alias: /^\/api\/x\/ac$/i, target: "/api/public/compare/resolve" },
+  { alias: /^\/api\/x\/ad$/i, target: "/api/search" },
+  { alias: /^\/api\/x\/ae$/i, target: "/api/public/blogs" },
+  {
+    alias: /^\/api\/x\/ae\/([^/]+)$/i,
+    target: (m) => `/api/public/blogs/${m[1]}`,
+  },
+  {
+    alias: /^\/api\/x\/u\/([^/]+)$/i,
+    target: (m) => `/api/public/product/${m[1]}`,
+  },
+  {
+    alias: /^\/api\/x\/v\/([^/]+)\/view$/i,
+    target: (m) => `/api/public/product/${m[1]}/view`,
+  },
+  {
+    alias: /^\/api\/x\/w\/([^/]+)\/discovery$/i,
+    target: (m) => `/api/public/product/${m[1]}/discovery`,
+  },
+  {
+    alias: /^\/api\/x\/y\/([^/]+)\/competitors$/i,
+    target: (m) => `/api/public/product/${m[1]}/competitors`,
+  },
+  {
+    alias: /^\/api\/x\/ar\/([^/]+)\/ratings$/i,
+    target: (m) => `/api/public/products/${m[1]}/ratings`,
+  },
+];
+
+app.use((req, _res, next) => {
+  try {
+    const pathName = req.path || "";
+    for (const rule of API_ALIAS_REWRITE_RULES) {
+      const match = pathName.match(rule.alias);
+      if (!match) continue;
+
+      const rewritten =
+        typeof rule.target === "function" ? rule.target(match) : rule.target;
+      if (!rewritten) break;
+
+      const qIndex = req.url.indexOf("?");
+      const query = qIndex >= 0 ? req.url.slice(qIndex) : "";
+      req.url = `${rewritten}${query}`;
+      break;
+    }
+  } catch {
+    // ignore alias rewrite failures
+  }
+  next();
+});
 // Apply XSS sanitization after body and query parsers. Use the underlying
 // `clean` function and avoid reassigning `req.query` if it's getter-only.
 app.use(function xssSafe(req, res, next) {
@@ -335,7 +408,55 @@ const resolveEffectiveSmartphonePrice = (variants, fallbackPrice = null) => {
 const hasOwn = (obj, key) =>
   Object.prototype.hasOwnProperty.call(obj || {}, key);
 
-const isScoreLikeKey = (key) => String(key || "").toLowerCase() === "score";
+const INTERNAL_SCORE_METADATA_KEYS = new Set([
+  "field_profile",
+  "fieldprofile",
+  "spec_score_source",
+  "specscoresource",
+  "overall_score_source",
+  "overallscoresource",
+  "spec_score_v2_source",
+  "specscorev2source",
+  "overall_score_v2_source",
+  "overallscorev2source",
+  "spec_score_v2_raw",
+  "specscorev2raw",
+  "camera_score_v2_raw",
+  "camerascorev2raw",
+  "spec_score_price",
+  "specscoreprice",
+  "spec_score_price_band",
+  "specscorepriceband",
+  "spec_score_feature_coverage",
+  "specscorefeaturecoverage",
+  "hook_rank_score",
+  "hookrankscore",
+]);
+
+const isScoreLikeKey = (key) => {
+  const normalized = String(key || "").toLowerCase();
+  if (normalized === "score") return true;
+  if (INTERNAL_SCORE_METADATA_KEYS.has(normalized)) return true;
+
+  const isScoreMetadata =
+    normalized.includes("spec_score") ||
+    normalized.includes("overall_score") ||
+    normalized.includes("camera_score");
+
+  if (!isScoreMetadata) return false;
+
+  if (
+    normalized.endsWith("_source") ||
+    normalized.endsWith("_raw") ||
+    normalized.endsWith("_price") ||
+    normalized.includes("price_band") ||
+    normalized.includes("feature_coverage")
+  ) {
+    return true;
+  }
+
+  return false;
+};
 
 const toArray = (value) => {
   if (Array.isArray(value)) return value;
