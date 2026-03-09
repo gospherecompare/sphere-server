@@ -5467,6 +5467,11 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         p.product_type,
 
         b.name AS brand_name,
+        MAX(ds.hook_score) AS hook_score,
+        MAX(ds.buyer_intent) AS buyer_intent,
+        MAX(ds.trend_velocity) AS trend_velocity,
+        MAX(ds.freshness) AS freshness,
+        MAX(ds.calculated_at) AS hook_calculated_at,
 
         s.category,
         s.model,
@@ -5542,6 +5547,9 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
 
       LEFT JOIN product_variants v
         ON v.product_id = p.id
+
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
 
       WHERE p.product_type = 'smartphone'
 
@@ -10935,6 +10943,90 @@ app.get("/api/public/trending/all", async (req, res) => {
   }
 });
 
+app.get("/api/public/compare/resolve", async (req, res) => {
+  try {
+    const normalizeCompareSlug = (value) =>
+      String(value || "")
+        .toLowerCase()
+        .replace(/-price-in-india$/g, "")
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, "");
+
+    const leftSlug = normalizeCompareSlug(req.query?.left);
+    const rightSlug = normalizeCompareSlug(req.query?.right);
+    if (!leftSlug || !rightSlug) {
+      return res.status(400).json({ message: "left and right slugs are required" });
+    }
+
+    const requestedType = String(req.query?.type || "")
+      .trim()
+      .toLowerCase();
+    const allowedTypes = new Set(["smartphone", "laptop", "tv", "networking"]);
+    const typeFilter = allowedTypes.has(requestedType) ? requestedType : null;
+
+    const slugList = Array.from(new Set([leftSlug, rightSlug]));
+    const params = [slugList];
+    let typeWhere = "";
+    if (typeFilter) {
+      params.push(typeFilter);
+      typeWhere = "AND p.product_type = $2";
+    }
+
+    const result = await db.query(
+      `
+      SELECT q.product_id, q.product_name, q.product_type, q.slug
+      FROM (
+        SELECT
+          p.id AS product_id,
+          p.name AS product_name,
+          p.product_type,
+          regexp_replace(
+            regexp_replace(lower(coalesce(p.name, '')), '[^a-z0-9]+', '-', 'g'),
+            '(^-|-$)',
+            '',
+            'g'
+          ) AS slug
+        FROM products p
+        INNER JOIN product_publish pub
+          ON pub.product_id = p.id
+         AND pub.is_published = true
+        WHERE p.product_type IN ('smartphone', 'laptop', 'tv', 'networking')
+          ${typeWhere}
+      ) q
+      WHERE q.slug = ANY($1::text[])
+      ORDER BY q.product_id DESC
+      `,
+      params,
+    );
+
+    const bySlug = new Map();
+    for (const row of result.rows || []) {
+      const key = String(row.slug || "").trim();
+      if (!key || bySlug.has(key)) continue;
+      bySlug.set(key, row);
+    }
+
+    const left = bySlug.get(leftSlug) || null;
+    const right = bySlug.get(rightSlug) || null;
+    const matched = Boolean(
+      left &&
+        right &&
+        Number(left.product_id) !== Number(right.product_id) &&
+        String(left.product_type || "") === String(right.product_type || ""),
+    );
+
+    return res.json({
+      matched,
+      left,
+      right,
+      compare_path: matched ? `/compare/${left.slug}-vs-${right.slug}` : null,
+    });
+  } catch (err) {
+    console.error("GET /api/public/compare/resolve error:", err);
+    return res.status(500).json({ message: "Failed to resolve compare slugs" });
+  }
+});
+
 app.post("/api/public/compare/scores", async (req, res) => {
   try {
     const body = req.body || {};
@@ -11169,6 +11261,7 @@ app.get("/api/public/trending/most-compared", async (req, res) => {
       SELECT
         p1.id AS product_id,
         p1.name AS product_name,
+        p1.product_type AS product_type,
         (
           SELECT image_url
           FROM product_images
@@ -11178,6 +11271,7 @@ app.get("/api/public/trending/most-compared", async (req, res) => {
         ) AS product_image,
         p2.id AS compared_product_id,
         p2.name AS compared_product_name,
+        p2.product_type AS compared_product_type,
         (
           SELECT image_url
           FROM product_images
@@ -11198,7 +11292,7 @@ app.get("/api/public/trending/most-compared", async (req, res) => {
       WHERE pc.compared_at >= now() - INTERVAL '7 days'
         AND p1.product_type IN ('smartphone', 'laptop', 'tv')
         AND p2.product_type IN ('smartphone', 'laptop', 'tv')
-      GROUP BY p1.id, p1.name, p2.id, p2.name
+      GROUP BY p1.id, p1.name, p1.product_type, p2.id, p2.name, p2.product_type
       ORDER BY compare_count DESC
     `);
 
