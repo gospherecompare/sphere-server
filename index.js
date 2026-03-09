@@ -2686,6 +2686,7 @@ async function runMigrations() {
         brand TEXT,
         model TEXT,
         launch_date DATE,
+        official_preorder_url TEXT,
         images JSONB,
         colors JSONB,
         build_design JSONB,
@@ -2709,6 +2710,9 @@ async function runMigrations() {
     );
     await safeQuery(
       `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS network JSONB;`,
+    );
+    await safeQuery(
+      `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS official_preorder_url TEXT;`,
     );
 
     // If older `connectivity_network` column exists, copy its data into `connectivity` (preserve existing connectivity)
@@ -5039,14 +5043,16 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
       `
       INSERT INTO smartphones (
         product_id, category, brand, model, launch_date,
+        official_preorder_url,
         images, colors, build_design, display, performance,
         camera, battery, connectivity, network,
         ports, audio, multimedia, sensors
       )
       VALUES (
         $1,$2,$3,$4,$5,
-        $6,$7,$8,$9,$10,
-        $11,$12,$13,$14,$15,$16,$17,$18
+        $6,
+        $7,$8,$9,$10,$11,
+        $12,$13,$14,$15,$16,$17,$18,$19
       )
       RETURNING id
       `,
@@ -5056,6 +5062,11 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
         smartphone.brand || null,
         smartphone.model || null,
         smartphone.launch_date || null,
+        smartphone.official_preorder_url ||
+          smartphone.officialPreorderUrl ||
+          req.body.official_preorder_url ||
+          req.body.officialPreorderUrl ||
+          null,
         JSON.stringify(images || []),
         JSON.stringify(smartphone.colors || []),
         JSON.stringify(smartphone.build_design || {}),
@@ -5259,6 +5270,7 @@ app.get("/api/smartphones", async (req, res) => {
         s.category,
         s.model,
         s.launch_date,
+        s.official_preorder_url,
         s.colors,
         s.build_design,
         s.display,
@@ -5343,7 +5355,7 @@ app.get("/api/smartphones", async (req, res) => {
  
       GROUP BY
         p.id, b.name, b.logo,
-        s.category, s.model, s.launch_date,
+        s.category, s.model, s.launch_date, s.official_preorder_url,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at
@@ -5392,6 +5404,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         s.category,
         s.model,
         s.launch_date,
+        s.official_preorder_url,
         s.colors,
         s.build_design,
         s.display,
@@ -5467,7 +5480,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
 
       GROUP BY
         p.id, b.name,
-        s.category, s.model, s.launch_date,
+        s.category, s.model, s.launch_date, s.official_preorder_url,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at, pub.is_published
@@ -7207,10 +7220,11 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     const updatePhoneSQL = `
       UPDATE smartphones SET
         category=$1, brand=$2, model=$3, launch_date=$4,
-        images=$5, colors=$6, build_design=$7, display=$8, performance=$9,
-        camera=$10, battery=$11, connectivity=$12, network=$13, ports=$14,
-        audio=$15, multimedia=$16, sensors=$17
-      WHERE id=$18
+        official_preorder_url=$5,
+        images=$6, colors=$7, build_design=$8, display=$9, performance=$10,
+        camera=$11, battery=$12, connectivity=$13, network=$14, ports=$15,
+        audio=$16, multimedia=$17, sensors=$18
+      WHERE id=$19
       RETURNING *;
     `;
 
@@ -7219,6 +7233,11 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       req.body.brand || null,
       req.body.model || null,
       parseDateForImport(req.body.launch_date),
+      req.body.official_preorder_url ||
+        req.body.officialPreorderUrl ||
+        req.body.smartphone?.official_preorder_url ||
+        req.body.smartphone?.officialPreorderUrl ||
+        null,
       JSON.stringify(req.body.images || []),
       JSON.stringify(req.body.colors || []),
       JSON.stringify(req.body.build_design || {}),
@@ -9801,6 +9820,7 @@ const handleTrendingSmartphones = async (req, res) => {
         MAX(to_jsonb(b)->>'website') AS brand_website,
         s.model,
         s.launch_date,
+        s.official_preorder_url,
         s.display,
         s.performance,
         s.camera,
@@ -9903,6 +9923,7 @@ const handleTrendingSmartphones = async (req, res) => {
         b.logo,
         s.model,
         s.launch_date,
+        s.official_preorder_url,
         s.display,
         s.performance,
         s.camera,
@@ -9934,6 +9955,7 @@ const handleTrendingSmartphones = async (req, res) => {
         brand_name: row.brand || null,
         brand_logo: row.brand_logo || null,
         brand_website: row.brand_website || null,
+        official_preorder_url: row.official_preorder_url || null,
         model: row.model || null,
         launch_date: row.launch_date || null,
         display: row.display || null,
@@ -10508,6 +10530,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
         (to_jsonb(b)->>'website') AS brand_website,
         s.model AS model,
         s.launch_date,
+        s.official_preorder_url,
         s.display,
         s.performance,
         s.camera,
