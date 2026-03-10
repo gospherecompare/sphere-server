@@ -3318,6 +3318,33 @@ async function runMigrations() {
       ON banners (is_published, start_at, end_at, priority);
     `);
 
+    // Ensure banner schedule columns are timestamptz for correct timezone handling.
+    await safeQuery(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name='banners' AND column_name='start_at'
+            AND data_type='timestamp without time zone'
+        ) THEN
+          ALTER TABLE banners
+          ALTER COLUMN start_at TYPE timestamptz
+          USING (start_at AT TIME ZONE 'UTC');
+        END IF;
+
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name='banners' AND column_name='end_at'
+            AND data_type='timestamp without time zone'
+        ) THEN
+          ALTER TABLE banners
+          ALTER COLUMN end_at TYPE timestamptz
+          USING (end_at AT TIME ZONE 'UTC');
+        END IF;
+      END
+      $$;
+    `);
+
     // Popular feature clicks (analytics) - aggregated per day
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS feature_click_stats (
