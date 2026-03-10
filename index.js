@@ -3287,6 +3287,37 @@ async function runMigrations() {
       ON blogs (product_id);
     `);
 
+    // Marketing banners (campaigns / promotions)
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS banners (
+        id SERIAL PRIMARY KEY,
+        title TEXT,
+        placement TEXT NOT NULL,
+        size_desktop TEXT,
+        size_tablet TEXT,
+        size_mobile TEXT,
+        media_url TEXT NOT NULL,
+        media_type TEXT,
+        link_url TEXT,
+        start_at TIMESTAMP,
+        end_at TIMESTAMP,
+        is_published BOOLEAN NOT NULL DEFAULT false,
+        priority INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT now(),
+        updated_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_banners_placement
+      ON banners (placement);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_banners_active
+      ON banners (is_published, start_at, end_at, priority);
+    `);
+
     // Popular feature clicks (analytics) - aggregated per day
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS feature_click_stats (
@@ -9164,6 +9195,292 @@ app.delete("/api/brands/:id", authenticate, async (req, res) => {
   } catch (err) {
     console.error("DELETE /api/brands/:id error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+/* -----------------------
+  Banners (marketing)
+------------------------*/
+app.get("/api/admin/banners", authenticate, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        b.*,
+        (
+          b.is_published = true
+          AND (b.start_at IS NULL OR b.start_at <= NOW())
+          AND (b.end_at IS NULL OR b.end_at >= NOW())
+        ) AS is_active,
+        (b.end_at IS NOT NULL AND b.end_at < NOW()) AS is_expired
+      FROM banners b
+      ORDER BY b.placement ASC, b.priority DESC, b.created_at DESC
+    `);
+
+    return res.json({ banners: result.rows });
+  } catch (err) {
+    console.error("GET /api/admin/banners error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/banners", authenticate, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const placement = String(body.placement || "").trim();
+    const media_url = String(body.media_url || body.mediaUrl || "").trim();
+
+    if (!placement) {
+      return res.status(400).json({ message: "placement is required" });
+    }
+    if (!media_url) {
+      return res.status(400).json({ message: "media_url is required" });
+    }
+
+    const allowedPlacements = new Set([
+      "top_leaderboard",
+      "right_sidebar",
+      "in_content",
+      "footer_leaderboard",
+      "mobile_sticky",
+    ]);
+    if (!allowedPlacements.has(placement)) {
+      return res.status(400).json({ message: "Invalid placement" });
+    }
+
+    const parseBool = (v) => {
+      if (v === true || v === false) return v;
+      if (v === 1 || v === 0) return Boolean(v);
+      if (v === null || v === undefined) return false;
+      const s = String(v).trim().toLowerCase();
+      if (["true", "1", "yes", "y", "on"].includes(s)) return true;
+      if (["false", "0", "no", "n", "off"].includes(s)) return false;
+      return false;
+    };
+
+    const title =
+      body.title === null || body.title === undefined
+        ? null
+        : String(body.title).trim();
+    const size_desktop =
+      body.size_desktop ?? body.sizeDesktop ?? body.desktop_size ?? null;
+    const size_tablet =
+      body.size_tablet ?? body.sizeTablet ?? body.tablet_size ?? null;
+    const size_mobile =
+      body.size_mobile ?? body.sizeMobile ?? body.mobile_size ?? null;
+    const media_type =
+      body.media_type ?? body.mediaType ?? body.format ?? null;
+    const link_url = body.link_url ?? body.linkUrl ?? body.url ?? null;
+    const start_at = body.start_at ?? body.startAt ?? null;
+    const end_at = body.end_at ?? body.endAt ?? null;
+    const is_published = parseBool(
+      body.is_published ?? body.isPublished ?? body.publish,
+    );
+    const priorityRaw = Number(body.priority ?? 0);
+    const priority = Number.isFinite(priorityRaw)
+      ? Math.max(0, Math.floor(priorityRaw))
+      : 0;
+
+    if (start_at && end_at) {
+      const startTime = new Date(start_at);
+      const endTime = new Date(end_at);
+      if (!Number.isNaN(startTime.getTime()) && !Number.isNaN(endTime.getTime())) {
+        if (endTime < startTime) {
+          return res
+            .status(400)
+            .json({ message: "end_at must be after start_at" });
+        }
+      }
+    }
+
+    const result = await db.query(
+      `
+      INSERT INTO banners (
+        title,
+        placement,
+        size_desktop,
+        size_tablet,
+        size_mobile,
+        media_url,
+        media_type,
+        link_url,
+        start_at,
+        end_at,
+        is_published,
+        priority
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      RETURNING *;
+      `,
+      [
+        title,
+        placement,
+        size_desktop,
+        size_tablet,
+        size_mobile,
+        media_url,
+        media_type,
+        link_url,
+        start_at,
+        end_at,
+        is_published,
+        priority,
+      ],
+    );
+
+    return res.json({ message: "Banner created", data: result.rows[0] });
+  } catch (err) {
+    console.error("POST /api/admin/banners error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/admin/banners/:id", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid banner id" });
+
+    const body = req.body || {};
+    const updates = [];
+    const values = [];
+    let idx = 1;
+
+    const allowedPlacements = new Set([
+      "top_leaderboard",
+      "right_sidebar",
+      "in_content",
+      "footer_leaderboard",
+      "mobile_sticky",
+    ]);
+
+    const pushUpdate = (field, value) => {
+      updates.push(`${field} = $${idx++}`);
+      values.push(value);
+    };
+
+    if (body.title !== undefined) pushUpdate("title", body.title);
+    if (body.placement !== undefined) {
+      const placement = String(body.placement || "").trim();
+      if (!allowedPlacements.has(placement)) {
+        return res.status(400).json({ message: "Invalid placement" });
+      }
+      pushUpdate("placement", placement);
+    }
+    if (body.size_desktop !== undefined) pushUpdate("size_desktop", body.size_desktop);
+    if (body.size_tablet !== undefined) pushUpdate("size_tablet", body.size_tablet);
+    if (body.size_mobile !== undefined) pushUpdate("size_mobile", body.size_mobile);
+    if (body.media_url !== undefined) pushUpdate("media_url", body.media_url);
+    if (body.media_type !== undefined) pushUpdate("media_type", body.media_type);
+    if (body.link_url !== undefined) pushUpdate("link_url", body.link_url);
+    if (body.start_at !== undefined) pushUpdate("start_at", body.start_at);
+    if (body.end_at !== undefined) pushUpdate("end_at", body.end_at);
+    if (body.priority !== undefined) {
+      const priorityRaw = Number(body.priority ?? 0);
+      const priority = Number.isFinite(priorityRaw)
+        ? Math.max(0, Math.floor(priorityRaw))
+        : 0;
+      pushUpdate("priority", priority);
+    }
+    if (body.is_published !== undefined) {
+      const v = body.is_published;
+      const parseBool = (val) => {
+        if (val === true || val === false) return val;
+        if (val === 1 || val === 0) return Boolean(val);
+        if (val === null || val === undefined) return false;
+        const s = String(val).trim().toLowerCase();
+        if (["true", "1", "yes", "y", "on"].includes(s)) return true;
+        if (["false", "0", "no", "n", "off"].includes(s)) return false;
+        return false;
+      };
+      pushUpdate("is_published", parseBool(v));
+    }
+
+    if (!updates.length) {
+      return res.status(400).json({ message: "No fields to update" });
+    }
+
+    updates.push(`updated_at = NOW()`);
+    values.push(id);
+
+    const result = await db.query(
+      `UPDATE banners SET ${updates.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values,
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Banner not found" });
+    }
+
+    return res.json({ message: "Banner updated", data: result.rows[0] });
+  } catch (err) {
+    console.error("PUT /api/admin/banners/:id error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/admin/banners/:id", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ message: "Invalid banner id" });
+
+    const result = await db.query("DELETE FROM banners WHERE id = $1", [id]);
+    if (!result.rowCount) {
+      return res.status(404).json({ message: "Banner not found" });
+    }
+
+    return res.json({ message: "Banner deleted" });
+  } catch (err) {
+    console.error("DELETE /api/admin/banners/:id error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/public/banners", async (req, res) => {
+  try {
+    const placement = req.query.placement
+      ? String(req.query.placement).trim()
+      : null;
+    const limitRaw = Number(req.query.limit ?? 0);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : null;
+
+    const params = [];
+    let where = `
+      WHERE b.is_published = true
+        AND (b.start_at IS NULL OR b.start_at <= NOW())
+        AND (b.end_at IS NULL OR b.end_at >= NOW())
+    `;
+    if (placement) {
+      params.push(placement);
+      where += ` AND b.placement = $${params.length}`;
+    }
+
+    const limitSql = limit ? ` LIMIT ${Math.min(50, Math.floor(limit))}` : "";
+
+    const result = await db.query(
+      `
+      SELECT
+        b.id,
+        b.title,
+        b.placement,
+        b.size_desktop,
+        b.size_tablet,
+        b.size_mobile,
+        b.media_url,
+        b.media_type,
+        b.link_url,
+        b.start_at,
+        b.end_at,
+        b.priority
+      FROM banners b
+      ${where}
+      ORDER BY b.priority DESC, b.created_at DESC
+      ${limitSql}
+      `,
+      params,
+    );
+
+    return res.json({ banners: result.rows });
+  } catch (err) {
+    console.error("GET /api/public/banners error:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
