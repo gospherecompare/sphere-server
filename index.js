@@ -8,7 +8,10 @@ const crypto = require("crypto");
 const ExcelJS = require("exceljs");
 const { client, db } = require("./db");
 const multer = require("multer");
-const { sendRegistrationMail } = require("./utils/mailer");
+const {
+  sendRegistrationMail,
+  sendCareerApplicationEmail,
+} = require("./utils/mailer");
 const { authenticateCustomer, authenticate } = require("./middleware/auth");
 const {
   recomputeProductDynamicScoreSmartphones,
@@ -4117,6 +4120,17 @@ app.post("/api/careers", async (req, res) => {
         b,
       ],
     );
+
+    try {
+      await sendCareerApplicationEmail({
+        email: email.toLowerCase(),
+        role,
+        firstName,
+        lastName,
+      });
+    } catch (mailErr) {
+      console.error("Career application email error:", mailErr);
+    }
 
     return res.status(201).json({
       message: "Application submitted successfully",
