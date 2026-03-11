@@ -297,8 +297,8 @@ const renderCareerApplicationTemplate = ({ role, firstName, lastName }) => {
               <td class="header-cell" style="background:linear-gradient(160deg,#1c1136 0%,#130e2a 100%);padding:26px 40px;border-bottom:none;">
                 <span style="display:inline-block;width:32px;height:32px;background:linear-gradient(135deg,#7b5ef8 0%,#5b8af7 100%);border-radius:7px;text-align:center;vertical-align:middle;margin-right:9px;line-height:32px;">
                   <span style="display:inline-block;vertical-align:middle;">
-                    <span style="display:inline-block;width:5px;height:12px;background:#fff;margin-right:1px;vertical-align:middle;"></span>
-                    <span style="display:inline-block;width:5px;height:12px;background:#fff;vertical-align:middle;"></span>
+                    <span style="display:inline-block;width:5px;height:12px; margin-top:-3px; background:#fff;margin-right:1px;vertical-align:middle;"></span>
+                    <span style="display:inline-block;width:5px;height:12px;margin-top:-3px;background:#fff;vertical-align:middle;"></span>
                   </span>
                 </span>
                 <span class="logo-text" style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:#ffffff;letter-spacing:-0.4px;vertical-align:middle;">Hooks</span>
