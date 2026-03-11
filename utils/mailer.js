@@ -280,96 +280,96 @@ const renderCareerApplicationTemplate = ({ role, firstName, lastName }) => {
   );
 
   return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Application Received</title>
-</head>
-<body style="margin:0;padding:0;background:#ffffff;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;padding:40px 12px 60px;">
-    <tbody><tr>
-      <td align="center">
-
-        <table role="presentation" class="wrapper" width="620" cellpadding="0" cellspacing="0" border="0" style="max-width:620px;width:100%;">
-
-          <tbody><tr>
-            <td class="header-cell" style="background:linear-gradient(160deg,#1c1136 0%,#130e2a 100%);padding:26px 40px;border:1px solid rgba(123,94,248,0.22);border-bottom:none;">
-              <span style="display:inline-block;width:32px;height:32px;background:linear-gradient(135deg,#7b5ef8 0%,#5b8af7 100%);border-radius:7px;text-align:center;vertical-align:middle;margin-right:9px;line-height:32px;">
-                <span style="display:inline-block;vertical-align:middle;">
-                  <span style="display:inline-block;width:5px;height:12px;background:#fff;margin-right:1px;vertical-align:middle;"></span>
-                  <span style="display:inline-block;width:5px;height:12px;background:#fff;vertical-align:middle;"></span>
+  <html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Application Received</title>
+  </head>
+  <body style="margin:0;padding:0;background:#ffffff;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:yellow;">
+      <tbody><tr>
+        <td align="center">
+  
+          <table role="presentation" class="wrapper" width="620" cellpadding="0" cellspacing="0" border="0" style="width:100%;">
+  
+            <tbody><tr>
+              <td class="header-cell" style="background:linear-gradient(160deg,#1c1136 0%,#130e2a 100%);padding:26px 40px;border-bottom:none;">
+                <span style="display:inline-block;width:32px;height:32px;background:linear-gradient(135deg,#7b5ef8 0%,#5b8af7 100%);border-radius:7px;text-align:center;vertical-align:middle;margin-right:9px;line-height:32px;">
+                  <span style="display:inline-block;vertical-align:middle;">
+                    <span style="display:inline-block;width:5px;height:12px;background:#fff;margin-right:1px;vertical-align:middle;"></span>
+                    <span style="display:inline-block;width:5px;height:12px;background:#fff;vertical-align:middle;"></span>
+                  </span>
                 </span>
-              </span>
-              <span class="logo-text" style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:#ffffff;letter-spacing:-0.4px;vertical-align:middle;">Hooks</span>
-              <span style="font-size:10px;font-weight:500;color:#5a4d80;letter-spacing:2.5px;text-transform:uppercase;margin-left:9px;vertical-align:middle;">Careers</span>
-            </td>
-          </tr>
-
-          <tr>
-            <td style="height:2px;background:linear-gradient(90deg,#7b5ef8 0%,#5b8af7 55%,rgba(91,138,247,0.05) 100%);border-left:1px solid rgba(123,94,248,0.2);border-right:1px solid rgba(123,94,248,0.2);"></td>
-          </tr>
-
-          <tr>
-            <td class="body-cell" style="background:#ffffff;padding:46px 40px 38px;border-left:1px solid rgba(123,94,248,0.12);border-right:1px solid rgba(123,94,248,0.12);">
-
-              <p style="margin:0 0 5px;font-size:10px;color:#8b72ff;letter-spacing:3px;text-transform:uppercase;font-weight:600;">We've got you</p>
-
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:22px;">
-                <tbody><tr><td style="height:1px;background:linear-gradient(90deg,#ede9ff 0%,rgba(255,255,255,0) 100%);"></td></tr>
-              </tbody></table>
-
-              <p class="body-copy" style="margin:0 0 10px;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">
-                Dear <strong style="font-weight:600;color:#0e0b1a;">${safeName}</strong>,
-              </p>
-              <p class="body-copy" style="margin:0 0 16px;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">
-                We've successfully received your application for the
-                <strong style="font-weight:600;color:#5b3ef8;">${roleLabel}</strong>
-                at Hooks. Our recruitment team has been notified and your profile is now under active review.
-              </p>
-              <p class="body-copy" style="margin:0 0 16px;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">
-                Our hiring team will carefully evaluate your qualifications and experience against the requirements of the role. If your profile is a strong match, we'll reach out to discuss next steps.
-              </p>
-              <p class="body-copy" style="margin:0;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">We truly appreciate your interest in joining Hooks.</p>
-
-              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:34px;padding-top:22px;">
-                <tbody><tr>
-                  <td style="vertical-align:middle;padding-right:16px;">
-                    <p class="sig-name" style="margin:0 0 2px;font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:#0e0b1a;">Hiring Hooks</p>
-                    <p style="margin:0;font-size:11px;color:#8b72ff;font-weight:400;">Hooks</p>
-                  </td>
-                </tr>
-              </tbody></table>
-
-            </td>
-          </tr>
-
-          <tr>
-            <td class="footer-cell" style="background:#000000;border:1px solid rgba(123,94,248,0.2);border-top:none;padding:20px 40px;">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-                <tbody><tr>
-                  <td style="vertical-align:middle;">
-                    <p class="footer-copy" style="margin:0;font-size:11px;color:#f0f0f0;line-height:1.5;">
-                      &copy; 2026
-                      <a href="https://tryhook.shop/" style="color:#8b72ff;text-decoration:none;font-weight:600;">tryhook.shop</a>
-                      &nbsp;&middot;&nbsp; All rights reserved.
-                    </p>
-                  </td>
-                  <td align="right" style="vertical-align:middle;">
-                    <a href="https://www.linkedin.com/company/hooks-data/?viewAsMember=true" class="social-icon" style="display:inline-block;width:30px;height:30px;background:rgba(123,94,248,0.22);border-radius:7px;text-align:center;line-height:30px;color:#7b5ef8;text-decoration:none;font-size:10px;font-weight:700;">in</a>
-                  </td>
-                </tr>
-              </tbody></table>
-            </td>
-          </tr>
-
-        </tbody></table>
-
-      </td>
-    </tr>
-  </tbody></table>
-</body>
-</html>`;
+                <span class="logo-text" style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:#ffffff;letter-spacing:-0.4px;vertical-align:middle;">Hooks</span>
+                <span style="font-size:10px;font-weight:500;color:#5a4d80;letter-spacing:2.5px;text-transform:uppercase;margin-left:9px;vertical-align:middle;">Careers</span>
+              </td>
+            </tr>
+  
+            <tr>
+              <td style="height:2px;background:linear-gradient(90deg,#7b5ef8 0%,#5b8af7 55%,rgba(91,138,247,0.05) 100%);border-left:1px solid rgba(123,94,248,0.2);border-right:1px solid rgba(123,94,248,0.2);"></td>
+            </tr>
+  
+            <tr>
+              <td class="body-cell" style="background:#ffffff;padding:46px 40px 38px;border-left:1px solid rgba(123,94,248,0.12);border-right:1px solid rgba(123,94,248,0.12);">
+  
+                <p style="margin:0 0 5px;font-size:10px;color:#8b72ff;letter-spacing:3px;text-transform:uppercase;font-weight:600;">We've got you</p>
+  
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:22px;">
+                  <tbody><tr><td style="height:1px;background:linear-gradient(90deg,#ede9ff 0%,rgba(255,255,255,0) 100%);"></td></tr>
+                </tbody></table>
+  
+                <p class="body-copy" style="margin:0 0 10px;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">
+                  Dear <strong style="font-weight:600;color:#0e0b1a;">${safeName}</strong>,
+                </p>
+                <p class="body-copy" style="margin:0 0 16px;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">
+                  We've successfully received your application for the
+                  <strong style="font-weight:600;color:#5b3ef8;">${roleLabel}</strong>
+                  at Hooks. Our recruitment team has been notified and your profile is now under active review.
+                </p>
+                <p class="body-copy" style="margin:0 0 16px;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">
+                  Our hiring team will carefully evaluate your qualifications and experience against the requirements of the role. If your profile is a strong match, we'll reach out to discuss next steps.
+                </p>
+                <p class="body-copy" style="margin:0;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">We truly appreciate your interest in joining Hooks.</p>
+  
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:34px;padding-top:22px;">
+                  <tbody><tr>
+                    <td style="vertical-align:middle;padding-right:16px;">
+                      <p class="sig-name" style="margin:0 0 2px;font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:#0e0b1a;">Hiring Hooks</p>
+                      <p style="margin:0;font-size:11px;color:#8b72ff;font-weight:400;">Hooks</p>
+                    </td>
+                  </tr>
+                </tbody></table>
+  
+              </td>
+            </tr>
+  
+            <tr>
+              <td class="footer-cell" style="background:#000000;border:1px solid rgba(123,94,248,0.2);border-top:none;padding:20px 40px;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                  <tbody><tr>
+                    <td style="vertical-align:middle;">
+                      <p class="footer-copy" style="margin:0;font-size:11px;color:#f0f0f0;line-height:1.5;">
+                        &copy; 2026
+                        <a href="https://tryhook.shop/" style="color:#8b72ff;text-decoration:none;font-weight:600;">tryhook.shop</a>
+                        &nbsp;&middot;&nbsp; All rights reserved.
+                      </p>
+                    </td>
+                    <td align="right" style="vertical-align:middle;">
+                      <a href="https://www.linkedin.com/company/hooks-data/?viewAsMember=true" class="social-icon" style="display:inline-block;width:30px;height:30px;background:rgba(123,94,248,0.22);border-radius:7px;text-align:center;line-height:30px;color:#7b5ef8;text-decoration:none;font-size:10px;font-weight:700;">in</a>
+                    </td>
+                  </tr>
+                </tbody></table>
+              </td>
+            </tr>
+  
+          </tbody></table>
+  
+        </td>
+      </tr>
+    </tbody></table>
+  </body>
+  </html>`;
 };
 
 async function sendCareerApplicationEmail({
