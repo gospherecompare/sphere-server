@@ -11,6 +11,10 @@ const multer = require("multer");
 const {
   sendRegistrationMail,
   sendCareerApplicationEmail,
+  sendCareerAssignmentEmail,
+  sendCareerInterviewEmail,
+  sendCareerHrEmail,
+  sendCareerOfferEmail,
 } = require("./utils/mailer");
 const { authenticateCustomer, authenticate } = require("./middleware/auth");
 const {
@@ -3204,11 +3208,11 @@ async function runMigrations() {
       
       `);
 
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS career_applications (
-        id SERIAL PRIMARY KEY,
-        role TEXT NOT NULL,
-        gender TEXT,
+      await safeQuery(`
+        CREATE TABLE IF NOT EXISTS career_applications (
+          id SERIAL PRIMARY KEY,
+          role TEXT NOT NULL,
+          gender TEXT,
         first_name TEXT NOT NULL,
         last_name TEXT NOT NULL,
         email TEXT NOT NULL,
@@ -3224,12 +3228,22 @@ async function runMigrations() {
         expected_ctc NUMERIC,
         skills TEXT,
         projects TEXT,
-        cover_letter TEXT,
-        application_place TEXT NOT NULL,
-        application_date DATE,
-        agree_terms BOOLEAN NOT NULL DEFAULT false,
-        status TEXT NOT NULL DEFAULT 'new',
-        source TEXT,
+          cover_letter TEXT,
+          assignment_pdf_url TEXT,
+          assignment_due_date DATE,
+          assignment_notes TEXT,
+          interview_link TEXT,
+          interview_scheduled_at TIMESTAMP,
+          interview_notes TEXT,
+          hr_scheduled_at TIMESTAMP,
+          hr_notes TEXT,
+          offer_pdf_url TEXT,
+          offer_notes TEXT,
+          application_place TEXT NOT NULL,
+          application_date DATE,
+          agree_terms BOOLEAN NOT NULL DEFAULT false,
+          status TEXT NOT NULL DEFAULT 'new',
+          source TEXT,
         payload JSONB,
         created_at TIMESTAMP DEFAULT now(),
         updated_at TIMESTAMP DEFAULT now()
@@ -3241,10 +3255,51 @@ async function runMigrations() {
       ON career_applications (created_at DESC);
     `);
 
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_career_applications_email
-      ON career_applications (email);
-    `);
+      await safeQuery(`
+        CREATE INDEX IF NOT EXISTS idx_career_applications_email
+        ON career_applications (email);
+      `);
+
+      await safeQuery(`
+        ALTER TABLE career_applications
+        ADD COLUMN IF NOT EXISTS assignment_pdf_url TEXT;
+      `);
+      await safeQuery(`
+        ALTER TABLE career_applications
+        ADD COLUMN IF NOT EXISTS assignment_due_date DATE;
+      `);
+      await safeQuery(`
+        ALTER TABLE career_applications
+        ADD COLUMN IF NOT EXISTS assignment_notes TEXT;
+      `);
+      await safeQuery(`
+        ALTER TABLE career_applications
+        ADD COLUMN IF NOT EXISTS interview_link TEXT;
+      `);
+      await safeQuery(`
+        ALTER TABLE career_applications
+        ADD COLUMN IF NOT EXISTS interview_scheduled_at TIMESTAMP;
+      `);
+      await safeQuery(`
+        ALTER TABLE career_applications
+        ADD COLUMN IF NOT EXISTS interview_notes TEXT;
+      `);
+      await safeQuery(`
+        ALTER TABLE career_applications
+        ADD COLUMN IF NOT EXISTS hr_scheduled_at TIMESTAMP;
+      `);
+      await safeQuery(`
+        ALTER TABLE career_applications
+        ADD COLUMN IF NOT EXISTS hr_notes TEXT;
+      `);
+      await safeQuery(`
+        ALTER TABLE career_applications
+        ADD COLUMN IF NOT EXISTS offer_pdf_url TEXT;
+      `);
+      await safeQuery(`
+        ALTER TABLE career_applications
+        ADD COLUMN IF NOT EXISTS offer_notes TEXT;
+      `);
 
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS blogs (
@@ -4152,17 +4207,21 @@ app.get("/api/admin/careers", authenticate, async (req, res) => {
     const offset = (page - 1) * limit;
 
     const [rowsResult, countResult] = await Promise.all([
-      db.query(
-        `SELECT id, role, first_name, last_name, email, phone,
-                experience_level, employment_status, notice_period,
-                preferred_location, expected_ctc, status, created_at,
-                updated_at, current_company, current_designation,
-                application_date
-         FROM career_applications
-         ORDER BY created_at DESC
-         LIMIT $1 OFFSET $2`,
-        [limit, offset],
-      ),
+        db.query(
+          `SELECT id, role, first_name, last_name, email, phone,
+                  gender, dob, education, experience_level, employment_status,
+                  notice_period, preferred_location, expected_ctc, status,
+                  created_at, updated_at, current_company, current_designation,
+                  application_date, skills, projects, cover_letter,
+                  application_place, source, assignment_pdf_url,
+                  assignment_due_date, assignment_notes, interview_link,
+                  interview_scheduled_at, interview_notes, hr_scheduled_at, hr_notes,
+                  offer_pdf_url, offer_notes
+           FROM career_applications
+           ORDER BY created_at DESC
+           LIMIT $1 OFFSET $2`,
+          [limit, offset],
+        ),
       db.query(`SELECT COUNT(*)::int AS total FROM career_applications`),
     ]);
 
@@ -4183,6 +4242,7 @@ const CAREER_APPLICATION_STATUSES = new Set([
   "screening",
   "shortlisted",
   "interview_scheduled",
+  "hr_round",
   "offered",
   "hired",
   "rejected",
@@ -4205,12 +4265,12 @@ app.patch("/api/admin/careers/:id/status", authenticate, async (req, res) => {
       return res.status(400).json({ message: "status is required" });
     }
 
-    if (!CAREER_APPLICATION_STATUSES.has(rawStatus)) {
-      return res.status(400).json({
-        message:
-          "Invalid status. Allowed values: new, screening, shortlisted, interview_scheduled, offered, hired, rejected",
-      });
-    }
+      if (!CAREER_APPLICATION_STATUSES.has(rawStatus)) {
+        return res.status(400).json({
+          message:
+            "Invalid status. Allowed values: new, screening, shortlisted, interview_scheduled, hr_round, offered, hired, rejected",
+        });
+      }
 
     const result = await db.query(
       `UPDATE career_applications
@@ -4231,6 +4291,204 @@ app.patch("/api/admin/careers/:id/status", authenticate, async (req, res) => {
   } catch (err) {
     console.error("Update career application status error:", err);
     return res.status(500).json({ message: "Failed to update status" });
+  }
+});
+
+const CAREER_NOTIFY_TYPES = new Set([
+  "assignment",
+  "interview",
+  "hr",
+  "offer",
+]);
+
+const normalizeCareerText = (value) => {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text.length ? text : null;
+};
+
+const parseCareerDate = (value) => {
+  const text = normalizeCareerText(value);
+  if (!text) return null;
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+};
+
+const parseCareerDateTime = (value) => {
+  const text = normalizeCareerText(value);
+  if (!text) return null;
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString();
+};
+
+const formatCareerDateLabel = (value) => {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  return parsed.toLocaleDateString("en-IN", {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+  });
+};
+
+app.post("/api/admin/careers/:id/notify", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const type = String(req.body?.type || "").trim().toLowerCase();
+    if (!CAREER_NOTIFY_TYPES.has(type)) {
+      return res
+        .status(400)
+        .json({ message: "Invalid notify type" });
+    }
+
+    const subject = normalizeCareerText(req.body?.subject);
+    const message = normalizeCareerText(req.body?.message);
+    const pdfUrl = normalizeCareerText(req.body?.pdf_url || req.body?.pdfUrl);
+    const offerUrl = normalizeCareerText(
+      req.body?.offer_url || req.body?.offerUrl,
+    );
+    const meetLink = normalizeCareerText(
+      req.body?.meet_link || req.body?.meetLink,
+    );
+    const dueDate = parseCareerDate(req.body?.due_date || req.body?.dueDate);
+    const scheduledAt = parseCareerDateTime(
+      req.body?.scheduled_at || req.body?.scheduledAt,
+    );
+    const timeZone = normalizeCareerText(
+      req.body?.time_zone || req.body?.timeZone,
+    );
+
+    const result = await db.query(
+      `SELECT id, role, first_name, last_name, email
+       FROM career_applications
+       WHERE id = $1`,
+      [id],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Application not found" });
+    }
+
+    const applicant = result.rows[0];
+    let status = null;
+    let updateQuery = "";
+    let updateValues = [];
+
+    if (type === "assignment") {
+      status = "shortlisted";
+      const dueDateLabel = formatCareerDateLabel(dueDate);
+      await sendCareerAssignmentEmail({
+        email: applicant.email,
+        role: applicant.role,
+        firstName: applicant.first_name,
+        lastName: applicant.last_name,
+        subject,
+        message,
+        pdfUrl,
+        dueDateLabel,
+      });
+      updateQuery = `
+        UPDATE career_applications
+        SET status = $1,
+            assignment_pdf_url = $2,
+            assignment_due_date = $3,
+            assignment_notes = $4,
+            updated_at = now()
+        WHERE id = $5
+        RETURNING id, status, updated_at, assignment_pdf_url, assignment_due_date, assignment_notes
+      `;
+      updateValues = [status, pdfUrl, dueDate, message, id];
+    }
+
+    if (type === "interview") {
+      status = "interview_scheduled";
+      await sendCareerInterviewEmail({
+        email: applicant.email,
+        role: applicant.role,
+        firstName: applicant.first_name,
+        lastName: applicant.last_name,
+        subject,
+        message,
+        meetLink,
+        scheduledAt,
+        timeZone,
+      });
+      updateQuery = `
+        UPDATE career_applications
+        SET status = $1,
+            interview_link = $2,
+            interview_scheduled_at = $3,
+            interview_notes = $4,
+            updated_at = now()
+        WHERE id = $5
+        RETURNING id, status, updated_at, interview_link, interview_scheduled_at, interview_notes
+      `;
+      updateValues = [status, meetLink, scheduledAt, message, id];
+    }
+
+    if (type === "hr") {
+      status = "hr_round";
+      await sendCareerHrEmail({
+        email: applicant.email,
+        role: applicant.role,
+        firstName: applicant.first_name,
+        lastName: applicant.last_name,
+        subject,
+        message,
+        scheduledAt,
+        timeZone,
+      });
+      updateQuery = `
+        UPDATE career_applications
+        SET status = $1,
+            hr_scheduled_at = $2,
+            hr_notes = $3,
+            updated_at = now()
+        WHERE id = $4
+        RETURNING id, status, updated_at, hr_scheduled_at, hr_notes
+      `;
+      updateValues = [status, scheduledAt, message, id];
+    }
+
+    if (type === "offer") {
+      status = "offered";
+      await sendCareerOfferEmail({
+        email: applicant.email,
+        role: applicant.role,
+        firstName: applicant.first_name,
+        lastName: applicant.last_name,
+        subject,
+        message,
+        offerUrl,
+      });
+      updateQuery = `
+        UPDATE career_applications
+        SET status = $1,
+            offer_pdf_url = $2,
+            offer_notes = $3,
+            updated_at = now()
+        WHERE id = $4
+        RETURNING id, status, updated_at, offer_pdf_url, offer_notes
+      `;
+      updateValues = [status, offerUrl, message, id];
+    }
+
+    const updateResult = await db.query(updateQuery, updateValues);
+
+    return res.json({
+      message: "Notification sent",
+      application: updateResult.rows[0],
+    });
+  } catch (err) {
+    console.error("Career notify error:", err);
+    return res.status(500).json({ message: "Failed to send notification" });
   }
 });
 

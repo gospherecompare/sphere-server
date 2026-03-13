@@ -369,7 +369,335 @@ const renderCareerApplicationTemplate = ({ role, firstName, lastName }) => {
       </tr>
     </tbody></table>
   </body>
-  </html>`;
+    </html>`;
+};
+
+const formatMultilineText = (value) => {
+  const safe = escapeHtml(value || "");
+  if (!safe) return "";
+  return safe.replace(/\n/g, "<br />");
+};
+
+const formatDateTimeLabel = (value, timeZone) => {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return escapeHtml(String(value));
+  }
+  const options = {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  };
+  let formatted;
+  try {
+    formatted = parsed.toLocaleString("en-IN", {
+      ...options,
+      timeZone: timeZone || undefined,
+    });
+  } catch (err) {
+    formatted = parsed.toLocaleString("en-IN", options);
+  }
+  return timeZone ? `${formatted} (${escapeHtml(timeZone)})` : formatted;
+};
+
+const getFileNameFromUrl = (url, fallback) => {
+  if (!url) return fallback;
+  try {
+    const parsed = new URL(url);
+    const name = parsed.pathname.split("/").filter(Boolean).pop();
+    return name || fallback;
+  } catch (err) {
+    return fallback;
+  }
+};
+
+const renderCareerEmailShell = ({ title, bodyHtml }) => `
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${escapeHtml(title || "Hooks Careers")}</title>
+  </head>
+  <body style="margin:0;padding:0;background:#ffffff;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;padding:28px 12px 48px;">
+      <tbody>
+        <tr>
+          <td align="center">
+            <table role="presentation" width="620" cellpadding="0" cellspacing="0" border="0" style="max-width:620px;width:100%;">
+              <tbody>
+                <tr>
+                  <td style="background:linear-gradient(160deg,#1c1136 0%,#130e2a 100%);padding:26px 40px;border:1px solid rgba(123,94,248,0.22);border-bottom:none;">
+                    <span style="display:inline-block;width:32px;height:32px;background:linear-gradient(135deg,#7b5ef8 0%,#5b8af7 100%);border-radius:7px;text-align:center;vertical-align:middle;margin-right:9px;line-height:32px;">
+                      <span style="display:inline-block;vertical-align:middle;">
+                        <span style="display:inline-block;width:5px;height:12px;background:#fff;margin-right:1px;vertical-align:middle;"></span>
+                        <span style="display:inline-block;width:5px;height:12px;background:#fff;vertical-align:middle;"></span>
+                      </span>
+                    </span>
+                    <span style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:#ffffff;letter-spacing:-0.4px;vertical-align:middle;">Hooks</span>
+                    <span style="font-size:10px;font-weight:500;color:#5a4d80;letter-spacing:2.5px;text-transform:uppercase;margin-left:9px;vertical-align:middle;">Careers</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="height:2px;background:linear-gradient(90deg,#7b5ef8 0%,#5b8af7 55%,rgba(91,138,247,0.05) 100%);border-left:1px solid rgba(123,94,248,0.2);border-right:1px solid rgba(123,94,248,0.2);"></td>
+                </tr>
+                <tr>
+                  <td style="background:#ffffff;padding:42px 40px;border-left:1px solid rgba(123,94,248,0.12);border-right:1px solid rgba(123,94,248,0.12);">
+                    ${bodyHtml || ""}
+                  </td>
+                </tr>
+                <tr>
+                  <td style="background:#000000;border:1px solid rgba(123,94,248,0.2);border-top:none;padding:20px 40px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                      <tbody>
+                        <tr>
+                          <td style="vertical-align:middle;">
+                            <p style="margin:0;font-size:11px;color:#f0f0f0;line-height:1.5;">
+                              &copy; 2026
+                              <a href="https://tryhook.shop/" style="color:#8b72ff;text-decoration:none;font-weight:600;">tryhook.shop</a>
+                              &nbsp;&middot;&nbsp; All rights reserved.
+                            </p>
+                          </td>
+                          <td align="right" style="vertical-align:middle;">
+                            <a href="https://www.linkedin.com/company/hooks-data/?viewAsMember=true" style="display:inline-block;width:30px;height:30px;background:rgba(123,94,248,0.22);border-radius:7px;text-align:center;line-height:30px;color:#7b5ef8;text-decoration:none;font-size:10px;font-weight:700;">in</a>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </body>
+</html>
+`;
+
+const renderCareerAssignmentTemplate = ({
+  role,
+  firstName,
+  lastName,
+  message,
+  pdfUrl,
+  dueDateLabel,
+}) => {
+  const safeRole = escapeHtml(role || "");
+  const safeName = escapeHtml(
+    `${firstName || ""} ${lastName || ""}`.trim() || "there",
+  );
+  const safeMessage = formatMultilineText(message);
+  const dueLine = dueDateLabel
+    ? `<p style="margin:0 0 14px;font-size:14px;line-height:1.7;color:#3d3550;">Assignment due date: <strong>${dueDateLabel}</strong></p>`
+    : "";
+  const assignmentLink = pdfUrl
+    ? `<p style="margin:0 0 18px;font-size:14px;line-height:1.7;color:#3d3550;">
+        You can access the assignment PDF here:
+        <a href="${escapeHtml(pdfUrl)}" style="color:#5b3ef8;text-decoration:none;font-weight:600;">Download assignment</a>
+      </p>`
+    : "";
+
+  return renderCareerEmailShell({
+    title: "Assignment from Hooks",
+    bodyHtml: `
+      <p style="margin:0 0 10px;font-size:15px;line-height:1.8;color:#3d3550;">
+        Dear <strong style="color:#0e0b1a;">${safeName}</strong>,
+      </p>
+      <p style="margin:0 0 16px;font-size:15px;line-height:1.8;color:#3d3550;">
+        We are excited to move you forward for ${
+          safeRole || "the role you applied for"
+        }. Please complete the assignment shared below.
+      </p>
+      ${dueLine}
+      ${assignmentLink}
+      ${
+        safeMessage
+          ? `<p style="margin:0 0 18px;font-size:14px;line-height:1.7;color:#3d3550;">${safeMessage}</p>`
+          : ""
+      }
+      <p style="margin:0;font-size:14px;line-height:1.7;color:#3d3550;">
+        If you have any questions, reply to this email and we will help.
+      </p>
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:30px;padding-top:18px;">
+        <tbody>
+          <tr>
+            <td style="vertical-align:middle;padding-right:16px;">
+              <p style="margin:0 0 2px;font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:#0e0b1a;">Hiring Hooks</p>
+              <p style="margin:0;font-size:11px;color:#8b72ff;font-weight:400;">Hooks</p>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    `,
+  });
+};
+
+const renderCareerInterviewTemplate = ({
+  role,
+  firstName,
+  lastName,
+  message,
+  meetLink,
+  scheduleLabel,
+}) => {
+  const safeRole = escapeHtml(role || "");
+  const safeName = escapeHtml(
+    `${firstName || ""} ${lastName || ""}`.trim() || "there",
+  );
+  const safeMessage = formatMultilineText(message);
+  const meetLine = meetLink
+    ? `<p style="margin:0 0 12px;font-size:14px;line-height:1.7;color:#3d3550;">
+        Google Meet link:
+        <a href="${escapeHtml(meetLink)}" style="color:#5b3ef8;text-decoration:none;font-weight:600;">Join interview</a>
+      </p>`
+    : "";
+  const scheduleLine = scheduleLabel
+    ? `<p style="margin:0 0 12px;font-size:14px;line-height:1.7;color:#3d3550;">
+        Scheduled for: <strong>${scheduleLabel}</strong>
+      </p>`
+    : "";
+
+  return renderCareerEmailShell({
+    title: "Interview scheduled",
+    bodyHtml: `
+      <p style="margin:0 0 10px;font-size:15px;line-height:1.8;color:#3d3550;">
+        Dear <strong style="color:#0e0b1a;">${safeName}</strong>,
+      </p>
+      <p style="margin:0 0 16px;font-size:15px;line-height:1.8;color:#3d3550;">
+        Your interview for ${safeRole || "the role you applied for"} has been scheduled.
+      </p>
+      ${scheduleLine}
+      ${meetLine}
+      ${
+        safeMessage
+          ? `<p style="margin:0 0 18px;font-size:14px;line-height:1.7;color:#3d3550;">${safeMessage}</p>`
+          : ""
+      }
+      <p style="margin:0;font-size:14px;line-height:1.7;color:#3d3550;">
+        If you need to reschedule, please reply to this email.
+      </p>
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:30px;padding-top:18px;">
+        <tbody>
+          <tr>
+            <td style="vertical-align:middle;padding-right:16px;">
+              <p style="margin:0 0 2px;font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:#0e0b1a;">Hiring Hooks</p>
+              <p style="margin:0;font-size:11px;color:#8b72ff;font-weight:400;">Hooks</p>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    `,
+  });
+};
+
+const renderCareerHrTemplate = ({
+  role,
+  firstName,
+  lastName,
+  message,
+  scheduleLabel,
+}) => {
+  const safeRole = escapeHtml(role || "");
+  const safeName = escapeHtml(
+    `${firstName || ""} ${lastName || ""}`.trim() || "there",
+  );
+  const safeMessage = formatMultilineText(message);
+  const scheduleLine = scheduleLabel
+    ? `<p style="margin:0 0 12px;font-size:14px;line-height:1.7;color:#3d3550;">
+        HR round scheduled for: <strong>${scheduleLabel}</strong>
+      </p>`
+    : "";
+
+  return renderCareerEmailShell({
+    title: "HR round update",
+    bodyHtml: `
+      <p style="margin:0 0 10px;font-size:15px;line-height:1.8;color:#3d3550;">
+        Dear <strong style="color:#0e0b1a;">${safeName}</strong>,
+      </p>
+      <p style="margin:0 0 16px;font-size:15px;line-height:1.8;color:#3d3550;">
+        We are moving you forward to the HR round for ${
+          safeRole || "the role you applied for"
+        }.
+      </p>
+      ${scheduleLine}
+      ${
+        safeMessage
+          ? `<p style="margin:0 0 18px;font-size:14px;line-height:1.7;color:#3d3550;">${safeMessage}</p>`
+          : ""
+      }
+      <p style="margin:0;font-size:14px;line-height:1.7;color:#3d3550;">
+        Please reply if you have any availability constraints.
+      </p>
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:30px;padding-top:18px;">
+        <tbody>
+          <tr>
+            <td style="vertical-align:middle;padding-right:16px;">
+              <p style="margin:0 0 2px;font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:#0e0b1a;">Hiring Hooks</p>
+              <p style="margin:0;font-size:11px;color:#8b72ff;font-weight:400;">Hooks</p>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    `,
+  });
+};
+
+const renderCareerOfferTemplate = ({
+  role,
+  firstName,
+  lastName,
+  message,
+  offerUrl,
+}) => {
+  const safeRole = escapeHtml(role || "");
+  const safeName = escapeHtml(
+    `${firstName || ""} ${lastName || ""}`.trim() || "there",
+  );
+  const safeMessage = formatMultilineText(message);
+  const offerLink = offerUrl
+    ? `<p style="margin:0 0 16px;font-size:14px;line-height:1.7;color:#3d3550;">
+        Offer document:
+        <a href="${escapeHtml(offerUrl)}" style="color:#5b3ef8;text-decoration:none;font-weight:600;">View offer</a>
+      </p>`
+    : "";
+
+  return renderCareerEmailShell({
+    title: "Offer from Hooks",
+    bodyHtml: `
+      <p style="margin:0 0 10px;font-size:15px;line-height:1.8;color:#3d3550;">
+        Dear <strong style="color:#0e0b1a;">${safeName}</strong>,
+      </p>
+      <p style="margin:0 0 16px;font-size:15px;line-height:1.8;color:#3d3550;">
+        We are pleased to share the offer details for ${
+          safeRole || "the role you applied for"
+        }.
+      </p>
+      ${offerLink}
+      ${
+        safeMessage
+          ? `<p style="margin:0 0 18px;font-size:14px;line-height:1.7;color:#3d3550;">${safeMessage}</p>`
+          : ""
+      }
+      <p style="margin:0;font-size:14px;line-height:1.7;color:#3d3550;">
+        Please reply to this email with any questions.
+      </p>
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:30px;padding-top:18px;">
+        <tbody>
+          <tr>
+            <td style="vertical-align:middle;padding-right:16px;">
+              <p style="margin:0 0 2px;font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:#0e0b1a;">Hiring Hooks</p>
+              <p style="margin:0;font-size:11px;color:#8b72ff;font-weight:400;">Hooks</p>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    `,
+  });
 };
 
 async function sendCareerApplicationEmail({
@@ -392,8 +720,164 @@ async function sendCareerApplicationEmail({
   });
 }
 
+async function sendCareerAssignmentEmail({
+  email,
+  role,
+  firstName,
+  lastName,
+  subject,
+  message,
+  pdfUrl,
+  dueDateLabel,
+}) {
+  const mailSubject =
+    subject || `Assignment details${role ? ` - ${role}` : ""}`;
+  const text = `Please complete the assignment for ${
+    role || "the role you applied for"
+  }.${dueDateLabel ? ` Due date: ${dueDateLabel}.` : ""} ${
+    pdfUrl ? `Assignment: ${pdfUrl}` : ""
+  }`;
+
+  await transporter.sendMail({
+    from: EMAIL_FROM,
+    to: email,
+    subject: mailSubject,
+    text,
+    html: renderCareerAssignmentTemplate({
+      role,
+      firstName,
+      lastName,
+      message,
+      pdfUrl,
+      dueDateLabel,
+    }),
+    attachments: pdfUrl
+      ? [
+          {
+            filename: getFileNameFromUrl(pdfUrl, "assignment.pdf"),
+            path: pdfUrl,
+          },
+        ]
+      : undefined,
+  });
+}
+
+async function sendCareerInterviewEmail({
+  email,
+  role,
+  firstName,
+  lastName,
+  subject,
+  message,
+  meetLink,
+  scheduledAt,
+  timeZone,
+}) {
+  const mailSubject =
+    subject || `Interview scheduled${role ? ` - ${role}` : ""}`;
+  const scheduleLabel = scheduledAt
+    ? formatDateTimeLabel(scheduledAt, timeZone)
+    : "";
+  const text = `Your interview for ${
+    role || "the role you applied for"
+  } has been scheduled.${scheduleLabel ? ` ${scheduleLabel}.` : ""} ${
+    meetLink ? `Meeting link: ${meetLink}` : ""
+  }`;
+
+  await transporter.sendMail({
+    from: EMAIL_FROM,
+    to: email,
+    subject: mailSubject,
+    text,
+    html: renderCareerInterviewTemplate({
+      role,
+      firstName,
+      lastName,
+      message,
+      meetLink,
+      scheduleLabel,
+    }),
+  });
+}
+
+async function sendCareerHrEmail({
+  email,
+  role,
+  firstName,
+  lastName,
+  subject,
+  message,
+  scheduledAt,
+  timeZone,
+}) {
+  const mailSubject =
+    subject || `HR round update${role ? ` - ${role}` : ""}`;
+  const scheduleLabel = scheduledAt
+    ? formatDateTimeLabel(scheduledAt, timeZone)
+    : "";
+  const text = `We are moving you to the HR round for ${
+    role || "the role you applied for"
+  }.${scheduleLabel ? ` Scheduled: ${scheduleLabel}.` : ""}`;
+
+  await transporter.sendMail({
+    from: EMAIL_FROM,
+    to: email,
+    subject: mailSubject,
+    text,
+    html: renderCareerHrTemplate({
+      role,
+      firstName,
+      lastName,
+      message,
+      scheduleLabel,
+    }),
+  });
+}
+
+async function sendCareerOfferEmail({
+  email,
+  role,
+  firstName,
+  lastName,
+  subject,
+  message,
+  offerUrl,
+}) {
+  const mailSubject =
+    subject || `Offer details${role ? ` - ${role}` : ""}`;
+  const text = `We are pleased to share the offer details for ${
+    role || "the role you applied for"
+  }.${offerUrl ? ` Offer: ${offerUrl}` : ""}`;
+
+  await transporter.sendMail({
+    from: EMAIL_FROM,
+    to: email,
+    subject: mailSubject,
+    text,
+    html: renderCareerOfferTemplate({
+      role,
+      firstName,
+      lastName,
+      message,
+      offerUrl,
+    }),
+    attachments: offerUrl
+      ? [
+          {
+            filename: getFileNameFromUrl(offerUrl, "offer.pdf"),
+            path: offerUrl,
+          },
+        ]
+      : undefined,
+  });
+}
+
 module.exports = {
   sendRegistrationEmail,
   sendRegistrationMail: sendRegistrationEmail,
   sendCareerApplicationEmail,
+  sendCareerAssignmentEmail,
+  sendCareerInterviewEmail,
+  sendCareerHrEmail,
+  sendCareerOfferEmail,
 };
