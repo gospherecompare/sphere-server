@@ -58,6 +58,12 @@ function parseSensors(raw, row) {
   return parts.length ? JSON.stringify(parts) : null;
 }
 
+const LAUNCH_STATUS_VALUES = new Set(["upcoming", "preorder", "released"]);
+function normalizeLaunchStatusOverride(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  return LAUNCH_STATUS_VALUES.has(raw) ? raw : null;
+}
+
 /* -------------------------
   IMPORT SMARTPHONES
 -------------------------- */
@@ -257,6 +263,17 @@ router.post(
 
             const sensorsRaw = getCell(row, "sensors");
             const sensors = parseSensors(sensorsRaw, i);
+            const officialPreorderUrlRaw =
+              getCell(row, "official_preorder_url") ||
+              getCell(row, "officialPreorderUrl");
+            const officialPreorderUrl = officialPreorderUrlRaw
+              ? String(officialPreorderUrlRaw).trim()
+              : null;
+            const launchStatusOverride = normalizeLaunchStatusOverride(
+              getCell(row, "launch_status_override") ||
+                getCell(row, "launch_status") ||
+                getCell(row, "launchStatusOverride"),
+            );
 
             /* -------------------------
               Insert smartphone (core)
@@ -264,16 +281,19 @@ router.post(
             await client.query(
               `INSERT INTO smartphones
                (product_id, category, brand, model, launch_date,
+                official_preorder_url, launch_status_override,
                 images, build_design, display, performance,
                 camera, battery, connectivity, network, ports, audio, multimedia, sensors)
                VALUES
-               ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+               ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
               [
                 productId,
                 category,
                 brand_name,
                 model,
                 parseDateForImport(getCell(row, "launch_date")),
+                officialPreorderUrl || null,
+                launchStatusOverride,
                 JSON.stringify(images),
                 JSON.stringify(build_design),
                 JSON.stringify(display),

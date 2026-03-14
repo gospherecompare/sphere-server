@@ -67,6 +67,12 @@ function parseDateForImport(val) {
   return d.toISOString().split("T")[0];
 }
 
+const LAUNCH_STATUS_VALUES = new Set(["upcoming", "preorder", "released"]);
+function normalizeLaunchStatusOverride(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  return LAUNCH_STATUS_VALUES.has(raw) ? raw : null;
+}
+
 router.post("/req", authenticate, async (req, res) => {
   const b = req.body || {};
 
@@ -145,6 +151,9 @@ router.post("/req", authenticate, async (req, res) => {
         ? sensorsJson.sensors
         : sensorsJson || null);
     const sensors = parseSensors(sensorsInput);
+    const launchStatusOverride = normalizeLaunchStatusOverride(
+      b.launch_status_override || b.launchStatusOverride,
+    );
 
     const publish = hasOwn(b, "publish")
       ? Boolean(b.publish)
@@ -165,14 +174,15 @@ router.post("/req", authenticate, async (req, res) => {
 
     await client.query(
       `INSERT INTO smartphones
-         (product_id, category, brand, model, launch_date, images, build_design, display, performance, camera, battery, connectivity, network, ports, audio, multimedia, sensors)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+         (product_id, category, brand, model, launch_date, launch_status_override, images, build_design, display, performance, camera, battery, connectivity, network, ports, audio, multimedia, sensors)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
       [
         productId,
         b.category || null,
         brand_name,
         model,
         parseDateForImport(b.launch_date),
+        launchStatusOverride,
         JSON.stringify(images),
         JSON.stringify(build_design),
         JSON.stringify(display),

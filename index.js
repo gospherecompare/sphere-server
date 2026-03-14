@@ -202,6 +202,12 @@ function formatDateForExcel(input) {
   return `${day} ${month} ${year}`;
 }
 
+const LAUNCH_STATUS_VALUES = new Set(["upcoming", "preorder", "released"]);
+function normalizeLaunchStatusOverride(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  return LAUNCH_STATUS_VALUES.has(raw) ? raw : null;
+}
+
 function parseDateForImport(val) {
   if (!val && val !== 0) return null;
   if (val instanceof Date) {
@@ -2815,6 +2821,7 @@ async function runMigrations() {
         model TEXT,
         launch_date DATE,
         official_preorder_url TEXT,
+        launch_status_override TEXT,
         images JSONB,
         colors JSONB,
         build_design JSONB,
@@ -2841,6 +2848,9 @@ async function runMigrations() {
     );
     await safeQuery(
       `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS official_preorder_url TEXT;`,
+    );
+    await safeQuery(
+      `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS launch_status_override TEXT;`,
     );
 
     // If older `connectivity_network` column exists, copy its data into `connectivity` (preserve existing connectivity)
@@ -5488,6 +5498,12 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
     );
 
     const productId = productRes.rows[0].id;
+    const launchStatusOverride = normalizeLaunchStatusOverride(
+      smartphone?.launch_status_override ||
+        smartphone?.launchStatusOverride ||
+        req.body.launch_status_override ||
+        req.body.launchStatusOverride,
+    );
 
     /* ---------- 2. INSERT SMARTPHONE ---------- */
     const smartphoneRes = await client.query(
@@ -5495,15 +5511,16 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
       INSERT INTO smartphones (
         product_id, category, brand, model, launch_date,
         official_preorder_url,
+        launch_status_override,
         images, colors, build_design, display, performance,
         camera, battery, connectivity, network,
         ports, audio, multimedia, sensors
       )
       VALUES (
         $1,$2,$3,$4,$5,
-        $6,
-        $7,$8,$9,$10,$11,
-        $12,$13,$14,$15,$16,$17,$18,$19
+        $6,$7,
+        $8,$9,$10,$11,$12,
+        $13,$14,$15,$16,$17,$18,$19,$20
       )
       RETURNING id
       `,
@@ -5518,6 +5535,7 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
           req.body.official_preorder_url ||
           req.body.officialPreorderUrl ||
           null,
+        launchStatusOverride,
         JSON.stringify(images || []),
         JSON.stringify(smartphone.colors || []),
         JSON.stringify(smartphone.build_design || {}),
@@ -5530,7 +5548,7 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
         JSON.stringify(smartphone.ports || {}),
         JSON.stringify(smartphone.audio || {}),
         JSON.stringify(smartphone.multimedia || {}),
-        // sensors as 16th param (if present)
+        // sensors param (if present)
         smartphone.sensors === null
           ? null
           : JSON.stringify(smartphone.sensors || []),
@@ -5722,6 +5740,7 @@ app.get("/api/smartphones", async (req, res) => {
         s.model,
         s.launch_date,
         s.official_preorder_url,
+        s.launch_status_override,
         s.colors,
         s.build_design,
         s.display,
@@ -5806,7 +5825,7 @@ app.get("/api/smartphones", async (req, res) => {
  
       GROUP BY
         p.id, b.name, b.logo,
-        s.category, s.model, s.launch_date, s.official_preorder_url,
+        s.category, s.model, s.launch_date, s.official_preorder_url, s.launch_status_override,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at
@@ -5928,6 +5947,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         s.model,
         s.launch_date,
         s.official_preorder_url,
+        s.launch_status_override,
         s.colors,
         s.build_design,
         s.display,
@@ -6006,7 +6026,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
 
       GROUP BY
         p.id, b.name,
-        s.category, s.model, s.launch_date, s.official_preorder_url,
+        s.category, s.model, s.launch_date, s.official_preorder_url, s.launch_status_override,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at, pub.is_published
@@ -7742,15 +7762,22 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       return res.status(400).json({ message: "Name is required" });
     }
 
+    const launchStatusOverride = normalizeLaunchStatusOverride(
+      req.body.launch_status_override ||
+        req.body.launchStatusOverride ||
+        req.body.smartphone?.launch_status_override ||
+        req.body.smartphone?.launchStatusOverride,
+    );
+
     /* ---------- UPDATE SMARTPHONE (PARENT) ---------- */
     const updatePhoneSQL = `
       UPDATE smartphones SET
         category=$1, brand=$2, model=$3, launch_date=$4,
-        official_preorder_url=$5,
-        images=$6, colors=$7, build_design=$8, display=$9, performance=$10,
-        camera=$11, battery=$12, connectivity=$13, network=$14, ports=$15,
-        audio=$16, multimedia=$17, sensors=$18
-      WHERE id=$19
+        official_preorder_url=$5, launch_status_override=$6,
+        images=$7, colors=$8, build_design=$9, display=$10, performance=$11,
+        camera=$12, battery=$13, connectivity=$14, network=$15, ports=$16,
+        audio=$17, multimedia=$18, sensors=$19
+      WHERE id=$20
       RETURNING *;
     `;
 
@@ -7764,6 +7791,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
         req.body.smartphone?.official_preorder_url ||
         req.body.smartphone?.officialPreorderUrl ||
         null,
+      launchStatusOverride,
       JSON.stringify(req.body.images || []),
       JSON.stringify(req.body.colors || []),
       JSON.stringify(req.body.build_design || {}),
@@ -10633,6 +10661,7 @@ const handleTrendingSmartphones = async (req, res) => {
         s.model,
         s.launch_date,
         s.official_preorder_url,
+        s.launch_status_override,
         s.display,
         s.performance,
         s.camera,
@@ -10736,6 +10765,7 @@ const handleTrendingSmartphones = async (req, res) => {
         s.model,
         s.launch_date,
         s.official_preorder_url,
+        s.launch_status_override,
         s.display,
         s.performance,
         s.camera,
@@ -10768,6 +10798,7 @@ const handleTrendingSmartphones = async (req, res) => {
         brand_logo: row.brand_logo || null,
         brand_website: row.brand_website || null,
         official_preorder_url: row.official_preorder_url || null,
+        launch_status_override: row.launch_status_override || null,
         model: row.model || null,
         launch_date: row.launch_date || null,
         display: row.display || null,
@@ -11343,6 +11374,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
         s.model AS model,
         s.launch_date,
         s.official_preorder_url,
+        s.launch_status_override,
         s.display,
         s.performance,
         s.camera,
