@@ -388,6 +388,43 @@ const decorateStorePriceList = (storePrices, todayIndia = getIndiaDateOnly()) =>
     decorateStorePriceAvailability(storePrice, todayIndia),
   );
 
+const getEarliestSaleStartDateFromVariants = (variants) => {
+  const dates = [];
+  for (const variant of Array.isArray(variants) ? variants : []) {
+    const variantObj = toPlainObject(variant);
+    const direct = normalizeDateOnlyInput(
+      variantObj.sale_start_date ??
+        variantObj.saleStartDate ??
+        variantObj.sale_date ??
+        variantObj.saleDate ??
+        null,
+    );
+    if (direct) dates.push(direct);
+
+    const storePrices = Array.isArray(variantObj.store_prices)
+      ? variantObj.store_prices
+      : Array.isArray(variantObj.storePrices)
+        ? variantObj.storePrices
+        : [];
+    for (const store of storePrices) {
+      const storeDate = normalizeDateOnlyInput(
+        store?.sale_start_date ??
+          store?.saleStartDate ??
+          store?.sale_date ??
+          store?.saleDate ??
+          store?.available_from ??
+          store?.availableFrom ??
+          null,
+      );
+      if (storeDate) dates.push(storeDate);
+    }
+  }
+
+  if (!dates.length) return null;
+  dates.sort();
+  return dates[0];
+};
+
 const resolveEffectiveSmartphonePrice = (variants, fallbackPrice = null) => {
   const livePrices = [];
   const prebookingPrices = [];
@@ -5871,6 +5908,7 @@ app.get("/api/smartphones", async (req, res) => {
           }),
         );
         item.variants = variants;
+        item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
         item.price = resolveEffectiveSmartphonePrice(variants, item.price ?? null);
         item.hook_score = hookScore;
         item.hookScore = hookScore;
@@ -6047,6 +6085,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
           }),
         );
         item.variants = variants;
+        item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
         item.price = resolveEffectiveSmartphonePrice(variants, item.price ?? null);
         return stripScoreRecursively(item);
       }),
@@ -6174,6 +6213,7 @@ app.get("/api/smartphone/:id", async (req, res) => {
     };
 
     const sanitized = sanitize(smartphone, variants);
+    sanitized.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
     sanitized.name = productName;
     sanitized.brand_logo = productBrandLogo || null;
     sanitized.brand_website = productBrandWebsite || null;
@@ -10871,6 +10911,7 @@ const handleTrendingSmartphones = async (req, res) => {
         item.starting_price ?? item.price ?? null,
       );
       item.variants = variants;
+      item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
       item.price = effectivePrice;
       item.starting_price = effectivePrice;
     }
@@ -11441,6 +11482,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
         item.price ?? null,
       );
       item.variants = variants;
+      item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
       item.price = effectivePrice;
       item.starting_price = effectivePrice;
     }
