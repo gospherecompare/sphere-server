@@ -964,6 +964,7 @@ const normalizeLaptopSectionsForResponse = (sectionsValue, rowValue) => {
 };
 
 const stripScoreRecursively = (value) => {
+  if (value instanceof Date) return value;
   if (Array.isArray(value)) {
     return value.map((item) => stripScoreRecursively(item));
   }
