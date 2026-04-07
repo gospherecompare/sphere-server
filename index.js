@@ -17,7 +17,6 @@ const { client, db } = require("./db");
 const multer = require("multer");
 const {
   sendRegistrationMail,
-  sendLoginOtpEmail,
   sendCareerApplicationEmail,
   sendCareerAssignmentEmail,
   sendCareerInterviewEmail,
@@ -3372,58 +3371,6 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
-      ALTER TABLE "user"
-      ADD COLUMN IF NOT EXISTS last_otp_verified_at TIMESTAMPTZ;
-    `);
-
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS auth_login_challenges (
-        challenge_id TEXT PRIMARY KEY,
-        user_id INT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
-        email TEXT NOT NULL,
-        otp_hash TEXT NOT NULL,
-        expires_at TIMESTAMPTZ NOT NULL,
-        attempts INT NOT NULL DEFAULT 0,
-        max_attempts INT NOT NULL DEFAULT 5,
-        resend_count INT NOT NULL DEFAULT 0,
-        last_sent_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        channels JSONB NOT NULL DEFAULT '[]'::jsonb,
-        verified_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-    `);
-
-    await safeQuery(`
-      ALTER TABLE auth_login_challenges
-      ADD COLUMN IF NOT EXISTS user_id INT REFERENCES "user"(id) ON DELETE CASCADE,
-      ADD COLUMN IF NOT EXISTS email TEXT,
-      ADD COLUMN IF NOT EXISTS otp_hash TEXT,
-      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS attempts INT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS max_attempts INT DEFAULT 5,
-      ADD COLUMN IF NOT EXISTS resend_count INT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS last_sent_at TIMESTAMPTZ DEFAULT now(),
-      ADD COLUMN IF NOT EXISTS channels JSONB DEFAULT '[]'::jsonb,
-      ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_auth_login_challenges_user_id
-      ON auth_login_challenges (user_id);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_auth_login_challenges_email
-      ON auth_login_challenges (email);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_auth_login_challenges_expires_at
-      ON auth_login_challenges (expires_at);
-    `);
-
-    await safeQuery(`
       CREATE TABLE IF NOT EXISTS auth_webauthn_credentials (
         id SERIAL PRIMARY KEY,
         user_id INT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
@@ -3892,15 +3839,8 @@ async function runMigrations() {
   Auth Middleware + Role-Based Access Control (RBAC)
 ------------------------*/
 
-const OTP_CHALLENGE_TABLE = "auth_login_challenges";
 const WEBAUTHN_CREDENTIAL_TABLE = "auth_webauthn_credentials";
 const WEBAUTHN_CHALLENGE_TABLE = "auth_webauthn_challenges";
-const OTP_CODE_LENGTH = 6;
-const OTP_TTL_MS = 5 * 60 * 1000;
-const OTP_RESEND_COOLDOWN_MS = 30 * 1000;
-const OTP_MAX_ATTEMPTS = 5;
-const OTP_HASH_ROUNDS = 10;
-const OTP_REVERIFY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const ACCESS_TOKEN_TTL = "1h";
 const PENDING_LOGIN_TOKEN_PURPOSE = "admin_pending_login";
 const PENDING_LOGIN_TOKEN_TTL_SECONDS = 15 * 60;
@@ -3935,23 +3875,13 @@ const loginInitiateLimiter = rateLimit({
   },
 });
 
-const loginOtpVerifyLimiter = rateLimit({
+const webAuthnVerifyLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: {
-    message: "Too many OTP verification attempts. Please try again later.",
-  },
-});
-
-const loginOtpResendLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    message: "Too many OTP resend requests. Please try again later.",
+    message: "Too many device verification attempts. Please try again later.",
   },
 });
 
@@ -3969,61 +3899,6 @@ const parseBooleanInput = (value) => {
   }
   return false;
 };
-
-const normalizeOtpInput = (value) => {
-  const digits = String(value || "")
-    .trim()
-    .replace(/\D/g, "");
-  return digits.length === OTP_CODE_LENGTH ? digits : null;
-};
-
-const generateOtpCode = () =>
-  String(crypto.randomInt(0, 10 ** OTP_CODE_LENGTH)).padStart(
-    OTP_CODE_LENGTH,
-    "0",
-  );
-
-const hasEmailOtpDeliveryConfig = () =>
-  Boolean(String(process.env.EMAIL_HOST || "").trim()) &&
-  Boolean(String(process.env.EMAIL_USER || "").trim()) &&
-  Boolean(String(process.env.EMAIL_PASS || "").trim());
-
-async function deliverLoginOtpNotifications({ user, otp, expiresInMinutes }) {
-  const safeName = user.user_name || user.first_name || user.email || "there";
-  const emailConfigured = hasEmailOtpDeliveryConfig();
-  const deliveryTasks = [];
-
-  if (emailConfigured) {
-    deliveryTasks.push(
-      sendLoginOtpEmail({
-        email: user.email,
-        otp,
-        userName: safeName,
-        expiresInMinutes,
-      })
-        .then(() => ({ delivered: true, channel: "email" }))
-        .catch((error) => {
-          console.error("Login OTP email failed:", error);
-          return { delivered: false, channel: "email", error };
-        }),
-    );
-  } else {
-    console.warn("Login OTP email skipped: email transport is not configured.");
-  }
-
-  if (!deliveryTasks.length) {
-    console.error("Login OTP delivery unavailable:", {
-      userId: user.id,
-      emailConfigured,
-    });
-    return [];
-  }
-
-  const results = await Promise.all(deliveryTasks);
-  return results
-    .filter((result) => result && result.delivered)
-    .map((result) => result.channel);
-}
 
 const normalizeTransportList = (value) =>
   (Array.isArray(value) ? value : []).filter(
@@ -4048,13 +3923,6 @@ const buildSuccessfulAdminLoginResponse = (
   token: issueAdminAccessToken(user),
   user: serializeAdminUser(user),
 });
-
-const hasFreshOtpVerification = (lastOtpVerifiedAt) => {
-  if (!lastOtpVerifiedAt) return false;
-  const verifiedAtMs = new Date(lastOtpVerifiedAt).getTime();
-  if (!Number.isFinite(verifiedAtMs)) return false;
-  return Date.now() - verifiedAtMs < OTP_REVERIFY_WINDOW_MS;
-};
 
 const issuePendingLoginTicket = (user, nextAction) =>
   jwt.sign(
@@ -4249,70 +4117,6 @@ async function clearWebAuthnChallenges(loginTicket) {
   );
 }
 
-async function issueLoginOtpChallenge(user) {
-  const normalizedEmail = normalizeLoginEmail(user.email);
-  const challengeId = crypto.randomUUID();
-  const otpCode = generateOtpCode();
-  const otpHash = await bcrypt.hash(otpCode, OTP_HASH_ROUNDS);
-  const expiresAt = new Date(Date.now() + OTP_TTL_MS);
-
-  await db.query(
-    `DELETE FROM ${OTP_CHALLENGE_TABLE}
-     WHERE user_id = $1
-       AND verified_at IS NULL`,
-    [user.id],
-  );
-
-  await db.query(
-    `INSERT INTO ${OTP_CHALLENGE_TABLE}
-      (challenge_id, user_id, email, otp_hash, expires_at, attempts, max_attempts, resend_count, last_sent_at, channels)
-     VALUES ($1, $2, $3, $4, $5, 0, $6, 0, now(), '[]'::jsonb)`,
-    [
-      challengeId,
-      user.id,
-      normalizedEmail,
-      otpHash,
-      expiresAt,
-      OTP_MAX_ATTEMPTS,
-    ],
-  );
-
-  const deliveryChannels = await deliverLoginOtpNotifications({
-    user: { ...user, email: normalizedEmail },
-    otp: otpCode,
-    expiresInMinutes: OTP_TTL_MS / (60 * 1000),
-  });
-
-  if (!deliveryChannels.length) {
-    await db.query(
-      `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
-      [challengeId],
-    );
-    const deliveryError = new Error("Unable to deliver OTP");
-    deliveryError.code = "OTP_DELIVERY_UNAVAILABLE";
-    throw deliveryError;
-  }
-
-  try {
-    await db.query(
-      `UPDATE ${OTP_CHALLENGE_TABLE}
-       SET channels = $2::jsonb
-       WHERE challenge_id = $1`,
-      [challengeId, JSON.stringify(deliveryChannels)],
-    );
-  } catch (err) {
-    console.warn("Failed to persist OTP delivery channels:", err);
-  }
-
-  return {
-    challengeId,
-    deliveryChannels,
-    expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
-    resendAfterMs: OTP_RESEND_COOLDOWN_MS,
-    maxAttempts: OTP_MAX_ATTEMPTS,
-  };
-}
-
 /* -----------------------
   AUTH Routes
 ------------------------*/
@@ -4413,16 +4217,6 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
 });
 
 app.post(
-  "/api/auth/login/verify-otp",
-  loginOtpVerifyLimiter,
-  async (_req, res) =>
-    res.status(410).json({
-      message:
-        "OTP sign-in is no longer available. Use device verification to continue.",
-    }),
-);
-
-app.post(
   "/api/auth/login/webauthn/options",
   loginInitiateLimiter,
   async (req, res) => {
@@ -4491,7 +4285,7 @@ app.post(
 
 app.post(
   "/api/auth/login/webauthn/verify",
-  loginOtpVerifyLimiter,
+  webAuthnVerifyLimiter,
   async (req, res) => {
     try {
       const loginTicket = String(req.body?.loginTicket || "").trim();
@@ -4675,7 +4469,7 @@ app.post(
 
 app.post(
   "/api/auth/login/webauthn/register/verify",
-  loginOtpVerifyLimiter,
+  webAuthnVerifyLimiter,
   async (req, res) => {
     try {
       const loginTicket = String(req.body?.loginTicket || "").trim();
@@ -4783,16 +4577,6 @@ app.post(
     res.status(400).json({
       message:
         "Device verification setup is required before you can finish signing in.",
-    }),
-);
-
-app.post(
-  "/api/auth/login/resend-otp",
-  loginOtpResendLimiter,
-  async (_req, res) =>
-    res.status(410).json({
-      message:
-        "OTP sign-in is no longer available. Use device verification to continue.",
     }),
 );
 
