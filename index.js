@@ -3983,85 +3983,14 @@ const generateOtpCode = () =>
     "0",
   );
 
-const normalizeSmsRecipient = (phone) => {
-  const raw = String(phone || "").trim();
-  if (!raw) return null;
-  const compact = raw.replace(/\s+/g, "");
-  if (/^\+\d{8,15}$/.test(compact)) return compact;
-
-  const defaultCountryCode = String(
-    process.env.OTP_SMS_DEFAULT_COUNTRY_CODE || "",
-  ).trim();
-  const digits = raw.replace(/\D/g, "");
-  if (defaultCountryCode && /^\+\d{1,4}$/.test(defaultCountryCode) && digits) {
-    return `${defaultCountryCode}${digits}`;
-  }
-
-  return null;
-};
-
-async function sendLoginOtpSms({ phone, otp, expiresInMinutes = 5, userName }) {
-  const recipient = normalizeSmsRecipient(phone);
-  if (!recipient) {
-    return { delivered: false, skipped: true, reason: "invalid_phone" };
-  }
-
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
-  const fromNumber = process.env.TWILIO_FROM_NUMBER;
-  if (!accountSid || !authToken || !fromNumber) {
-    return { delivered: false, skipped: true, reason: "sms_not_configured" };
-  }
-
-  if (typeof fetch !== "function") {
-    return { delivered: false, skipped: true, reason: "fetch_not_available" };
-  }
-
-  const safeMinutes = Number.isFinite(expiresInMinutes)
-    ? Math.max(1, Math.floor(expiresInMinutes))
-    : 5;
-  const body = `Your Hook login code is ${otp}. It expires in ${safeMinutes} minutes.`;
-
-  const response = await fetch(
-    `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({
-        From: fromNumber,
-        To: recipient,
-        Body: body,
-      }).toString(),
-    },
-  );
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    throw new Error(
-      `SMS delivery failed (${response.status})${errorText ? `: ${errorText}` : ""}`,
-    );
-  }
-
-  return { delivered: true, channel: "sms", recipient, userName };
-}
-
 const hasEmailOtpDeliveryConfig = () =>
   Boolean(String(process.env.EMAIL_HOST || "").trim()) &&
   Boolean(String(process.env.EMAIL_USER || "").trim()) &&
   Boolean(String(process.env.EMAIL_PASS || "").trim());
 
-const hasSmsOtpDeliveryConfig = () =>
-  Boolean(String(process.env.TWILIO_ACCOUNT_SID || "").trim()) &&
-  Boolean(String(process.env.TWILIO_AUTH_TOKEN || "").trim()) &&
-  Boolean(String(process.env.TWILIO_FROM_NUMBER || "").trim());
-
 async function deliverLoginOtpNotifications({ user, otp, expiresInMinutes }) {
   const safeName = user.user_name || user.first_name || user.email || "there";
   const emailConfigured = hasEmailOtpDeliveryConfig();
-  const smsConfigured = hasSmsOtpDeliveryConfig();
   const deliveryTasks = [];
 
   if (emailConfigured) {
@@ -4082,30 +4011,10 @@ async function deliverLoginOtpNotifications({ user, otp, expiresInMinutes }) {
     console.warn("Login OTP email skipped: email transport is not configured.");
   }
 
-  if (user.phone && smsConfigured) {
-    deliveryTasks.push(
-      sendLoginOtpSms({
-        phone: user.phone,
-        otp,
-        expiresInMinutes,
-        userName: safeName,
-      })
-        .then((result) => result)
-        .catch((error) => {
-          console.error("Login OTP SMS failed:", error);
-          return { delivered: false, channel: "sms", error };
-        }),
-    );
-  } else if (user.phone && !smsConfigured) {
-    console.warn("Login OTP SMS skipped: Twilio is not configured.");
-  }
-
   if (!deliveryTasks.length) {
     console.error("Login OTP delivery unavailable:", {
       userId: user.id,
-      hasPhone: Boolean(user.phone),
       emailConfigured,
-      smsConfigured,
     });
     return [];
   }
