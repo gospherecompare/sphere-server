@@ -38,6 +38,14 @@ const {
 const {
   recomputeSmartphoneCompetitorAnalysis,
 } = require("./utils/competitorAnalysis");
+const {
+  cleanText,
+  cleanToken,
+  getSearchPopularityDevices,
+  normalizeProductType,
+  normalizeSearchQuery,
+  resolveSearchInterestProduct,
+} = require("./utils/searchPopularity");
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
@@ -3826,6 +3834,56 @@ async function runMigrations() {
     await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_feature_click_stats_device_day
       ON feature_click_stats (device_type, day);
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS search_interest_events (
+        id SERIAL PRIMARY KEY,
+        event_id TEXT UNIQUE,
+        query TEXT,
+        normalized_query TEXT,
+        product_id INT REFERENCES products(id) ON DELETE SET NULL,
+        product_type TEXT,
+        device_type TEXT,
+        source TEXT,
+        created_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_search_interest_events_product_created
+      ON search_interest_events (product_id, created_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_search_interest_events_query_created
+      ON search_interest_events (normalized_query, created_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_search_interest_events_created_at
+      ON search_interest_events (created_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS page_engagement_events (
+        id SERIAL PRIMARY KEY,
+        product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        page_path TEXT,
+        source TEXT,
+        duration_ms INT NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+        created_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_page_engagement_events_product_created
+      ON page_engagement_events (product_id, created_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_page_engagement_events_created_at
+      ON page_engagement_events (created_at DESC);
     `);
 
     console.log("✅ Migrations to   completed");
@@ -11277,6 +11335,42 @@ app.post("/api/public/product/:id/view", async (req, res) => {
   }
 });
 
+app.post("/api/public/page-engagement", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const productId = Number(body.product_id ?? body.productId);
+    const durationRaw = Number(body.duration_ms ?? body.durationMs ?? 0);
+    const durationMs = Number.isFinite(durationRaw)
+      ? Math.min(30 * 60 * 1000, Math.max(0, Math.floor(durationRaw)))
+      : 0;
+    const pagePath =
+      cleanText(body.page_path ?? body.pagePath ?? "", 255) || null;
+    const source = cleanToken(body.source, 48) || "detail";
+
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ message: "Invalid product id" });
+    }
+
+    await db.query(
+      `
+      INSERT INTO page_engagement_events (
+        product_id,
+        page_path,
+        source,
+        duration_ms
+      )
+      VALUES ($1, $2, $3, $4)
+      `,
+      [productId, pagePath, source, durationMs],
+    );
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("POST /api/public/page-engagement error:", err);
+    return res.status(500).json({ success: false });
+  }
+});
+
 // Recompute Hook Dynamic Score (admin) - use external cron to call this endpoint,
 // or run `npm run recompute:hookscore` on a schedule.
 app.post("/api/admin/hook-score/recompute", authenticate, async (req, res) => {
@@ -11724,6 +11818,80 @@ app.post("/api/public/feature-click", async (req, res) => {
   }
 });
 
+app.post("/api/public/search-interest", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const query = cleanText(body.query, 180) || null;
+    const rawProductType = body.product_type ?? body.productType ?? "";
+    const rawDeviceType =
+      body.device_type ?? body.deviceType ?? rawProductType ?? "";
+    const normalizedProductType =
+      rawProductType === "" || rawProductType === null || rawProductType === undefined
+        ? null
+        : normalizeProductType(rawProductType);
+    const normalizedDeviceType =
+      rawDeviceType === "" || rawDeviceType === null || rawDeviceType === undefined
+        ? null
+        : normalizeProductType(rawDeviceType);
+
+    if (rawProductType && normalizedProductType === undefined) {
+      return res.status(400).json({ message: "Invalid product_type" });
+    }
+
+    if (rawDeviceType && normalizedDeviceType === undefined) {
+      return res.status(400).json({ message: "Invalid device_type" });
+    }
+
+    const resolvedProduct = await resolveSearchInterestProduct(db, {
+      productId: body.product_id ?? body.productId,
+      productType: normalizedProductType || normalizedDeviceType || null,
+      query,
+    });
+
+    if (!query && !resolvedProduct?.product_id) {
+      return res
+        .status(400)
+        .json({ message: "query or product_id is required" });
+    }
+
+    const eventId = cleanToken(body.event_id ?? body.eventId, 96) || null;
+    const source = cleanToken(body.source, 48) || "search";
+
+    await db.query(
+      `
+      INSERT INTO search_interest_events (
+        event_id,
+        query,
+        normalized_query,
+        product_id,
+        product_type,
+        device_type,
+        source
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (event_id) DO NOTHING
+      `,
+      [
+        eventId,
+        query,
+        query ? normalizeSearchQuery(query) : null,
+        resolvedProduct?.product_id || null,
+        resolvedProduct?.product_type || normalizedProductType || null,
+        normalizedDeviceType || normalizedProductType || null,
+        source,
+      ],
+    );
+
+    return res.json({
+      success: true,
+      product_id: resolvedProduct?.product_id || null,
+    });
+  } catch (err) {
+    console.error("POST /api/public/search-interest error:", err);
+    return res.status(500).json({ success: false });
+  }
+});
+
 // Popular feature ordering (public) - last N days
 app.get("/api/public/popular-features", async (req, res) => {
   try {
@@ -11773,6 +11941,74 @@ app.get("/api/public/popular-features", async (req, res) => {
   } catch (err) {
     console.error("GET /api/public/popular-features error:", err);
     return res.status(500).json({ message: "Failed to load popular features" });
+  }
+});
+
+app.get("/api/public/search-popularity", async (req, res) => {
+  try {
+    const query = req.query || {};
+    const rawType = String(
+      query.productType ?? query.product_type ?? query.type ?? "",
+    ).trim();
+
+    if (rawType && normalizeProductType(rawType) === undefined) {
+      return res.status(400).json({ message: "Invalid productType" });
+    }
+
+    const result = await getSearchPopularityDevices(db, {
+      productType: rawType,
+      days: query.days,
+      limit: query.limit ?? 5,
+    });
+
+    return res.json({
+      success: true,
+      product_type: result.productType || "all",
+      days: result.days,
+      generated_at: new Date().toISOString(),
+      devices: result.devices,
+    });
+  } catch (err) {
+    console.error("GET /api/public/search-popularity error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to load search popularity" });
+  }
+});
+
+app.get("/api/admin/search-popularity", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const query = req.query || {};
+    const rawType = String(
+      query.productType ?? query.product_type ?? query.type ?? "",
+    ).trim();
+
+    if (rawType && normalizeProductType(rawType) === undefined) {
+      return res.status(400).json({ message: "Invalid productType" });
+    }
+
+    const result = await getSearchPopularityDevices(db, {
+      productType: rawType,
+      days: query.days,
+      limit: query.limit ?? 100,
+    });
+
+    return res.json({
+      success: true,
+      product_type: result.productType || "all",
+      days: result.days,
+      generated_at: new Date().toISOString(),
+      devices: result.devices,
+    });
+  } catch (err) {
+    console.error("GET /api/admin/search-popularity error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to load search popularity report" });
   }
 });
 
@@ -14395,11 +14631,18 @@ app.get("/api/public/product/:id", async (req, res) => {
   }
 });
 
-async function runGlobalSearch(queryText, { publishedOnly = true } = {}) {
+async function runGlobalSearch(
+  queryText,
+  { publishedOnly = true, limit = 5 } = {},
+) {
   const q = (queryText || "").trim();
   if (!q) return [];
 
-  const term = `%${q}%`;
+  const normalizedQuery = q.toLowerCase();
+  const containsTerm = `%${normalizedQuery}%`;
+  const prefixTerm = `${normalizedQuery}%`;
+  const wordPrefixTerm = `% ${normalizedQuery}%`;
+  const resultLimit = Math.min(20, toPositiveInt(limit, 5));
 
   const publishJoin = publishedOnly
     ? `
@@ -14409,25 +14652,6 @@ async function runGlobalSearch(queryText, { publishedOnly = true } = {}) {
       `
     : "";
 
-  const brandExistsClause = publishedOnly
-    ? `
-         AND EXISTS (
-           SELECT 1
-           FROM products p
-           INNER JOIN product_publish pub
-             ON pub.product_id = p.id
-            AND pub.is_published = true
-           WHERE p.brand_id = b.id
-         )
-      `
-    : `
-         AND EXISTS (
-           SELECT 1
-           FROM products p
-           WHERE p.brand_id = b.id
-         )
-      `;
-
   // Search products by name and brand with image
   const products = await db.query(
     `SELECT DISTINCT
@@ -14435,26 +14659,39 @@ async function runGlobalSearch(queryText, { publishedOnly = true } = {}) {
       p.name,
       p.product_type,
       b.name AS brand_name,
-      (SELECT image_url FROM product_images WHERE product_id = p.id AND position = 1 LIMIT 1) AS image_url
+      (SELECT image_url FROM product_images WHERE product_id = p.id AND position = 1 LIMIT 1) AS image_url,
+      CASE
+        WHEN LOWER(p.name) = $1 THEN 0
+        WHEN LOWER(COALESCE(b.name, '')) = $1 THEN 1
+        WHEN LOWER(p.name) LIKE $2 THEN 2
+        WHEN LOWER(COALESCE(b.name, '')) LIKE $2 THEN 3
+        WHEN LOWER(p.name) LIKE $3 THEN 4
+        WHEN LOWER(p.name) LIKE $4 THEN 5
+        WHEN LOWER(COALESCE(b.name, '')) LIKE $4 THEN 6
+        ELSE 7
+      END AS relevance_rank,
+      CASE
+        WHEN LOWER(p.name) LIKE $4 THEN POSITION($1 IN LOWER(p.name))
+        ELSE 999
+      END AS name_match_position
      FROM products p
      ${publishJoin}
      LEFT JOIN brands b ON b.id = p.brand_id
-     WHERE p.name ILIKE $1
-        OR b.name ILIKE $1
-     ORDER BY p.name ASC
-     LIMIT 10`,
-    [term],
-  );
-
-  // Search brands only
-  const brands = await db.query(
-    `SELECT b.id, b.name
-     FROM brands b
-     WHERE b.name ILIKE $1
-     ${brandExistsClause}
-     ORDER BY b.name ASC
-     LIMIT 6`,
-    [term],
+     WHERE LOWER(p.name) LIKE $4
+        OR LOWER(COALESCE(b.name, '')) LIKE $4
+     ORDER BY
+       relevance_rank ASC,
+       name_match_position ASC,
+       LENGTH(p.name) ASC,
+       p.name ASC
+     LIMIT $5`,
+    [
+      normalizedQuery,
+      prefixTerm,
+      wordPrefixTerm,
+      containsTerm,
+      resultLimit,
+    ],
   );
 
   const safeNum = (v) => {
@@ -14616,31 +14853,17 @@ async function runGlobalSearch(queryText, { publishedOnly = true } = {}) {
     });
   }
 
-  // Add brands to results (avoid duplicates)
-  for (const b of brands.rows) {
-    const brandExists = results.some(
-      (item) => item.type === "brand" && item.name === b.name,
-    );
-    const productExists = results.some(
-      (item) => item.type === "product" && item.brand_name === b.name,
-    );
-
-    if (!brandExists && !productExists) {
-      results.push({
-        type: "brand",
-        id: b.id,
-        name: b.name,
-      });
-    }
-  }
-
   return results;
 }
 
 // Public search: published products only
 app.get("/api/search", async (req, res) => {
   try {
-    const results = await runGlobalSearch(req.query.q, { publishedOnly: true });
+    const limit = Math.min(20, toPositiveInt(req.query.limit, 5));
+    const results = await runGlobalSearch(req.query.q, {
+      publishedOnly: true,
+      limit,
+    });
     res.json({ results });
   } catch (err) {
     console.error("GET /api/search error:", err);
@@ -14651,8 +14874,10 @@ app.get("/api/search", async (req, res) => {
 // Admin search: includes published + unpublished products
 app.get("/api/search/admin", authenticate, async (req, res) => {
   try {
+    const limit = Math.min(20, toPositiveInt(req.query.limit, 5));
     const results = await runGlobalSearch(req.query.q, {
       publishedOnly: false,
+      limit,
     });
     res.json({ results });
   } catch (err) {
