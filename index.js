@@ -4451,7 +4451,6 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
     const email = normalizeLoginEmail(b.email);
     const password = String(b.password || "");
     const deviceAuthSupported = parseBooleanInput(b.deviceAuthSupported);
-    const forceOtpFallback = parseBooleanInput(b.forceOtpFallback);
 
     if (!email || !password) {
       return res.status(400).json({ message: "email and password required" });
@@ -4472,11 +4471,14 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
     }
 
     const credentials = await listUserWebAuthnCredentials(user.id);
-    const canUseRegisteredDevice =
-      credentials.length > 0 && deviceAuthSupported && !forceOtpFallback;
-    const otpStillFresh = hasFreshOtpVerification(user.last_otp_verified_at);
+    if (!deviceAuthSupported) {
+      return res.status(400).json({
+        message:
+          "This account requires device verification. Use a browser and device with passkey, Face ID, fingerprint, Windows Hello, or screen-lock support.",
+      });
+    }
 
-    if (canUseRegisteredDevice && otpStillFresh) {
+    if (credentials.length > 0) {
       return res.json(
         buildPendingLoginResponse(
           user,
@@ -4486,26 +4488,17 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
       );
     }
 
-    const challenge = await issueLoginOtpChallenge(user);
-
-    return res.json({
-      message: "OTP sent",
-      nextStep: "otp",
-      otpRequired: true,
-      challengeId: challenge.challengeId,
-      expiresIn: challenge.expiresInSeconds,
-      resendAfterMs: challenge.resendAfterMs,
-      maxAttempts: challenge.maxAttempts,
-      deliveryChannels: challenge.deliveryChannels,
-    });
+    return res.json(
+      buildPendingLoginResponse(
+        user,
+        "device_setup",
+        "Set up device verification to finish signing in.",
+      ),
+    );
   } catch (err) {
-    console.error("Login OTP initiation error:", err);
-    const statusCode = err?.code === "OTP_DELIVERY_UNAVAILABLE" ? 503 : 500;
-    res.status(statusCode).json({
-      message:
-        err?.code === "OTP_DELIVERY_UNAVAILABLE"
-          ? "OTP delivery is unavailable right now. Please try again shortly."
-          : "Unable to start OTP login. Please try again.",
+    console.error("Login MFA initiation error:", err);
+    res.status(500).json({
+      message: "Unable to start MFA login. Please try again.",
     });
   }
 });
@@ -4513,164 +4506,11 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
 app.post(
   "/api/auth/login/verify-otp",
   loginOtpVerifyLimiter,
-  async (req, res) => {
-    let client;
-    try {
-      client = await db.connect();
-      const b = req.body || {};
-      const email = normalizeLoginEmail(b.email);
-      const challengeId = String(b.challengeId || "").trim();
-      const otp = normalizeOtpInput(b.otp);
-      const deviceAuthSupported = parseBooleanInput(b.deviceAuthSupported);
-      const forceOtpFallback = parseBooleanInput(b.forceOtpFallback);
-
-      if (!email || !challengeId || !otp) {
-        return res.status(400).json({
-          message: "challengeId, email and 6-digit otp are required",
-        });
-      }
-
-      await client.query("BEGIN");
-      const challengeResult = await client.query(
-        `SELECT *
-         FROM ${OTP_CHALLENGE_TABLE}
-         WHERE challenge_id = $1
-           AND email = $2
-         FOR UPDATE`,
-        [challengeId, email],
-      );
-
-      if (!challengeResult.rows.length) {
-        await client.query("ROLLBACK");
-        return res.status(401).json({
-          message: "OTP expired or invalid. Please log in again.",
-        });
-      }
-
-      const challenge = challengeResult.rows[0];
-      const expiresAtMs = new Date(challenge.expires_at).getTime();
-      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
-        await client.query(
-          `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
-          [challengeId],
-        );
-        await client.query("COMMIT");
-        return res.status(410).json({
-          message: "OTP expired. Please log in again.",
-        });
-      }
-
-      const maxAttempts = Number(challenge.max_attempts || OTP_MAX_ATTEMPTS);
-      const attempts = Number(challenge.attempts || 0);
-      if (attempts >= maxAttempts) {
-        await client.query(
-          `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
-          [challengeId],
-        );
-        await client.query("COMMIT");
-        return res.status(429).json({
-          message: "Too many invalid OTP attempts. Please log in again.",
-        });
-      }
-
-      const isValid = await bcrypt.compare(otp, challenge.otp_hash);
-      if (!isValid) {
-        const updated = await client.query(
-          `UPDATE ${OTP_CHALLENGE_TABLE}
-           SET attempts = attempts + 1
-           WHERE challenge_id = $1
-           RETURNING attempts, max_attempts`,
-          [challengeId],
-        );
-
-        const nextAttempts = Number(updated.rows[0]?.attempts || attempts + 1);
-        const nextMaxAttempts = Number(
-          updated.rows[0]?.max_attempts || maxAttempts,
-        );
-        const attemptsRemaining = Math.max(
-          0,
-          nextMaxAttempts - nextAttempts,
-        );
-
-        if (attemptsRemaining <= 0) {
-          await client.query(
-            `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
-            [challengeId],
-          );
-          await client.query("COMMIT");
-          return res.status(429).json({
-            message: "Too many invalid OTP attempts. Please log in again.",
-          });
-        }
-
-        await client.query("COMMIT");
-        return res.status(401).json({
-          message: "Invalid OTP",
-          attemptsRemaining,
-        });
-      }
-
-      await client.query(
-        `UPDATE "user"
-         SET last_otp_verified_at = now()
-         WHERE id = $1`,
-        [challenge.user_id],
-      );
-      await client.query(
-        `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
-        [challengeId],
-      );
-      await client.query("COMMIT");
-
-      const userResult = await db.query('SELECT * FROM "user" WHERE id = $1', [
-        challenge.user_id,
-      ]);
-      if (!userResult.rows.length) {
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      const user = userResult.rows[0];
-      const credentials = await listUserWebAuthnCredentials(user.id);
-
-      if (credentials.length > 0 && deviceAuthSupported && !forceOtpFallback) {
-        return res.json(
-          buildPendingLoginResponse(
-            user,
-            "device_auth",
-            "OTP verified. Use your device verification to finish signing in.",
-          ),
-        );
-      }
-
-      if (!credentials.length && deviceAuthSupported && !forceOtpFallback) {
-        return res.json(
-          buildPendingLoginResponse(
-            user,
-            "device_setup",
-            "OTP verified. Set up device verification for faster future logins.",
-          ),
-        );
-      }
-
-      return res.json(buildSuccessfulAdminLoginResponse(user));
-    } catch (err) {
-      if (client) {
-        try {
-          await client.query("ROLLBACK");
-        } catch (rollbackError) {
-          console.error("OTP verify rollback failed:", rollbackError);
-        }
-      }
-      console.error("Login OTP verification error:", err);
-      return res.status(500).json({
-        message: "Unable to verify OTP. Please try again.",
-      });
-    } finally {
-      if (client) {
-        client.release();
-      }
-    }
-  },
+  async (_req, res) =>
+    res.status(410).json({
+      message:
+        "OTP sign-in is no longer available. Use device verification to continue.",
+    }),
 );
 
 app.post(
@@ -5030,222 +4870,21 @@ app.post(
 app.post(
   "/api/auth/login/finalize",
   loginInitiateLimiter,
-  async (req, res) => {
-    try {
-      const loginTicket = String(req.body?.loginTicket || "").trim();
-      const pendingLogin = verifyPendingLoginTicket(loginTicket);
-
-      if (!pendingLogin || pendingLogin.nextAction !== "device_setup") {
-        return res.status(401).json({
-          message: "Login session expired. Please sign in again.",
-        });
-      }
-
-      const user = await getAdminUserById(pendingLogin.id);
-      if (!user) {
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      await clearWebAuthnChallenges(loginTicket);
-      return res.json(buildSuccessfulAdminLoginResponse(user));
-    } catch (err) {
-      console.error("Finalize login error:", err);
-      return res.status(500).json({
-        message: "Unable to finish login. Please try again.",
-      });
-    }
-  },
+  async (_req, res) =>
+    res.status(400).json({
+      message:
+        "Device verification setup is required before you can finish signing in.",
+    }),
 );
 
 app.post(
   "/api/auth/login/resend-otp",
   loginOtpResendLimiter,
-  async (req, res) => {
-    let client;
-    try {
-      client = await db.connect();
-      const b = req.body || {};
-      const email = normalizeLoginEmail(b.email);
-      const challengeId = String(b.challengeId || "").trim();
-
-      if (!email || !challengeId) {
-        await client.query("ROLLBACK").catch(() => {});
-        return res.status(400).json({
-          message: "challengeId and email are required",
-        });
-      }
-
-      await client.query("BEGIN");
-      const challengeResult = await client.query(
-        `SELECT *
-         FROM ${OTP_CHALLENGE_TABLE}
-         WHERE challenge_id = $1
-           AND email = $2
-         FOR UPDATE`,
-        [challengeId, email],
-      );
-
-      if (!challengeResult.rows.length) {
-        await client.query("ROLLBACK");
-        return res.status(410).json({
-          message: "OTP expired. Please log in again.",
-        });
-      }
-
-      const challenge = challengeResult.rows[0];
-      const expiresAtMs = new Date(challenge.expires_at).getTime();
-      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
-        await client.query(
-          `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
-          [challengeId],
-        );
-        await client.query("COMMIT");
-        return res.status(410).json({
-          message: "OTP expired. Please log in again.",
-        });
-      }
-
-      const maxAttempts = Number(challenge.max_attempts || OTP_MAX_ATTEMPTS);
-      const attempts = Number(challenge.attempts || 0);
-      if (attempts >= maxAttempts) {
-        await client.query(
-          `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
-          [challengeId],
-        );
-        await client.query("COMMIT");
-        return res.status(429).json({
-          message: "Too many invalid OTP attempts. Please log in again.",
-        });
-      }
-
-      const lastSentAtMs = new Date(challenge.last_sent_at).getTime();
-      const cooldownRemainingMs = Math.max(
-        0,
-        OTP_RESEND_COOLDOWN_MS - (Date.now() - lastSentAtMs),
-      );
-      if (cooldownRemainingMs > 0) {
-        await client.query("ROLLBACK");
-        return res.status(429).json({
-          message: "Please wait before requesting another OTP.",
-          retryAfterMs: cooldownRemainingMs,
-        });
-      }
-
-      const userResult = await client.query('SELECT * FROM "user" WHERE id = $1', [
-        challenge.user_id,
-      ]);
-      if (!userResult.rows.length) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      const user = userResult.rows[0];
-      const otpCode = generateOtpCode();
-      const otpHash = await bcrypt.hash(otpCode, OTP_HASH_ROUNDS);
-      const nextExpiresAt = new Date(Date.now() + OTP_TTL_MS);
-      const previousState = {
-        otp_hash: challenge.otp_hash,
-        expires_at: challenge.expires_at,
-        attempts: challenge.attempts,
-        resend_count: challenge.resend_count,
-        last_sent_at: challenge.last_sent_at,
-        channels: challenge.channels || [],
-      };
-
-      await client.query(
-        `UPDATE ${OTP_CHALLENGE_TABLE}
-         SET otp_hash = $2,
-             expires_at = $3,
-             attempts = 0,
-             last_sent_at = now()
-         WHERE challenge_id = $1`,
-        [challengeId, otpHash, nextExpiresAt],
-      );
-      await client.query("COMMIT");
-
-      const deliveryChannels = await deliverLoginOtpNotifications({
-        user,
-        otp: otpCode,
-        expiresInMinutes: OTP_TTL_MS / (60 * 1000),
-      });
-
-      if (!deliveryChannels.length) {
-        const revertClient = await db.connect();
-        try {
-          await revertClient.query("BEGIN");
-          await revertClient.query(
-            `UPDATE ${OTP_CHALLENGE_TABLE}
-             SET otp_hash = $2,
-                 expires_at = $3,
-                 attempts = $4,
-                 resend_count = $5,
-                 last_sent_at = $6,
-                 channels = $7::jsonb
-             WHERE challenge_id = $1`,
-            [
-              challengeId,
-              previousState.otp_hash,
-              previousState.expires_at,
-              previousState.attempts,
-              previousState.resend_count,
-              previousState.last_sent_at,
-              JSON.stringify(previousState.channels || []),
-            ],
-          );
-          await revertClient.query("COMMIT");
-        } catch (revertError) {
-          try {
-            await revertClient.query("ROLLBACK");
-          } catch (rollbackError) {
-            console.error("OTP resend rollback failed:", rollbackError);
-          }
-          console.error("OTP resend revert failed:", revertError);
-        } finally {
-          revertClient.release();
-        }
-
-        return res.status(500).json({
-          message: "Unable to deliver OTP. Please try again.",
-        });
-      }
-
-      await db.query(
-        `UPDATE ${OTP_CHALLENGE_TABLE}
-         SET channels = $2::jsonb,
-             resend_count = resend_count + 1,
-             last_sent_at = now()
-         WHERE challenge_id = $1`,
-        [challengeId, JSON.stringify(deliveryChannels)],
-      ).catch((err) => {
-        console.warn("Failed to update OTP resend metadata:", err);
-      });
-
-      return res.json({
-        message: "OTP sent again",
-        challengeId,
-        expiresIn: Math.floor(OTP_TTL_MS / 1000),
-        resendAfterMs: OTP_RESEND_COOLDOWN_MS,
-        maxAttempts: OTP_MAX_ATTEMPTS,
-        deliveryChannels,
-      });
-    } catch (err) {
-      if (client) {
-        try {
-          await client.query("ROLLBACK");
-        } catch (rollbackError) {
-          console.error("OTP resend rollback failed:", rollbackError);
-        }
-      }
-      console.error("Login OTP resend error:", err);
-      return res.status(500).json({
-        message: "Unable to resend OTP. Please try again.",
-      });
-    } finally {
-      if (client) {
-        client.release();
-      }
-    }
-  },
+  async (_req, res) =>
+    res.status(410).json({
+      message:
+        "OTP sign-in is no longer available. Use device verification to continue.",
+    }),
 );
 
 /* ---- ADMIN Profile Endpoints ---- */
