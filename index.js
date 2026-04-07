@@ -3394,6 +3394,21 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
+      ALTER TABLE auth_login_challenges
+      ADD COLUMN IF NOT EXISTS user_id INT REFERENCES "user"(id) ON DELETE CASCADE,
+      ADD COLUMN IF NOT EXISTS email TEXT,
+      ADD COLUMN IF NOT EXISTS otp_hash TEXT,
+      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS attempts INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS max_attempts INT DEFAULT 5,
+      ADD COLUMN IF NOT EXISTS resend_count INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_sent_at TIMESTAMPTZ DEFAULT now(),
+      ADD COLUMN IF NOT EXISTS channels JSONB DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
+    `);
+
+    await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_auth_login_challenges_user_id
       ON auth_login_challenges (user_id);
     `);
@@ -3424,6 +3439,19 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
+      ALTER TABLE auth_webauthn_credentials
+      ADD COLUMN IF NOT EXISTS user_id INT REFERENCES "user"(id) ON DELETE CASCADE,
+      ADD COLUMN IF NOT EXISTS credential_id TEXT,
+      ADD COLUMN IF NOT EXISTS public_key BYTEA,
+      ADD COLUMN IF NOT EXISTS counter BIGINT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS transports JSONB DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS credential_device_type TEXT,
+      ADD COLUMN IF NOT EXISTS credential_backed_up BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now(),
+      ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
+    `);
+
+    await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_auth_webauthn_credentials_user_id
       ON auth_webauthn_credentials (user_id);
     `);
@@ -3440,6 +3468,18 @@ async function runMigrations() {
         expires_at TIMESTAMPTZ NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
+    `);
+
+    await safeQuery(`
+      ALTER TABLE auth_webauthn_challenges
+      ADD COLUMN IF NOT EXISTS user_id INT REFERENCES "user"(id) ON DELETE CASCADE,
+      ADD COLUMN IF NOT EXISTS purpose TEXT,
+      ADD COLUMN IF NOT EXISTS login_ticket_hash TEXT,
+      ADD COLUMN IF NOT EXISTS challenge TEXT,
+      ADD COLUMN IF NOT EXISTS rp_id TEXT,
+      ADD COLUMN IF NOT EXISTS expected_origin TEXT,
+      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
     `);
 
     await safeQuery(`
@@ -4008,23 +4048,41 @@ async function sendLoginOtpSms({ phone, otp, expiresInMinutes = 5, userName }) {
   return { delivered: true, channel: "sms", recipient, userName };
 }
 
+const hasEmailOtpDeliveryConfig = () =>
+  Boolean(String(process.env.EMAIL_HOST || "").trim()) &&
+  Boolean(String(process.env.EMAIL_USER || "").trim()) &&
+  Boolean(String(process.env.EMAIL_PASS || "").trim());
+
+const hasSmsOtpDeliveryConfig = () =>
+  Boolean(String(process.env.TWILIO_ACCOUNT_SID || "").trim()) &&
+  Boolean(String(process.env.TWILIO_AUTH_TOKEN || "").trim()) &&
+  Boolean(String(process.env.TWILIO_FROM_NUMBER || "").trim());
+
 async function deliverLoginOtpNotifications({ user, otp, expiresInMinutes }) {
   const safeName = user.user_name || user.first_name || user.email || "there";
-  const deliveryTasks = [
-    sendLoginOtpEmail({
-      email: user.email,
-      otp,
-      userName: safeName,
-      expiresInMinutes,
-    })
-      .then(() => ({ delivered: true, channel: "email" }))
-      .catch((error) => {
-        console.error("Login OTP email failed:", error);
-        return { delivered: false, channel: "email", error };
-      }),
-  ];
+  const emailConfigured = hasEmailOtpDeliveryConfig();
+  const smsConfigured = hasSmsOtpDeliveryConfig();
+  const deliveryTasks = [];
 
-  if (user.phone) {
+  if (emailConfigured) {
+    deliveryTasks.push(
+      sendLoginOtpEmail({
+        email: user.email,
+        otp,
+        userName: safeName,
+        expiresInMinutes,
+      })
+        .then(() => ({ delivered: true, channel: "email" }))
+        .catch((error) => {
+          console.error("Login OTP email failed:", error);
+          return { delivered: false, channel: "email", error };
+        }),
+    );
+  } else {
+    console.warn("Login OTP email skipped: email transport is not configured.");
+  }
+
+  if (user.phone && smsConfigured) {
     deliveryTasks.push(
       sendLoginOtpSms({
         phone: user.phone,
@@ -4038,6 +4096,18 @@ async function deliverLoginOtpNotifications({ user, otp, expiresInMinutes }) {
           return { delivered: false, channel: "sms", error };
         }),
     );
+  } else if (user.phone && !smsConfigured) {
+    console.warn("Login OTP SMS skipped: Twilio is not configured.");
+  }
+
+  if (!deliveryTasks.length) {
+    console.error("Login OTP delivery unavailable:", {
+      userId: user.id,
+      hasPhone: Boolean(user.phone),
+      emailConfigured,
+      smsConfigured,
+    });
+    return [];
   }
 
   const results = await Promise.all(deliveryTasks);
@@ -4309,7 +4379,9 @@ async function issueLoginOtpChallenge(user) {
       `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
       [challengeId],
     );
-    throw new Error("Unable to deliver OTP");
+    const deliveryError = new Error("Unable to deliver OTP");
+    deliveryError.code = "OTP_DELIVERY_UNAVAILABLE";
+    throw deliveryError;
   }
 
   try {
@@ -4428,8 +4500,12 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
     });
   } catch (err) {
     console.error("Login OTP initiation error:", err);
-    res.status(500).json({
-      message: "Unable to start OTP login. Please try again.",
+    const statusCode = err?.code === "OTP_DELIVERY_UNAVAILABLE" ? 503 : 500;
+    res.status(statusCode).json({
+      message:
+        err?.code === "OTP_DELIVERY_UNAVAILABLE"
+          ? "OTP delivery is unavailable right now. Please try again shortly."
+          : "Unable to start OTP login. Please try again.",
     });
   }
 });
