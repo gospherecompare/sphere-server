@@ -1,7 +1,24 @@
 const { Pool } = require("pg");
 require("dotenv").config();
 
+const parseBooleanEnv = (value, fallback = false) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  return fallback;
+};
+
+const sslEnabled = parseBooleanEnv(process.env.DB_SSL, false);
+const rejectUnauthorized = parseBooleanEnv(
+  process.env.DB_SSL_REJECT_UNAUTHORIZED,
+  false,
+);
+
 const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || undefined,
   user: process.env.DB_USER,
   host: process.env.DB_HOST,
   database: process.env.DB_NAME,
@@ -12,7 +29,7 @@ const pool = new Pool({
   idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS, 10) || 30000,
   connectionTimeoutMillis:
     parseInt(process.env.DB_CONN_TIMEOUT_MS, 10) || 10000,
-  ssl: false,
+  ssl: sslEnabled ? { rejectUnauthorized } : false,
 });
 
 pool.on("error", (err) => {
