@@ -14644,17 +14644,20 @@ async function runGlobalSearch(
   const wordPrefixTerm = `% ${normalizedQuery}%`;
   const resultLimit = Math.min(20, toPositiveInt(limit, 5));
 
-  const publishJoin = publishedOnly
+  const publishFilter = publishedOnly
     ? `
-       INNER JOIN product_publish pub
-         ON pub.product_id = p.id
-        AND pub.is_published = true
+       EXISTS (
+         SELECT 1
+         FROM product_publish pub
+         WHERE pub.product_id = p.id
+           AND pub.is_published = true
+       )
       `
-    : "";
+    : "TRUE";
 
   // Search products by name and brand with image
   const products = await db.query(
-    `SELECT DISTINCT
+    `SELECT
       p.id,
       p.name,
       p.product_type,
@@ -14675,10 +14678,12 @@ async function runGlobalSearch(
         ELSE 999
       END AS name_match_position
      FROM products p
-     ${publishJoin}
      LEFT JOIN brands b ON b.id = p.brand_id
-     WHERE LOWER(p.name) LIKE $4
-        OR LOWER(COALESCE(b.name, '')) LIKE $4
+     WHERE ${publishFilter}
+       AND (
+         LOWER(p.name) LIKE $4
+         OR LOWER(COALESCE(b.name, '')) LIKE $4
+       )
      ORDER BY
        relevance_rank ASC,
        name_match_position ASC,
