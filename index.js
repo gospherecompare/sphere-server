@@ -17,6 +17,7 @@ const { client, db } = require("./db");
 const multer = require("multer");
 const {
   sendRegistrationMail,
+  sendAdminOrganizationPinOtpEmail,
   sendCareerApplicationEmail,
   sendCareerAssignmentEmail,
   sendCareerInterviewEmail,
@@ -3379,6 +3380,66 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
+      CREATE TABLE IF NOT EXISTS admin_security_config (
+        id INT PRIMARY KEY CHECK (id = 1),
+        organization_pin_hash TEXT,
+        updated_by INT REFERENCES "user"(id) ON DELETE SET NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      ALTER TABLE admin_security_config
+      ADD COLUMN IF NOT EXISTS organization_pin_hash TEXT,
+      ADD COLUMN IF NOT EXISTS updated_by INT REFERENCES "user"(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+    `);
+
+    await safeQuery(`
+      INSERT INTO admin_security_config (id)
+      VALUES (1)
+      ON CONFLICT (id) DO NOTHING;
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS admin_email_otp_challenges (
+        id UUID PRIMARY KEY,
+        user_id INT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+        email TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        code_hash TEXT NOT NULL,
+        login_ticket_hash TEXT,
+        attempts INT NOT NULL DEFAULT 0,
+        expires_at TIMESTAMPTZ NOT NULL,
+        consumed_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      ALTER TABLE admin_email_otp_challenges
+      ADD COLUMN IF NOT EXISTS user_id INT REFERENCES "user"(id) ON DELETE CASCADE,
+      ADD COLUMN IF NOT EXISTS email TEXT,
+      ADD COLUMN IF NOT EXISTS purpose TEXT,
+      ADD COLUMN IF NOT EXISTS code_hash TEXT,
+      ADD COLUMN IF NOT EXISTS login_ticket_hash TEXT,
+      ADD COLUMN IF NOT EXISTS attempts INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_admin_email_otp_user_purpose
+      ON admin_email_otp_challenges (user_id, purpose, created_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_admin_email_otp_expires_at
+      ON admin_email_otp_challenges (expires_at);
+    `);
+
+    await safeQuery(`
       CREATE TABLE IF NOT EXISTS auth_webauthn_credentials (
         id SERIAL PRIMARY KEY,
         user_id INT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
@@ -3899,11 +3960,23 @@ async function runMigrations() {
 
 const WEBAUTHN_CREDENTIAL_TABLE = "auth_webauthn_credentials";
 const WEBAUTHN_CHALLENGE_TABLE = "auth_webauthn_challenges";
+const ADMIN_SECURITY_CONFIG_TABLE = "admin_security_config";
+const ADMIN_EMAIL_OTP_TABLE = "admin_email_otp_challenges";
 const ACCESS_TOKEN_TTL = "1h";
 const PENDING_LOGIN_TOKEN_PURPOSE = "admin_pending_login";
 const PENDING_LOGIN_TOKEN_TTL_SECONDS = 15 * 60;
 const PENDING_LOGIN_TOKEN_TTL = `${PENDING_LOGIN_TOKEN_TTL_SECONDS}s`;
 const WEBAUTHN_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const ADMIN_PIN_SETUP_STEP = "pin_setup";
+const ADMIN_PIN_STEP = "pin";
+const ADMIN_PIN_MIN_LENGTH = 4;
+const ADMIN_PIN_MAX_LENGTH = 10;
+const ADMIN_EMAIL_OTP_LENGTH = 6;
+const ADMIN_EMAIL_OTP_TTL_MINUTES = 10;
+const ADMIN_EMAIL_OTP_TTL_MS = ADMIN_EMAIL_OTP_TTL_MINUTES * 60 * 1000;
+const ADMIN_EMAIL_OTP_MAX_ATTEMPTS = 5;
+const ADMIN_PIN_OTP_PURPOSE_SETUP = "organization_pin_setup";
+const ADMIN_PIN_OTP_PURPOSE_UPDATE = "organization_pin_update";
 const WEBAUTHN_RP_NAME =
   String(process.env.WEBAUTHN_RP_NAME || "Hooks Admin").trim() ||
   "Hooks Admin";
@@ -3943,6 +4016,27 @@ const webAuthnVerifyLimiter = rateLimit({
   },
 });
 
+const adminOtpSendLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message: "Too many verification code requests. Please try again later.",
+  },
+});
+
+const adminOtpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message:
+      "Too many verification attempts. Please request a new code and try again.",
+  },
+});
+
 const normalizeLoginEmail = (value) =>
   String(value || "")
     .trim()
@@ -3957,6 +4051,24 @@ const parseBooleanInput = (value) => {
   }
   return false;
 };
+
+const normalizeAdminPin = (value) =>
+  String(value || "")
+    .replace(/\s+/g, "")
+    .trim();
+
+const normalizeAdminOtp = (value) =>
+  String(value || "")
+    .replace(/\s+/g, "")
+    .trim();
+
+const isValidAdminPin = (value) =>
+  new RegExp(`^\\d{${ADMIN_PIN_MIN_LENGTH},${ADMIN_PIN_MAX_LENGTH}}$`).test(
+    normalizeAdminPin(value),
+  );
+
+const isValidAdminOtp = (value) =>
+  new RegExp(`^\\d{${ADMIN_EMAIL_OTP_LENGTH}}$`).test(normalizeAdminOtp(value));
 
 const normalizeTransportList = (value) =>
   (Array.isArray(value) ? value : []).filter(
@@ -4031,6 +4143,14 @@ const buildPendingLoginResponse = (user, nextAction, message) => {
     payload.deviceSetupRequired = true;
   }
 
+  if (nextAction === ADMIN_PIN_SETUP_STEP) {
+    payload.pinSetupRequired = true;
+  }
+
+  if (nextAction === ADMIN_PIN_STEP) {
+    payload.pinRequired = true;
+  }
+
   return payload;
 };
 
@@ -4077,6 +4197,254 @@ async function getAdminUserById(userId) {
     userId,
   ]);
   return result.rows[0] || null;
+}
+
+async function getAdminSecurityConfig() {
+  await db.query(
+    `INSERT INTO ${ADMIN_SECURITY_CONFIG_TABLE} (id)
+     VALUES (1)
+     ON CONFLICT (id) DO NOTHING`,
+  );
+
+  const result = await db.query(
+    `SELECT id, organization_pin_hash, updated_by, updated_at
+     FROM ${ADMIN_SECURITY_CONFIG_TABLE}
+     WHERE id = 1
+     LIMIT 1`,
+  );
+
+  return result.rows[0] || {
+    id: 1,
+    organization_pin_hash: null,
+    updated_by: null,
+    updated_at: null,
+  };
+}
+
+async function upsertAdminOrganizationPinHash(pinHash, updatedBy) {
+  const result = await db.query(
+    `INSERT INTO ${ADMIN_SECURITY_CONFIG_TABLE}
+      (id, organization_pin_hash, updated_by, updated_at)
+     VALUES (1, $1, $2, now())
+     ON CONFLICT (id)
+     DO UPDATE SET
+       organization_pin_hash = EXCLUDED.organization_pin_hash,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = now()
+     RETURNING id, organization_pin_hash, updated_by, updated_at`,
+    [pinHash, updatedBy || null],
+  );
+
+  return result.rows[0] || null;
+}
+
+const maskEmailAddress = (email) => {
+  const normalized = String(email || "").trim();
+  if (!normalized.includes("@")) return normalized;
+
+  const [local, domain] = normalized.split("@");
+  const maskedLocal =
+    local.length <= 2
+      ? `${local[0] || ""}*`
+      : `${local.slice(0, 2)}${"*".repeat(Math.max(1, local.length - 2))}`;
+
+  return `${maskedLocal}@${domain}`;
+};
+
+const hashAdminOtpCode = (code) =>
+  crypto
+    .createHash("sha256")
+    .update(String(code || ""))
+    .digest("hex");
+
+const generateAdminOtpCode = () =>
+  Array.from({ length: ADMIN_EMAIL_OTP_LENGTH }, () =>
+    crypto.randomInt(0, 10),
+  ).join("");
+
+async function cleanupAdminOtpChallenges() {
+  await db.query(
+    `DELETE FROM ${ADMIN_EMAIL_OTP_TABLE}
+     WHERE expires_at <= now()
+        OR consumed_at IS NOT NULL`,
+  );
+}
+
+async function createAdminOtpChallenge({ user, purpose, loginTicket }) {
+  const userId = Number(user?.id || 0);
+  const email = String(user?.email || "").trim();
+
+  if (!userId || !email) {
+    throw new Error("Unable to send verification code for this admin user.");
+  }
+
+  const challengeId = crypto.randomUUID();
+  const otpCode = generateAdminOtpCode();
+  const loginTicketHash = loginTicket ? hashLoginTicket(loginTicket) : null;
+  const expiresAt = new Date(Date.now() + ADMIN_EMAIL_OTP_TTL_MS);
+
+  await cleanupAdminOtpChallenges();
+  await db.query(
+    `DELETE FROM ${ADMIN_EMAIL_OTP_TABLE}
+     WHERE user_id = $1
+       AND purpose = $2
+       AND consumed_at IS NULL`,
+    [userId, purpose],
+  );
+
+  await db.query(
+    `INSERT INTO ${ADMIN_EMAIL_OTP_TABLE}
+      (id, user_id, email, purpose, code_hash, login_ticket_hash, attempts, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, 0, $7)`,
+    [
+      challengeId,
+      userId,
+      email,
+      purpose,
+      hashAdminOtpCode(otpCode),
+      loginTicketHash,
+      expiresAt,
+    ],
+  );
+
+  const purposeLabel =
+    purpose === ADMIN_PIN_OTP_PURPOSE_SETUP
+      ? "create or confirm the organization PIN"
+      : "change the organization PIN";
+
+  await sendAdminOrganizationPinOtpEmail({
+    email,
+    userName:
+      user.first_name ||
+      user.user_name ||
+      user.username ||
+      user.email ||
+      "Admin",
+    otpCode,
+    purposeLabel,
+    expiresInMinutes: ADMIN_EMAIL_OTP_TTL_MINUTES,
+  });
+
+  return {
+    challengeId,
+    expiresIn: ADMIN_EMAIL_OTP_TTL_MINUTES * 60,
+    maskedEmail: maskEmailAddress(email),
+  };
+}
+
+async function consumeAdminOtpChallenge({
+  challengeId,
+  userId,
+  purpose,
+  otp,
+  loginTicket,
+}) {
+  const normalizedChallengeId = String(challengeId || "").trim();
+  const normalizedOtp = normalizeAdminOtp(otp);
+
+  if (!normalizedChallengeId) {
+    return {
+      ok: false,
+      status: 400,
+      message: "Verification session is missing. Please request a new OTP.",
+    };
+  }
+
+  if (!isValidAdminOtp(normalizedOtp)) {
+    return {
+      ok: false,
+      status: 400,
+      message: `Enter the ${ADMIN_EMAIL_OTP_LENGTH}-digit verification OTP sent to your email.`,
+    };
+  }
+
+  await cleanupAdminOtpChallenges();
+
+  const result = await db.query(
+    `SELECT *
+     FROM ${ADMIN_EMAIL_OTP_TABLE}
+     WHERE id = $1
+       AND user_id = $2
+       AND purpose = $3
+     LIMIT 1`,
+    [normalizedChallengeId, userId, purpose],
+  );
+
+  const challenge = result.rows[0] || null;
+  if (!challenge) {
+    return {
+      ok: false,
+      status: 400,
+      message: "Verification session expired. Please request a new OTP.",
+    };
+  }
+
+  if (challenge.consumed_at) {
+    return {
+      ok: false,
+      status: 400,
+      message: "This verification OTP has already been used.",
+    };
+  }
+
+  const expiresAtMs = new Date(challenge.expires_at).getTime();
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
+    await db.query(`DELETE FROM ${ADMIN_EMAIL_OTP_TABLE} WHERE id = $1`, [
+      challenge.id,
+    ]);
+    return {
+      ok: false,
+      status: 400,
+      message: "Verification OTP expired. Please request a new OTP.",
+    };
+  }
+
+  if (loginTicket) {
+    const expectedLoginTicketHash = hashLoginTicket(loginTicket);
+    if (challenge.login_ticket_hash !== expectedLoginTicketHash) {
+      return {
+        ok: false,
+        status: 401,
+        message: "Login session expired. Please sign in again.",
+      };
+    }
+  }
+
+  const attempts = Number(challenge.attempts || 0);
+  if (attempts >= ADMIN_EMAIL_OTP_MAX_ATTEMPTS) {
+    await db.query(`DELETE FROM ${ADMIN_EMAIL_OTP_TABLE} WHERE id = $1`, [
+      challenge.id,
+    ]);
+    return {
+      ok: false,
+      status: 429,
+      message: "Too many invalid OTP attempts. Please request a new OTP.",
+    };
+  }
+
+  const matches = hashAdminOtpCode(normalizedOtp) === challenge.code_hash;
+  if (!matches) {
+    await db.query(
+      `UPDATE ${ADMIN_EMAIL_OTP_TABLE}
+       SET attempts = attempts + 1
+       WHERE id = $1`,
+      [challenge.id],
+    );
+    return {
+      ok: false,
+      status: 401,
+      message: "Invalid verification OTP",
+    };
+  }
+
+  await db.query(
+    `UPDATE ${ADMIN_EMAIL_OTP_TABLE}
+     SET consumed_at = now()
+     WHERE id = $1`,
+    [challenge.id],
+  );
+
+  return { ok: true };
 }
 
 async function listUserWebAuthnCredentials(userId) {
@@ -4221,7 +4589,6 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
     const b = req.body || {};
     const email = normalizeLoginEmail(b.email);
     const password = String(b.password || "");
-    const deviceAuthSupported = parseBooleanInput(b.deviceAuthSupported);
 
     if (!email || !password) {
       return res.status(400).json({ message: "email and password required" });
@@ -4241,20 +4608,13 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    const credentials = await listUserWebAuthnCredentials(user.id);
-    if (!deviceAuthSupported) {
-      return res.status(400).json({
-        message:
-          "This account requires device verification. Use a browser and device with passkey, Face ID, fingerprint, Windows Hello, or screen-lock support.",
-      });
-    }
-
-    if (credentials.length > 0) {
+    const securityConfig = await getAdminSecurityConfig();
+    if (securityConfig?.organization_pin_hash) {
       return res.json(
         buildPendingLoginResponse(
           user,
-          "device_auth",
-          "Use your device verification to finish signing in.",
+          ADMIN_PIN_STEP,
+          "Enter your organization PIN to finish signing in.",
         ),
       );
     }
@@ -4262,17 +4622,179 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
     return res.json(
       buildPendingLoginResponse(
         user,
-        "device_setup",
-        "Set up device verification to finish signing in.",
+        ADMIN_PIN_SETUP_STEP,
+        "Organization PIN is not configured yet. Create it and verify your email with an OTP to finish signing in.",
       ),
     );
   } catch (err) {
-    console.error("Login MFA initiation error:", err);
+    console.error("Login initiation error:", err);
     res.status(500).json({
-      message: "Unable to start MFA login. Please try again.",
+      message: "Unable to start login. Please try again.",
     });
   }
 });
+
+app.post("/api/auth/login/pin", webAuthnVerifyLimiter, async (req, res) => {
+  try {
+    const loginTicket = String(req.body?.loginTicket || "").trim();
+    const pin = normalizeAdminPin(req.body?.pin);
+    const pendingLogin = verifyPendingLoginTicket(loginTicket);
+
+    if (!pendingLogin || pendingLogin.nextAction !== ADMIN_PIN_STEP) {
+      return res.status(401).json({
+        message: "Login session expired. Please sign in again.",
+      });
+    }
+
+    if (!isValidAdminPin(pin)) {
+      return res.status(400).json({
+        message: `Enter a valid ${ADMIN_PIN_MIN_LENGTH}-${ADMIN_PIN_MAX_LENGTH} digit organization PIN.`,
+      });
+    }
+
+    const securityConfig = await getAdminSecurityConfig();
+    if (!securityConfig?.organization_pin_hash) {
+      return res.status(400).json({
+        message: "Organization PIN is not configured. Contact an administrator.",
+      });
+    }
+
+    const matches = await bcrypt.compare(pin, securityConfig.organization_pin_hash);
+    if (!matches) {
+      return res.status(401).json({ message: "Invalid organization PIN" });
+    }
+
+    const user = await getAdminUserById(pendingLogin.id);
+    if (!user) {
+      return res.status(401).json({ message: "User not found" });
+    }
+
+    return res.json(
+      buildSuccessfulAdminLoginResponse(
+        user,
+        "Login successful",
+      ),
+    );
+  } catch (err) {
+    console.error("Organization PIN login verify error:", err);
+    return res.status(500).json({
+      message: "Unable to verify organization PIN. Please try again.",
+    });
+  }
+});
+
+app.post(
+  "/api/auth/login/pin/setup/request-otp",
+  adminOtpSendLimiter,
+  async (req, res) => {
+    try {
+      const loginTicket = String(req.body?.loginTicket || "").trim();
+      const pendingLogin = verifyPendingLoginTicket(loginTicket);
+
+      if (!pendingLogin || pendingLogin.nextAction !== ADMIN_PIN_SETUP_STEP) {
+        return res.status(401).json({
+          message: "Login session expired. Please sign in again.",
+        });
+      }
+
+      const securityConfig = await getAdminSecurityConfig();
+      if (securityConfig?.organization_pin_hash) {
+        return res.status(400).json({
+          message:
+            "Organization PIN is already configured. Sign in with the current PIN.",
+        });
+      }
+
+      const user = await getAdminUserById(pendingLogin.id);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const challenge = await createAdminOtpChallenge({
+        user,
+        purpose: ADMIN_PIN_OTP_PURPOSE_SETUP,
+        loginTicket,
+      });
+
+      return res.json({
+        success: true,
+        message: `Verification OTP sent to ${challenge.maskedEmail}.`,
+        otpChallengeId: challenge.challengeId,
+        otpExpiresIn: challenge.expiresIn,
+      });
+    } catch (err) {
+      console.error("Organization PIN setup OTP send error:", err);
+      return res.status(500).json({
+        message: "Unable to send verification OTP. Please try again.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/auth/login/pin/setup/verify",
+  adminOtpVerifyLimiter,
+  async (req, res) => {
+    try {
+      const loginTicket = String(req.body?.loginTicket || "").trim();
+      const otpChallengeId = String(req.body?.otpChallengeId || "").trim();
+      const otp = normalizeAdminOtp(req.body?.otp);
+      const newPin = normalizeAdminPin(req.body?.newPin);
+      const pendingLogin = verifyPendingLoginTicket(loginTicket);
+
+      if (!pendingLogin || pendingLogin.nextAction !== ADMIN_PIN_SETUP_STEP) {
+        return res.status(401).json({
+          message: "Login session expired. Please sign in again.",
+        });
+      }
+
+      if (!isValidAdminPin(newPin)) {
+        return res.status(400).json({
+          message: `Organization PIN must be ${ADMIN_PIN_MIN_LENGTH}-${ADMIN_PIN_MAX_LENGTH} digits.`,
+        });
+      }
+
+      const securityConfig = await getAdminSecurityConfig();
+      if (securityConfig?.organization_pin_hash) {
+        return res.status(400).json({
+          message:
+            "Organization PIN is already configured. Sign in with the current PIN.",
+        });
+      }
+
+      const otpResult = await consumeAdminOtpChallenge({
+        challengeId: otpChallengeId,
+        userId: pendingLogin.id,
+        purpose: ADMIN_PIN_OTP_PURPOSE_SETUP,
+        otp,
+        loginTicket,
+      });
+      if (!otpResult.ok) {
+        return res.status(otpResult.status).json({ message: otpResult.message });
+      }
+
+      const user = await getAdminUserById(pendingLogin.id);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const hashedPin = await bcrypt.hash(newPin, 10);
+      await upsertAdminOrganizationPinHash(hashedPin, user.id);
+
+      return res.json(
+        buildSuccessfulAdminLoginResponse(
+          user,
+          "Organization PIN created and verified. Login successful.",
+        ),
+      );
+    } catch (err) {
+      console.error("Organization PIN setup verify error:", err);
+      return res.status(500).json({
+        message: "Unable to verify OTP and create the organization PIN.",
+      });
+    }
+  },
+);
 
 app.post(
   "/api/auth/login/webauthn/options",
@@ -4800,6 +5322,128 @@ app.post("/api/auth/change-password", authenticate, async (req, res) => {
   } catch (err) {
     console.error("Change admin password error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post(
+  "/api/auth/organization-pin/request-otp",
+  authenticate,
+  adminOtpSendLimiter,
+  async (req, res) => {
+    try {
+      const user = await getAdminUserById(req.user.id);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const securityConfig = await getAdminSecurityConfig();
+      const purpose = securityConfig?.organization_pin_hash
+        ? ADMIN_PIN_OTP_PURPOSE_UPDATE
+        : ADMIN_PIN_OTP_PURPOSE_SETUP;
+
+      const challenge = await createAdminOtpChallenge({
+        user,
+        purpose,
+      });
+
+      return res.json({
+        success: true,
+        message: `Verification OTP sent to ${challenge.maskedEmail}.`,
+        otpChallengeId: challenge.challengeId,
+        otpExpiresIn: challenge.expiresIn,
+        purpose,
+      });
+    } catch (err) {
+      console.error("Organization PIN OTP send error:", err);
+      return res.status(500).json({
+        message: "Unable to send verification OTP. Please try again.",
+      });
+    }
+  },
+);
+
+app.get("/api/auth/organization-pin/status", authenticate, async (req, res) => {
+  try {
+    const securityConfig = await getAdminSecurityConfig();
+
+    res.json({
+      success: true,
+      isConfigured: Boolean(securityConfig?.organization_pin_hash),
+      updated_at: securityConfig?.updated_at || null,
+      updated_by: securityConfig?.updated_by || null,
+    });
+  } catch (err) {
+    console.error("Get organization PIN status error:", err);
+    res.status(500).json({ message: "Failed to load organization PIN status" });
+  }
+});
+
+app.put("/api/auth/organization-pin", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const currentPin = normalizeAdminPin(req.body?.currentPin);
+    const newPin = normalizeAdminPin(req.body?.newPin);
+    const otp = normalizeAdminOtp(req.body?.otp);
+    const otpChallengeId = String(req.body?.otpChallengeId || "").trim();
+
+    if (!isValidAdminPin(newPin)) {
+      return res.status(400).json({
+        message: `Organization PIN must be ${ADMIN_PIN_MIN_LENGTH}-${ADMIN_PIN_MAX_LENGTH} digits.`,
+      });
+    }
+
+    const securityConfig = await getAdminSecurityConfig();
+    const currentHash = securityConfig?.organization_pin_hash || null;
+
+    if (currentHash) {
+      if (!currentPin) {
+        return res.status(400).json({
+          message: "Current organization PIN is required",
+        });
+      }
+
+      const currentMatches = await bcrypt.compare(currentPin, currentHash);
+      if (!currentMatches) {
+        return res.status(401).json({
+          message: "Current organization PIN is incorrect",
+        });
+      }
+
+      const samePin = await bcrypt.compare(newPin, currentHash);
+      if (samePin) {
+        return res.status(400).json({
+          message: "New organization PIN must be different from current PIN",
+        });
+      }
+    }
+
+    const otpResult = await consumeAdminOtpChallenge({
+      challengeId: otpChallengeId,
+      userId,
+      purpose: currentHash
+        ? ADMIN_PIN_OTP_PURPOSE_UPDATE
+        : ADMIN_PIN_OTP_PURPOSE_SETUP,
+      otp,
+    });
+    if (!otpResult.ok) {
+      return res.status(otpResult.status).json({ message: otpResult.message });
+    }
+
+    const hashedPin = await bcrypt.hash(newPin, 10);
+    const updated = await upsertAdminOrganizationPinHash(hashedPin, userId);
+
+    res.json({
+      success: true,
+      message: currentHash
+        ? "Organization PIN updated successfully"
+        : "Organization PIN created successfully",
+      isConfigured: true,
+      updated_at: updated?.updated_at || null,
+      updated_by: updated?.updated_by || userId,
+    });
+  } catch (err) {
+    console.error("Update organization PIN error:", err);
+    res.status(500).json({ message: "Failed to update organization PIN" });
   }
 });
 

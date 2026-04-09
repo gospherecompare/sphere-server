@@ -294,6 +294,70 @@ async function sendRegistrationEmail({ email, password, user_name }) {
   });
 }
 
+async function sendAdminOrganizationPinOtpEmail({
+  email,
+  userName,
+  otpCode,
+  purposeLabel,
+  expiresInMinutes = 10,
+}) {
+  const safeName = escapeHtml(userName || "Admin");
+  const safePurpose = escapeHtml(purposeLabel || "verify your admin access");
+  const safeOtp = escapeHtml(otpCode || "");
+  const safeExpiry = escapeHtml(String(expiresInMinutes));
+
+  await transporter.sendMail({
+    from: EMAIL_FROM,
+    to: email,
+    subject: "Your Hooks admin verification code",
+    text: `Hello ${userName || "Admin"}, your verification code is ${otpCode}. Use it to ${purposeLabel || "verify your admin access"}. This code expires in ${expiresInMinutes} minutes.`,
+    html: `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="UTF-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <title>Hooks Admin Verification Code</title>
+        </head>
+        <body style="margin:0;padding:24px;background:#f4f7fb;font-family:Arial,sans-serif;color:#1f2937;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+            <tr>
+              <td align="center">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;background:#ffffff;border-radius:16px;overflow:hidden;">
+                  <tr>
+                    <td style="padding:24px 28px;background:linear-gradient(135deg,#1d4ed8,#4338ca);color:#ffffff;">
+                      <div style="font-size:22px;font-weight:700;">Hooks Admin</div>
+                      <div style="margin-top:6px;font-size:14px;opacity:0.9;">Verification required</div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td style="padding:28px;">
+                      <p style="margin:0 0 12px;font-size:15px;line-height:1.7;">Hello ${safeName},</p>
+                      <p style="margin:0 0 16px;font-size:15px;line-height:1.7;">
+                        Use this verification code to ${safePurpose}.
+                      </p>
+                      <div style="margin:24px 0;padding:18px;border-radius:14px;background:#eef2ff;text-align:center;">
+                        <div style="font-size:30px;letter-spacing:8px;font-weight:700;color:#312e81;">${safeOtp}</div>
+                      </div>
+                      <p style="margin:0 0 12px;font-size:14px;line-height:1.7;color:#4b5563;">
+                        This code expires in ${safeExpiry} minutes. If you did not request this code, you can safely ignore this email.
+                      </p>
+                      <p style="margin:20px 0 0;font-size:14px;line-height:1.7;color:#4b5563;">
+                        Thanks,<br />
+                        Hooks Security
+                      </p>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+          </table>
+        </body>
+      </html>
+    `,
+  });
+}
+
 const renderCareerApplicationTemplate = ({ role, firstName, lastName }) => {
   const safeRole = escapeHtml(role || "");
   const roleLabel = safeRole || "the role you applied for";
@@ -895,6 +959,7 @@ async function sendCareerOfferEmail({
 module.exports = {
   sendRegistrationEmail,
   sendRegistrationMail: sendRegistrationEmail,
+  sendAdminOrganizationPinOtpEmail,
   sendCareerApplicationEmail,
   sendCareerAssignmentEmail,
   sendCareerInterviewEmail,
