@@ -2567,6 +2567,13 @@ const applySpecScoreToRows = (type, rows, profiles) => {
 
 const BLOG_ALLOWED_PRODUCT_TYPES = new Set(["smartphone", "laptop", "tv"]);
 const BLOG_ALLOWED_STATUSES = new Set(["draft", "published"]);
+const BLOG_ALLOWED_CATEGORIES = new Set([
+  "news",
+  "mobiles",
+  "gadgets",
+  "guides",
+  "launches",
+]);
 
 const toSafeFiniteNumber = (value, fallback = 0) => {
   const parsed = Number(value);
@@ -3782,6 +3789,7 @@ async function runMigrations() {
         product_id INT UNIQUE
           REFERENCES products(id)
           ON DELETE CASCADE,
+        category TEXT NOT NULL DEFAULT 'news',
         title TEXT NOT NULL,
         slug TEXT NOT NULL UNIQUE,
         excerpt TEXT,
@@ -3808,6 +3816,11 @@ async function runMigrations() {
     await safeQuery(`
       ALTER TABLE blogs
       ALTER COLUMN product_id DROP NOT NULL;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'news';
     `);
 
     await safeQuery(`
@@ -6219,12 +6232,18 @@ app.get("/api/admin/blogs/candidates", authenticate, async (req, res) => {
         p.name,
         p.product_type,
         b.name AS brand_name,
-        COALESCE(pub.is_published, false) AS is_published
+        COALESCE(pub.is_published, false) AS is_published,
+        bl.id AS existing_blog_id,
+        bl.title AS existing_blog_title,
+        bl.status AS existing_blog_status,
+        bl.category AS existing_blog_category
       FROM products p
       LEFT JOIN brands b
         ON b.id = p.brand_id
       LEFT JOIN product_publish pub
         ON pub.product_id = p.id
+      LEFT JOIN blogs bl
+        ON bl.product_id = p.id
       WHERE p.product_type = $1
       ORDER BY p.id DESC
       LIMIT $2
@@ -6251,6 +6270,10 @@ app.get("/api/admin/blogs/candidates", authenticate, async (req, res) => {
         spec_score: toSafeFiniteNumber(snapshot?.scored?.spec_score, 0),
         price: price || null,
         image: snapshot.hero_image || null,
+        existing_blog_id: Number(baseRow.existing_blog_id) || null,
+        existing_blog_title: baseRow.existing_blog_title || "",
+        existing_blog_status: baseRow.existing_blog_status || null,
+        existing_blog_category: baseRow.existing_blog_category || null,
       });
     }
 
@@ -6294,6 +6317,7 @@ app.get(
       SELECT
         id,
         product_id,
+        category,
         title,
         slug,
         excerpt,
@@ -6403,9 +6427,15 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
     const excerpt = String(req.body?.excerpt || "").trim();
     const contentTemplate = String(req.body?.content_template || "").trim();
     const requestedSlug = String(req.body?.slug || "").trim();
+    const requestedCategory = String(req.body?.category || "news")
+      .trim()
+      .toLowerCase();
     const requestedStatus = String(req.body?.status || "draft")
       .trim()
       .toLowerCase();
+    const category = BLOG_ALLOWED_CATEGORIES.has(requestedCategory)
+      ? requestedCategory
+      : "news";
     const status = BLOG_ALLOWED_STATUSES.has(requestedStatus)
       ? requestedStatus
       : "draft";
@@ -6475,21 +6505,22 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
         UPDATE blogs
         SET
           product_id = $2,
-          title = $3,
-          slug = $4,
-          excerpt = $5,
-          content_template = $6,
-          content_rendered = $7,
-          status = $8,
-          blog_eligible = $9,
-          eligibility_snapshot = $10::jsonb,
-          token_snapshot = $11::jsonb,
-          meta_title = $12,
-          meta_description = $13,
-          hero_image = $14,
-          updated_by = $15,
+          category = $3,
+          title = $4,
+          slug = $5,
+          excerpt = $6,
+          content_template = $7,
+          content_rendered = $8,
+          status = $9,
+          blog_eligible = $10,
+          eligibility_snapshot = $11::jsonb,
+          token_snapshot = $12::jsonb,
+          meta_title = $13,
+          meta_description = $14,
+          hero_image = $15,
+          updated_by = $16,
           published_at = CASE
-            WHEN $8 = 'published' THEN COALESCE(published_at, $16)
+            WHEN $9 = 'published' THEN COALESCE(published_at, $17)
             ELSE NULL
           END,
           updated_at = now()
@@ -6497,6 +6528,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
         RETURNING
           id,
           product_id,
+          category,
           title,
           slug,
           excerpt,
@@ -6516,6 +6548,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
         [
           targetBlogId,
           productId,
+          category,
           title,
           slug,
           excerpt || null,
@@ -6540,6 +6573,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
         `
         INSERT INTO blogs (
           product_id,
+          category,
           title,
           slug,
           excerpt,
@@ -6558,11 +6592,12 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           created_at,
           updated_at
         ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16,now(),now()
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,$16,$17,now(),now()
         )
         RETURNING
           id,
           product_id,
+          category,
           title,
           slug,
           excerpt,
@@ -6581,6 +6616,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       `,
         [
           productId,
+          category,
           title,
           slug,
           excerpt || null,
@@ -6632,6 +6668,7 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
       SELECT
         bl.id,
         bl.product_id,
+        bl.category,
         bl.title,
         bl.slug,
         bl.status,
@@ -6685,15 +6722,32 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
   }
 });
 
-app.get("/api/public/blogs", async (req, res) => {
+app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
   try {
-    const limit = Math.min(50, toPositiveInt(req.query.limit, 12));
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const blogId = Number(req.params.id);
+    if (!Number.isInteger(blogId) || blogId <= 0) {
+      return res.status(400).json({ message: "Invalid blog id" });
+    }
+
     const result = await db.query(
       `
       SELECT
-        bl.slug,
+        bl.id,
+        bl.product_id,
+        bl.category,
         bl.title,
+        bl.slug,
         bl.excerpt,
+        bl.content_template,
+        bl.content_rendered,
+        bl.status,
+        bl.blog_eligible,
+        bl.eligibility_snapshot,
+        bl.token_snapshot,
+        bl.meta_title,
+        bl.meta_description,
         COALESCE(
           bl.hero_image,
           (
@@ -6705,6 +6759,97 @@ app.get("/api/public/blogs", async (req, res) => {
           )
         ) AS hero_image,
         bl.published_at,
+        bl.created_at,
+        bl.updated_at,
+        p.name AS product_name,
+        p.product_type,
+        b.name AS brand_name
+      FROM blogs bl
+      LEFT JOIN products p
+        ON p.id = bl.product_id
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      WHERE bl.id = $1
+      LIMIT 1
+    `,
+      [blogId],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Blog not found" });
+    }
+
+    return res.json({ blog: result.rows[0] });
+  } catch (err) {
+    console.error("GET /api/admin/blogs/:id error:", err);
+    return res.status(500).json({ message: "Failed to fetch blog" });
+  }
+});
+
+app.delete("/api/admin/blogs/:id", authenticate, async (req, res) => {
+  try {
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const blogId = Number(req.params.id);
+    if (!Number.isInteger(blogId) || blogId <= 0) {
+      return res.status(400).json({ message: "Invalid blog id" });
+    }
+
+    const deleteResult = await db.query(
+      `
+      DELETE FROM blogs
+      WHERE id = $1
+      RETURNING id, title, product_id
+    `,
+      [blogId],
+    );
+
+    if (!deleteResult.rows.length) {
+      return res.status(404).json({ message: "Blog not found" });
+    }
+
+    return res.json({
+      message: "Blog deleted successfully",
+      blog: deleteResult.rows[0],
+    });
+  } catch (err) {
+    console.error("DELETE /api/admin/blogs/:id error:", err);
+    return res.status(500).json({ message: "Failed to delete blog" });
+  }
+});
+
+app.get("/api/public/blogs", async (req, res) => {
+  try {
+    const limit = Math.min(50, toPositiveInt(req.query.limit, 12));
+    const rawCategory = String(req.query.category || "")
+      .trim()
+      .toLowerCase();
+    const category = BLOG_ALLOWED_CATEGORIES.has(rawCategory)
+      ? rawCategory
+      : null;
+    const result = await db.query(
+      `
+      SELECT
+        bl.id,
+        bl.slug,
+        bl.category,
+        bl.title,
+        bl.excerpt,
+        bl.content_rendered,
+        bl.meta_title,
+        bl.meta_description,
+        COALESCE(
+          bl.hero_image,
+          (
+            SELECT pi.image_url
+            FROM product_images pi
+            WHERE pi.product_id = bl.product_id
+            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+            LIMIT 1
+          )
+        ) AS hero_image,
+        bl.published_at,
+        bl.updated_at,
         p.name AS product_name,
         p.product_type,
         b.name AS brand_name
@@ -6714,14 +6859,16 @@ app.get("/api/public/blogs", async (req, res) => {
       LEFT JOIN brands b
         ON b.id = p.brand_id
       WHERE bl.status = 'published'
+        ${category ? "AND bl.category = $2" : ""}
       ORDER BY bl.published_at DESC NULLS LAST, bl.updated_at DESC
       LIMIT $1
     `,
-      [limit],
+      category ? [limit, category] : [limit],
     );
 
     return res.json({
       limit,
+      category,
       blogs: result.rows || [],
     });
   } catch (err) {
@@ -6742,6 +6889,7 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
       SELECT
         bl.id,
         bl.product_id,
+        bl.category,
         bl.title,
         bl.slug,
         bl.excerpt,
@@ -6759,6 +6907,7 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
           )
         ) AS hero_image,
         bl.published_at,
+        bl.updated_at,
         p.name AS product_name,
         p.product_type,
         b.name AS brand_name
