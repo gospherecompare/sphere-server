@@ -4624,7 +4624,7 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
       buildPendingLoginResponse(
         user,
         ADMIN_PIN_SETUP_STEP,
-        "Organization PIN is not configured yet. Create it and verify your email with an OTP to finish signing in.",
+        "Organization PIN is not configured yet. Create it to finish signing in.",
       ),
     );
   } catch (err) {
@@ -4707,27 +4707,15 @@ app.post(
         });
       }
 
-      const user = await getAdminUserById(pendingLogin.id);
-      if (!user) {
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      const challenge = await createAdminOtpChallenge({
-        user,
-        purpose: ADMIN_PIN_OTP_PURPOSE_SETUP,
-        loginTicket,
-      });
-
       return res.json({
         success: true,
-        message: `Verification OTP sent to ${challenge.maskedEmail}.`,
-        otpChallengeId: challenge.challengeId,
-        otpExpiresIn: challenge.expiresIn,
+        message:
+          "OTP verification is disabled. You can continue with organization PIN setup directly.",
       });
     } catch (err) {
-      console.error("Organization PIN setup OTP send error:", err);
+      console.error("Organization PIN setup request error:", err);
       return res.status(500).json({
-        message: "Unable to send verification OTP. Please try again.",
+        message: "Unable to continue organization PIN setup. Please try again.",
       });
     }
   },
@@ -4739,8 +4727,6 @@ app.post(
   async (req, res) => {
     try {
       const loginTicket = String(req.body?.loginTicket || "").trim();
-      const otpChallengeId = String(req.body?.otpChallengeId || "").trim();
-      const otp = normalizeAdminOtp(req.body?.otp);
       const newPin = normalizeAdminPin(req.body?.newPin);
       const pendingLogin = verifyPendingLoginTicket(loginTicket);
 
@@ -4764,19 +4750,6 @@ app.post(
         });
       }
 
-      const otpResult = await consumeAdminOtpChallenge({
-        challengeId: otpChallengeId,
-        userId: pendingLogin.id,
-        purpose: ADMIN_PIN_OTP_PURPOSE_SETUP,
-        otp,
-        loginTicket,
-      });
-      if (!otpResult.ok) {
-        return res
-          .status(otpResult.status)
-          .json({ message: otpResult.message });
-      }
-
       const user = await getAdminUserById(pendingLogin.id);
       if (!user) {
         return res.status(404).json({ message: "User not found" });
@@ -4788,13 +4761,13 @@ app.post(
       return res.json(
         buildSuccessfulAdminLoginResponse(
           user,
-          "Organization PIN created and verified. Login successful.",
+          "Organization PIN created. Login successful.",
         ),
       );
     } catch (err) {
       console.error("Organization PIN setup verify error:", err);
       return res.status(500).json({
-        message: "Unable to verify OTP and create the organization PIN.",
+        message: "Unable to create the organization PIN.",
       });
     }
   },
@@ -5339,35 +5312,11 @@ app.post(
   authenticate,
   adminOtpSendLimiter,
   async (req, res) => {
-    try {
-      const user = await getAdminUserById(req.user.id);
-      if (!user) {
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      const securityConfig = await getAdminSecurityConfig();
-      const purpose = securityConfig?.organization_pin_hash
-        ? ADMIN_PIN_OTP_PURPOSE_UPDATE
-        : ADMIN_PIN_OTP_PURPOSE_SETUP;
-
-      const challenge = await createAdminOtpChallenge({
-        user,
-        purpose,
-      });
-
-      return res.json({
-        success: true,
-        message: `Verification OTP sent to ${challenge.maskedEmail}.`,
-        otpChallengeId: challenge.challengeId,
-        otpExpiresIn: challenge.expiresIn,
-        purpose,
-      });
-    } catch (err) {
-      console.error("Organization PIN OTP send error:", err);
-      return res.status(500).json({
-        message: "Unable to send verification OTP. Please try again.",
-      });
-    }
+    return res.json({
+      success: true,
+      message:
+        "OTP verification is disabled. You can update the organization PIN directly.",
+    });
   },
 );
 
@@ -5392,8 +5341,6 @@ app.put("/api/auth/organization-pin", authenticate, async (req, res) => {
     const userId = req.user.id;
     const currentPin = normalizeAdminPin(req.body?.currentPin);
     const newPin = normalizeAdminPin(req.body?.newPin);
-    const otp = normalizeAdminOtp(req.body?.otp);
-    const otpChallengeId = String(req.body?.otpChallengeId || "").trim();
 
     if (!isValidAdminPin(newPin)) {
       return res.status(400).json({
@@ -5424,18 +5371,6 @@ app.put("/api/auth/organization-pin", authenticate, async (req, res) => {
           message: "New organization PIN must be different from current PIN",
         });
       }
-    }
-
-    const otpResult = await consumeAdminOtpChallenge({
-      challengeId: otpChallengeId,
-      userId,
-      purpose: currentHash
-        ? ADMIN_PIN_OTP_PURPOSE_UPDATE
-        : ADMIN_PIN_OTP_PURPOSE_SETUP,
-      otp,
-    });
-    if (!otpResult.ok) {
-      return res.status(otpResult.status).json({ message: otpResult.message });
     }
 
     const hashedPin = await bcrypt.hash(newPin, 10);
