@@ -3978,8 +3978,7 @@ const ADMIN_EMAIL_OTP_MAX_ATTEMPTS = 5;
 const ADMIN_PIN_OTP_PURPOSE_SETUP = "organization_pin_setup";
 const ADMIN_PIN_OTP_PURPOSE_UPDATE = "organization_pin_update";
 const WEBAUTHN_RP_NAME =
-  String(process.env.WEBAUTHN_RP_NAME || "Hooks Admin").trim() ||
-  "Hooks Admin";
+  String(process.env.WEBAUTHN_RP_NAME || "Hooks Admin").trim() || "Hooks Admin";
 
 const normalizeOrigin = (value) =>
   String(value || "")
@@ -3987,9 +3986,7 @@ const normalizeOrigin = (value) =>
     .replace(/\/$/, "");
 
 const WEBAUTHN_ALLOWED_ORIGINS = new Set([
-  ...Array.from(ALLOWED_ORIGINS)
-    .map(normalizeOrigin)
-    .filter(Boolean),
+  ...Array.from(ALLOWED_ORIGINS).map(normalizeOrigin).filter(Boolean),
   ...String(process.env.WEBAUTHN_ALLOWED_ORIGINS || "")
     .split(",")
     .map(normalizeOrigin)
@@ -4213,12 +4210,14 @@ async function getAdminSecurityConfig() {
      LIMIT 1`,
   );
 
-  return result.rows[0] || {
-    id: 1,
-    organization_pin_hash: null,
-    updated_by: null,
-    updated_at: null,
-  };
+  return (
+    result.rows[0] || {
+      id: 1,
+      organization_pin_hash: null,
+      updated_by: null,
+      updated_at: null,
+    }
+  );
 }
 
 async function upsertAdminOrganizationPinHash(pinHash, updatedBy) {
@@ -4483,7 +4482,9 @@ async function storeWebAuthnChallenge({
   const loginTicketHash = hashLoginTicket(loginTicket);
   const expiresAt = new Date(Date.now() + WEBAUTHN_CHALLENGE_TTL_MS);
 
-  await db.query(`DELETE FROM ${WEBAUTHN_CHALLENGE_TABLE} WHERE expires_at <= now()`);
+  await db.query(
+    `DELETE FROM ${WEBAUTHN_CHALLENGE_TABLE} WHERE expires_at <= now()`,
+  );
   await db.query(
     `DELETE FROM ${WEBAUTHN_CHALLENGE_TABLE}
      WHERE login_ticket_hash = $1
@@ -4655,11 +4656,15 @@ app.post("/api/auth/login/pin", webAuthnVerifyLimiter, async (req, res) => {
     const securityConfig = await getAdminSecurityConfig();
     if (!securityConfig?.organization_pin_hash) {
       return res.status(400).json({
-        message: "Organization PIN is not configured. Contact an administrator.",
+        message:
+          "Organization PIN is not configured. Contact an administrator.",
       });
     }
 
-    const matches = await bcrypt.compare(pin, securityConfig.organization_pin_hash);
+    const matches = await bcrypt.compare(
+      pin,
+      securityConfig.organization_pin_hash,
+    );
     if (!matches) {
       return res.status(401).json({ message: "Invalid organization PIN" });
     }
@@ -4670,10 +4675,7 @@ app.post("/api/auth/login/pin", webAuthnVerifyLimiter, async (req, res) => {
     }
 
     return res.json(
-      buildSuccessfulAdminLoginResponse(
-        user,
-        "Login successful",
-      ),
+      buildSuccessfulAdminLoginResponse(user, "Login successful"),
     );
   } catch (err) {
     console.error("Organization PIN login verify error:", err);
@@ -4770,7 +4772,9 @@ app.post(
         loginTicket,
       });
       if (!otpResult.ok) {
-        return res.status(otpResult.status).json({ message: otpResult.message });
+        return res
+          .status(otpResult.status)
+          .json({ message: otpResult.message });
       }
 
       const user = await getAdminUserById(pendingLogin.id);
@@ -4813,7 +4817,8 @@ app.post(
       const expectedOrigin = getAllowedWebAuthnOrigin(req);
       if (!expectedOrigin) {
         return res.status(400).json({
-          message: "This browser origin is not allowed for device verification.",
+          message:
+            "This browser origin is not allowed for device verification.",
         });
       }
 
@@ -4922,7 +4927,10 @@ app.post(
           requireUserVerification: true,
         });
       } catch (verificationError) {
-        console.warn("WebAuthn authentication verification failed:", verificationError);
+        console.warn(
+          "WebAuthn authentication verification failed:",
+          verificationError,
+        );
         return res.status(401).json({
           message: "Device verification failed. Please try again.",
         });
@@ -4987,7 +4995,8 @@ app.post(
       const expectedOrigin = getAllowedWebAuthnOrigin(req);
       if (!expectedOrigin) {
         return res.status(400).json({
-          message: "This browser origin is not allowed for device verification.",
+          message:
+            "This browser origin is not allowed for device verification.",
         });
       }
 
@@ -5090,7 +5099,10 @@ app.post(
           requireUserVerification: true,
         });
       } catch (verificationError) {
-        console.warn("WebAuthn registration verification failed:", verificationError);
+        console.warn(
+          "WebAuthn registration verification failed:",
+          verificationError,
+        );
         return res.status(401).json({
           message: "Device setup failed. Please try again.",
         });
@@ -5150,14 +5162,11 @@ app.post(
   },
 );
 
-app.post(
-  "/api/auth/login/finalize",
-  loginInitiateLimiter,
-  async (_req, res) =>
-    res.status(400).json({
-      message:
-        "Device verification setup is required before you can finish signing in.",
-    }),
+app.post("/api/auth/login/finalize", loginInitiateLimiter, async (_req, res) =>
+  res.status(400).json({
+    message:
+      "Device verification setup is required before you can finish signing in.",
+  }),
 );
 
 /* ---- ADMIN Profile Endpoints ---- */
@@ -12470,11 +12479,15 @@ app.post("/api/public/search-interest", async (req, res) => {
     const rawDeviceType =
       body.device_type ?? body.deviceType ?? rawProductType ?? "";
     const normalizedProductType =
-      rawProductType === "" || rawProductType === null || rawProductType === undefined
+      rawProductType === "" ||
+      rawProductType === null ||
+      rawProductType === undefined
         ? null
         : normalizeProductType(rawProductType);
     const normalizedDeviceType =
-      rawDeviceType === "" || rawDeviceType === null || rawDeviceType === undefined
+      rawDeviceType === "" ||
+      rawDeviceType === null ||
+      rawDeviceType === undefined
         ? null
         : normalizeProductType(rawDeviceType);
 
@@ -15334,13 +15347,7 @@ async function runGlobalSearch(
        LENGTH(p.name) ASC,
        p.name ASC
      LIMIT $5`,
-    [
-      normalizedQuery,
-      prefixTerm,
-      wordPrefixTerm,
-      containsTerm,
-      resultLimit,
-    ],
+    [normalizedQuery, prefixTerm, wordPrefixTerm, containsTerm, resultLimit],
   );
 
   const safeNum = (v) => {
@@ -15878,8 +15885,8 @@ async function start() {
     process.exit(1);
   }
 
-  app.listen(PORT, "127.0.0.1", async () => {
-    console.log(`🚀 Server running at http://localhost:${PORT}`);
+  app.listen(PORT, "0.0.0.0", async () => {
+    console.log(`Server running at http://localhost:${PORT}`);
     try {
       const r = await db.query("SELECT now()");
       console.log("DB time:", r.rows[0].now);
