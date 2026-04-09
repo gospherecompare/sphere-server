@@ -2755,6 +2755,40 @@ const readBlogProductImages = async (productId) => {
     .filter(Boolean);
 };
 
+const collectImageCandidates = (...values) => {
+  const candidates = [];
+  const seen = new Set();
+
+  const pushCandidate = (value) => {
+    const parsed = parseJsonLikeValue(value);
+    if (Array.isArray(parsed)) {
+      parsed.forEach(pushCandidate);
+      return;
+    }
+
+    if (parsed && typeof parsed === "object") {
+      [
+        parsed.image_url,
+        parsed.hero_image,
+        parsed.cover_image,
+        parsed.thumbnail,
+        parsed.url,
+        parsed.src,
+        parsed.image,
+      ].forEach(pushCandidate);
+      return;
+    }
+
+    const text = String(parsed || "").trim();
+    if (!text || seen.has(text)) return;
+    seen.add(text);
+    candidates.push(text);
+  };
+
+  values.forEach(pushCandidate);
+  return candidates;
+};
+
 const fetchBlogProductSnapshot = async (
   productId,
   profiles,
@@ -2808,6 +2842,16 @@ const fetchBlogProductSnapshot = async (
     readBlogProductVariants(normalizedId),
     readBlogProductImages(normalizedId),
   ]);
+  const heroImage = collectImageCandidates(
+    detailRow?.hero_image,
+    detailRow?.image_url,
+    detailRow?.cover_image,
+    detailRow?.thumbnail,
+    detailRow?.image,
+    detailRow?.images,
+    images,
+    baseRow?.brand_logo,
+  )[0] || null;
 
   const source = stripScoreRecursively({
     ...toPlainObject(detailRow),
@@ -2843,7 +2887,7 @@ const fetchBlogProductSnapshot = async (
     variants,
     images,
     lowest_price: lowestPrice,
-    hero_image: images[0] || null,
+    hero_image: heroImage,
   };
 };
 
@@ -2939,6 +2983,47 @@ const buildBlogSuggestions = (snapshot, tokenMap) => {
       preserveUnknown: true,
     }),
   }));
+};
+
+const resolvePublicBlogRow = async (
+  row,
+  profileConfig = null,
+  snapshotCache = null,
+) => {
+  const blog = { ...row };
+  const template = String(blog.content_template || "").trim();
+  const productId = Number(blog.product_id);
+
+  if (!template) return blog;
+
+  const tokenMap = { ...toPlainObject(blog.token_snapshot) };
+
+  if (Number.isInteger(productId) && productId > 0) {
+    let snapshot = snapshotCache instanceof Map ? snapshotCache.get(productId) : null;
+    if (snapshot === undefined) snapshot = null;
+
+    if (snapshot === null) {
+      const config =
+        profileConfig ||
+        (await readDeviceFieldProfilesConfig().catch(() => ({ profiles: [] })));
+      snapshot = await fetchBlogProductSnapshot(productId, config?.profiles || []);
+      if (snapshotCache instanceof Map) {
+        snapshotCache.set(productId, snapshot);
+      }
+    }
+
+    if (snapshot) {
+      Object.assign(tokenMap, buildBlogTokenMap(snapshot));
+      if (!blog.hero_image && snapshot.hero_image) {
+        blog.hero_image = snapshot.hero_image;
+      }
+    }
+  }
+
+  blog.content_rendered = renderBlogTemplateWithTokens(template, tokenMap, {
+    preserveUnknown: false,
+  });
+  return blog;
 };
 
 const resolveUniqueBlogSlug = async (
@@ -6831,11 +6916,14 @@ app.get("/api/public/blogs", async (req, res) => {
       `
       SELECT
         bl.id,
+        bl.product_id,
         bl.slug,
         bl.category,
         bl.title,
         bl.excerpt,
+        bl.content_template,
         bl.content_rendered,
+        bl.token_snapshot,
         bl.meta_title,
         bl.meta_description,
         COALESCE(
@@ -6866,10 +6954,26 @@ app.get("/api/public/blogs", async (req, res) => {
       category ? [limit, category] : [limit],
     );
 
+    const rows = result.rows || [];
+    const needsResolution = rows.some((row) => Number(row.product_id) > 0);
+    const blogs = needsResolution
+      ? await (async () => {
+          const profileConfig = await readDeviceFieldProfilesConfig().catch(
+            () => ({ profiles: [] }),
+          );
+          const snapshotCache = new Map();
+          return Promise.all(
+            rows.map((row) =>
+              resolvePublicBlogRow(row, profileConfig, snapshotCache),
+            ),
+          );
+        })()
+      : rows;
+
     return res.json({
       limit,
       category,
-      blogs: result.rows || [],
+      blogs,
     });
   } catch (err) {
     console.error("GET /api/public/blogs error:", err);
@@ -6893,7 +6997,9 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
         bl.title,
         bl.slug,
         bl.excerpt,
+        bl.content_template,
         bl.content_rendered,
+        bl.token_snapshot,
         bl.meta_title,
         bl.meta_description,
         COALESCE(
@@ -6927,7 +7033,8 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
       return res.status(404).json({ message: "Blog not found" });
     }
 
-    return res.json({ blog: result.rows[0] });
+    const blog = await resolvePublicBlogRow(result.rows[0]);
+    return res.json({ blog });
   } catch (err) {
     console.error("GET /api/public/blogs/:slug error:", err);
     return res.status(500).json({ message: "Failed to fetch blog" });
