@@ -3017,6 +3017,15 @@ const resolvePublicBlogRow = async (
       if (!blog.hero_image && snapshot.hero_image) {
         blog.hero_image = snapshot.hero_image;
       }
+      if (!blog.hero_image_source && blog.hero_image) {
+        blog.hero_image_source =
+          snapshot.hero_image && blog.hero_image === snapshot.hero_image
+            ? "asset"
+            : "url";
+      }
+      if (!blog.brand_logo && snapshot?.core?.brand_logo) {
+        blog.brand_logo = snapshot.core.brand_logo;
+      }
     }
   }
 
@@ -3887,6 +3896,7 @@ async function runMigrations() {
         meta_title TEXT,
         meta_description TEXT,
         hero_image TEXT,
+        hero_image_source TEXT,
         created_by INT REFERENCES "user"(id),
         updated_by INT REFERENCES "user"(id),
         published_at TIMESTAMP,
@@ -3906,6 +3916,11 @@ async function runMigrations() {
     await safeQuery(`
       ALTER TABLE blogs
       ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'news';
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS hero_image_source TEXT;
     `);
 
     await safeQuery(`
@@ -6526,6 +6541,13 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       : "draft";
     const metaTitle = String(req.body?.meta_title || "").trim();
     const metaDescription = String(req.body?.meta_description || "").trim();
+    const heroImageSourceRaw = String(req.body?.hero_image_source || "")
+      .trim()
+      .toLowerCase();
+    const heroImageSource =
+      heroImageSourceRaw === "asset" || heroImageSourceRaw === "url"
+        ? heroImageSourceRaw
+        : null;
 
     if (!title) return res.status(400).json({ message: "title is required" });
     if (!contentTemplate) {
@@ -6603,9 +6625,10 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           meta_title = $13,
           meta_description = $14,
           hero_image = $15,
-          updated_by = $16,
+          hero_image_source = $16,
+          updated_by = $17,
           published_at = CASE
-            WHEN $9 = 'published' THEN COALESCE(published_at, $17)
+            WHEN $9 = 'published' THEN COALESCE(published_at, $18)
             ELSE NULL
           END,
           updated_at = now()
@@ -6626,6 +6649,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           meta_title,
           meta_description,
           hero_image,
+          hero_image_source,
           published_at,
           created_at,
           updated_at
@@ -6646,6 +6670,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           metaTitle || null,
           metaDescription || null,
           heroImage || null,
+          heroImageSource,
           actorId,
           nowPublishedAt,
         ],
@@ -6671,13 +6696,14 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           meta_title,
           meta_description,
           hero_image,
+          hero_image_source,
           created_by,
           updated_by,
           published_at,
           created_at,
           updated_at
         ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,$16,$17,now(),now()
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,now(),now()
         )
         RETURNING
           id,
@@ -6695,6 +6721,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           meta_title,
           meta_description,
           hero_image,
+          hero_image_source,
           published_at,
           created_at,
           updated_at
@@ -6714,6 +6741,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           metaTitle || null,
           metaDescription || null,
           heroImage || null,
+          heroImageSource,
           actorId,
           actorId,
           nowPublishedAt,
@@ -6758,6 +6786,7 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
         bl.slug,
         bl.status,
         bl.blog_eligible,
+        bl.hero_image_source,
         COALESCE(
           bl.hero_image,
           (
@@ -6772,7 +6801,8 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
         bl.updated_at,
         p.name AS product_name,
         p.product_type,
-        b.name AS brand_name
+        b.name AS brand_name,
+        b.logo AS brand_logo
       FROM blogs bl
       LEFT JOIN products p
         ON p.id = bl.product_id
@@ -6833,6 +6863,7 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
         bl.token_snapshot,
         bl.meta_title,
         bl.meta_description,
+        bl.hero_image_source,
         COALESCE(
           bl.hero_image,
           (
@@ -6926,6 +6957,7 @@ app.get("/api/public/blogs", async (req, res) => {
         bl.token_snapshot,
         bl.meta_title,
         bl.meta_description,
+        bl.hero_image_source,
         COALESCE(
           bl.hero_image,
           (
@@ -6940,7 +6972,8 @@ app.get("/api/public/blogs", async (req, res) => {
         bl.updated_at,
         p.name AS product_name,
         p.product_type,
-        b.name AS brand_name
+        b.name AS brand_name,
+        b.logo AS brand_logo
       FROM blogs bl
       LEFT JOIN products p
         ON p.id = bl.product_id
@@ -7002,6 +7035,7 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
         bl.token_snapshot,
         bl.meta_title,
         bl.meta_description,
+        bl.hero_image_source,
         COALESCE(
           bl.hero_image,
           (
