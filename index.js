@@ -47,6 +47,24 @@ const {
   normalizeSearchQuery,
   resolveSearchInterestProduct,
 } = require("./utils/searchPopularity");
+const {
+  normalizeRole,
+  RBAC_MODULES,
+  ROLE_PRESETS,
+  getPermissionMatrix,
+  getAllPermissionCodes,
+  getRolePreset,
+  getDefaultPermissionsForRole,
+  permissionMatches,
+  hasPermissionSet,
+  hasAnyPermissionSet,
+  hasAllPermissionsSet,
+  getModulePermissionCode,
+  getModuleLabel,
+  getModuleActions,
+  isActionSupported,
+  normalizePermissionToken,
+} = require("./utils/rbac");
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
@@ -2575,6 +2593,45 @@ const BLOG_ALLOWED_CATEGORIES = new Set([
   "launches",
 ]);
 
+const parseBlogTags = (value) => {
+  if (Array.isArray(value)) {
+    return Array.from(
+      new Set(
+        value
+          .map((item) => String(item || "").trim())
+          .filter(Boolean),
+      ),
+    );
+  }
+
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+
+  return Array.from(
+    new Set(
+      raw
+        .split(/[,;\n]+/)
+        .map((item) => String(item || "").trim())
+        .filter(Boolean),
+    ),
+  );
+};
+
+const parseBlogBoolean = (value) => {
+  if (typeof value === "boolean") return value;
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(normalized);
+};
+
+const parseBlogDate = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return null;
+  return date;
+};
+
 const toSafeFiniteNumber = (value, fallback = 0) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -2660,12 +2717,19 @@ const renderBlogTemplateWithTokens = (
   });
 };
 
-const ensureBlogManagerAccess = (req, res) => {
-  const role = String(req?.user?.role || "")
-    .trim()
-    .toLowerCase();
-  if (role === "admin" || role === "editor") return true;
-  res.status(403).json({ message: "Admin or editor access required" });
+const ensureBlogManagerAccess = async (req, res, action = "view") => {
+  const role = normalizeRole(req?.user?.role || "viewer");
+  const permissionMap = {
+    view: ["content.news.view"],
+    create: ["content.news.create"],
+    edit: ["content.news.edit"],
+    delete: ["content.news.delete"],
+    manage: ["content.news.manage", "content.news.edit", "content.news.create"],
+  };
+  const requested = permissionMap[action] || permissionMap.view;
+  const allowed = await hasRoleAnyPermissions(role, requested);
+  if (allowed) return true;
+  res.status(403).json({ message: "Content access required" });
   return false;
 };
 
@@ -2991,6 +3055,14 @@ const resolvePublicBlogRow = async (
   snapshotCache = null,
 ) => {
   const blog = { ...row };
+  if (!blog.author_name && blog.author_user_id) {
+    const author = await resolveRbacUserById(blog.author_user_id).catch(
+      () => null,
+    );
+    if (author?.display_name) {
+      blog.author_name = author.display_name;
+    }
+  }
   const template = String(blog.content_template || "").trim();
   const productId = Number(blog.product_id);
 
@@ -3476,9 +3548,118 @@ async function runMigrations() {
         email TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
         role TEXT DEFAULT 'admin',
+        display_name TEXT,
+        bio TEXT,
+        department TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        avatar TEXT,
+        permissions_override JSONB NOT NULL DEFAULT '[]'::jsonb,
+        last_login TIMESTAMPTZ,
+        updated_at TIMESTAMP DEFAULT now(),
         created_at TIMESTAMP DEFAULT now()
       );
     `);
+
+    await safeQuery(`
+      ALTER TABLE "user"
+      ADD COLUMN IF NOT EXISTS display_name TEXT,
+      ADD COLUMN IF NOT EXISTS bio TEXT,
+      ADD COLUMN IF NOT EXISTS department TEXT,
+      ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active',
+      ADD COLUMN IF NOT EXISTS avatar TEXT,
+      ADD COLUMN IF NOT EXISTS permissions_override JSONB NOT NULL DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now();
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS admin_roles (
+        id SERIAL PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
+        built_in BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMP DEFAULT now(),
+        updated_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS admin_permissions (
+        id SERIAL PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        description TEXT,
+        module_key TEXT,
+        action TEXT,
+        built_in BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMP DEFAULT now(),
+        updated_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS admin_activity_log (
+        id SERIAL PRIMARY KEY,
+        actor_user_id INT REFERENCES "user"(id) ON DELETE SET NULL,
+        actor_name TEXT,
+        actor_role TEXT,
+        module_key TEXT,
+        action TEXT NOT NULL,
+        target_type TEXT,
+        target_id TEXT,
+        target_label TEXT,
+        note TEXT,
+        meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    for (const module of getPermissionMatrix()) {
+      for (const permission of module.permissions || []) {
+        await safeQuery(
+          `
+          INSERT INTO admin_permissions (
+            name,
+            description,
+            module_key,
+            action,
+            built_in
+          )
+          VALUES ($1,$2,$3,$4,true)
+          ON CONFLICT (name) DO NOTHING
+        `,
+          [
+            permission.code,
+            `Allows ${permission.action} on ${module.label}`,
+            module.key,
+            permission.action,
+          ],
+        );
+      }
+    }
+
+    for (const [roleName, preset] of Object.entries(ROLE_PRESETS)) {
+      await safeQuery(
+        `
+        INSERT INTO admin_roles (
+          name,
+          title,
+          description,
+          permissions,
+          built_in
+        )
+        VALUES ($1,$2,$3,$4::jsonb,true)
+        ON CONFLICT (name) DO NOTHING
+      `,
+        [
+          roleName,
+          preset.label,
+          preset.description,
+          JSON.stringify(getDefaultPermissionsForRole(roleName)),
+        ],
+      );
+    }
 
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS admin_security_config (
@@ -3887,6 +4068,7 @@ async function runMigrations() {
         title TEXT NOT NULL,
         slug TEXT NOT NULL UNIQUE,
         excerpt TEXT,
+        author_name TEXT,
         content_template TEXT NOT NULL,
         content_rendered TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'draft',
@@ -3897,6 +4079,12 @@ async function runMigrations() {
         meta_description TEXT,
         hero_image TEXT,
         hero_image_source TEXT,
+        hero_image_alt TEXT,
+        hero_image_caption TEXT,
+        tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+        featured BOOLEAN NOT NULL DEFAULT false,
+        trending BOOLEAN NOT NULL DEFAULT false,
+        pinned BOOLEAN NOT NULL DEFAULT false,
         created_by INT REFERENCES "user"(id),
         updated_by INT REFERENCES "user"(id),
         published_at TIMESTAMP,
@@ -3921,6 +4109,46 @@ async function runMigrations() {
     await safeQuery(`
       ALTER TABLE blogs
       ADD COLUMN IF NOT EXISTS hero_image_source TEXT;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS author_name TEXT;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS author_user_id INT REFERENCES "user"(id) ON DELETE SET NULL;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS hero_image_alt TEXT;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS hero_image_caption TEXT;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS featured BOOLEAN NOT NULL DEFAULT false;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS trending BOOLEAN NOT NULL DEFAULT false;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT false;
     `);
 
     await safeQuery(`
@@ -4185,11 +4413,248 @@ const normalizeTransportList = (value) =>
     (transport) => typeof transport === "string" && transport.trim(),
   );
 
+const parseJsonArray = (value, fallback = []) => {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+  return fallback;
+};
+
+const normalizeUserStatus = (value = "") => {
+  const status = String(value || "").trim().toLowerCase();
+  return status === "inactive" ? "inactive" : "active";
+};
+
+const normalizeAdminUserRow = (user, roleRecord = null) => {
+  if (!user) return null;
+  const firstName = String(user.first_name || "").trim();
+  const lastName = String(user.last_name || "").trim();
+  const displayName =
+    String(user.display_name || "").trim() ||
+    [firstName, lastName].filter(Boolean).join(" ").trim() ||
+    String(user.user_name || "").trim() ||
+    String(user.email || "").trim() ||
+    "User";
+  const permissionsOverride = parseJsonArray(user.permissions_override, []);
+  const roleName = normalizeRole(user.role || roleRecord?.name || "viewer");
+  const rolePermissions = parseJsonArray(
+    roleRecord?.permissions || [],
+    [],
+  ).map((permission) => normalizePermissionToken(permission));
+  const effectivePermissions = Array.from(
+    new Set(
+      [...rolePermissions, ...permissionsOverride]
+        .map((permission) => normalizePermissionToken(permission))
+        .filter(Boolean),
+    ),
+  );
+
+  return {
+    id: user.id,
+    user_name: user.user_name || "",
+    username: user.user_name || "",
+    first_name: firstName,
+    last_name: lastName,
+    display_name: displayName,
+    author_name: displayName,
+    bio: String(user.bio || "").trim(),
+    department: String(user.department || "").trim(),
+    email: String(user.email || "").trim(),
+    phone: String(user.phone || "").trim(),
+    gender: String(user.gender || "").trim(),
+    avatar: String(user.avatar || "").trim(),
+    role: roleName,
+    role_title: roleRecord?.title || getRolePreset(roleName).label,
+    role_description: roleRecord?.description || getRolePreset(roleName).description,
+    status: normalizeUserStatus(user.status),
+    permissions_override: permissionsOverride,
+    effective_permissions: effectivePermissions,
+    permissions: effectivePermissions,
+    last_login: user.last_login || null,
+    created_at: user.created_at || null,
+    updated_at: user.updated_at || user.created_at || null,
+  };
+};
+
+const normalizeAdminRoleRow = (role) => {
+  if (!role) return null;
+  const roleName = normalizeRole(role.name || role.id || "viewer");
+  const preset = getRolePreset(roleName);
+  const permissions = Array.from(
+    new Set(parseJsonArray(role.permissions, getDefaultPermissionsForRole(roleName)).map((permission) => normalizePermissionToken(permission)).filter(Boolean)),
+  );
+
+  return {
+    id: role.id || roleName,
+    name: role.name || roleName,
+    title: String(role.title || preset.label || roleName).trim(),
+    description: String(role.description || preset.description || "").trim(),
+    permissions,
+    built_in: Boolean(role.built_in),
+    created_at: role.created_at || null,
+    updated_at: role.updated_at || role.created_at || null,
+  };
+};
+
+const normalizeAdminPermissionRow = (permission) => {
+  if (!permission) return null;
+  return {
+    id: permission.id || permission.name,
+    name: permission.name || "",
+    description: String(permission.description || "").trim(),
+    module: String(permission.module_key || permission.module || "").trim(),
+    module_label: getModuleLabel(permission.module_key || permission.module || ""),
+    action: String(permission.action || "").trim(),
+    built_in: Boolean(permission.built_in),
+    created_at: permission.created_at || null,
+    updated_at: permission.updated_at || permission.created_at || null,
+  };
+};
+
+const recordAdminActivity = async ({
+  actorUserId = null,
+  actorName = "",
+  actorRole = "",
+  moduleKey = "",
+  action = "updated",
+  targetType = "",
+  targetId = null,
+  targetLabel = "",
+  note = "",
+  meta = {},
+} = {}) => {
+  try {
+    await db.query(
+      `
+      INSERT INTO admin_activity_log (
+        actor_user_id,
+        actor_name,
+        actor_role,
+        module_key,
+        action,
+        target_type,
+        target_id,
+        target_label,
+        note,
+        meta
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
+    `,
+      [
+        actorUserId || null,
+        String(actorName || "").trim() || "System",
+        String(actorRole || "").trim() || "admin",
+        String(moduleKey || "").trim() || null,
+        String(action || "").trim() || "updated",
+        String(targetType || "").trim() || null,
+        targetId === null || typeof targetId === "undefined"
+          ? null
+          : String(targetId),
+        String(targetLabel || "").trim() || null,
+        String(note || "").trim() || null,
+        JSON.stringify(toPlainObject(meta)),
+      ],
+    );
+  } catch (err) {
+    console.error("Failed to record admin activity:", err.message);
+  }
+};
+
+const getRoleAccessRow = async (roleName = "") => {
+  const normalized = normalizeRole(roleName);
+  const result = await db.query(
+    `
+    SELECT id, name, title, description, permissions, built_in, created_at, updated_at
+    FROM admin_roles
+    WHERE LOWER(name) = $1
+    ORDER BY updated_at DESC, id DESC
+    LIMIT 1
+  `,
+    [normalized],
+  );
+  return normalizeAdminRoleRow(result.rows[0]) || normalizeAdminRoleRow({
+    name: normalized,
+    title: getRolePreset(normalized).label,
+    description: getRolePreset(normalized).description,
+    permissions: getDefaultPermissionsForRole(normalized),
+    built_in: true,
+  });
+};
+
+const getRolePermissions = async (roleName = "") => {
+  const role = await getRoleAccessRow(roleName);
+  return Array.from(
+    new Set((role?.permissions || []).map((permission) => normalizePermissionToken(permission)).filter(Boolean)),
+  );
+};
+
+const hasRolePermission = async (roleName = "", requested = "") => {
+  const permissions = await getRolePermissions(roleName);
+  return hasPermissionSet(permissions, requested);
+};
+
+const hasRoleAnyPermissions = async (roleName = "", requested = []) => {
+  const permissions = await getRolePermissions(roleName);
+  return hasAnyPermissionSet(permissions, requested);
+};
+
+const hasRoleAllPermissions = async (roleName = "", requested = []) => {
+  const permissions = await getRolePermissions(roleName);
+  return hasAllPermissionsSet(permissions, requested);
+};
+
+const requireRolePermissions = (requested = [], { any = false } = {}) =>
+  async (req, res, next) => {
+    try {
+      const roleName = normalizeRole(req.user?.role || "viewer");
+      const permitted = any
+        ? await hasRoleAnyPermissions(roleName, requested)
+        : await hasRoleAllPermissions(roleName, requested);
+      if (!permitted) {
+        return res.status(403).json({ message: "Insufficient permissions" });
+      }
+      return next();
+    } catch (err) {
+      console.error("Permission check failed:", err);
+      return res.status(500).json({ message: "Failed to verify permissions" });
+    }
+  };
+
 const serializeAdminUser = (user) => ({
   id: user.id,
   email: user.email,
   role: user.role,
   username: user.user_name,
+  user_name: user.user_name,
+  display_name:
+    user.display_name || user.author_name || user.user_name || user.email || "",
+  author_name:
+    user.author_name || user.display_name || user.user_name || user.email || "",
+  first_name: user.first_name || "",
+  last_name: user.last_name || "",
+  phone: user.phone || "",
+  gender: user.gender || "",
+  bio: user.bio || "",
+  department: user.department || "",
+  status: user.status || "active",
+  avatar: user.avatar || "",
+  permissions_override: Array.isArray(user.permissions_override)
+    ? user.permissions_override
+    : [],
+  effective_permissions: Array.isArray(user.effective_permissions)
+    ? user.effective_permissions
+    : [],
+  permissions: Array.isArray(user.effective_permissions)
+    ? user.effective_permissions
+    : [],
+  last_login: user.last_login || null,
+  created_at: user.created_at || null,
+  updated_at: user.updated_at || null,
 });
 
 const issueAdminAccessToken = (user) =>
@@ -4306,7 +4771,10 @@ async function getAdminUserById(userId) {
   const result = await db.query('SELECT * FROM "user" WHERE id = $1 LIMIT 1', [
     userId,
   ]);
-  return result.rows[0] || null;
+  const user = result.rows[0] || null;
+  if (!user) return null;
+  const roleRecord = await getRoleAccessRow(user.role);
+  return normalizeAdminUserRow(user, roleRecord);
 }
 
 async function getAdminSecurityConfig() {
@@ -4663,14 +5131,31 @@ async function clearWebAuthnChallenges(loginTicket) {
 app.post("/api/auth/register", async (req, res) => {
   try {
     const b = req.body || {};
-    const user_name = b.user_name || null;
-    const first_name = b.first_name || null;
-    const last_name = b.last_name || null;
-    const phone = b.phone || null;
-    const gender = b.gender || null;
-    const email = b.email;
-    const password = b.password || `${Math.random()}${Date.now()}`;
-    const role = b.role || "admin";
+    const user_name = String(b.user_name || b.username || "").trim() || null;
+    const first_name = String(b.first_name || "").trim() || null;
+    const last_name = String(b.last_name || "").trim() || null;
+    const phone = String(b.phone || "").trim() || null;
+    const gender = String(b.gender || "").trim() || null;
+    const email = String(b.email || "").trim().toLowerCase();
+    const password = String(b.password || `${Math.random()}${Date.now()}`).trim();
+    const role = normalizeRole(b.role || "viewer");
+    const displayName =
+      String(b.display_name || "").trim() ||
+      [first_name, last_name].filter(Boolean).join(" ").trim() ||
+      user_name ||
+      email ||
+      "User";
+    const bio = String(b.bio || "").trim() || null;
+    const department = String(b.department || "").trim() || null;
+    const status = normalizeUserStatus(b.status);
+    const avatar = String(b.avatar || b.avatar_url || "").trim() || null;
+    const permissionsOverride = Array.from(
+      new Set(
+        parseJsonArray(b.permissions_override || b.permissions, [])
+          .map((permission) => normalizePermissionToken(permission))
+          .filter(Boolean),
+      ),
+    );
 
     if (!email || !password) {
       return res.status(400).json({ message: "email and password required" });
@@ -4680,15 +5165,33 @@ app.post("/api/auth/register", async (req, res) => {
 
     const result = await db.query(
       `INSERT INTO "user"
-        (user_name, first_name, last_name, phone, gender, email, password, role)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       RETURNING id, email, role`,
-      [user_name, first_name, last_name, phone, gender, email, hashed, role],
+        (user_name, first_name, last_name, phone, gender, email, password, role, display_name, bio, department, status, avatar, permissions_override)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
+       RETURNING *`,
+      [
+        user_name,
+        first_name,
+        last_name,
+        phone,
+        gender,
+        email,
+        hashed,
+        role,
+        displayName,
+        bio,
+        department,
+        status,
+        avatar,
+        JSON.stringify(permissionsOverride),
+      ],
     );
+
+    const roleRecord = await getRoleAccessRow(role);
+    const user = normalizeAdminUserRow(result.rows[0], roleRecord);
 
     res.status(201).json({
       message: "User registered successfully. Email sent.",
-      user: result.rows[0],
+      user,
     });
   } catch (err) {
     if (err.code === "23505") {
@@ -4717,6 +5220,8 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
     }
 
     const user = result.rows[0];
+    const roleRecord = await getRoleAccessRow(user.role);
+    const normalizedUser = normalizeAdminUserRow(user, roleRecord);
     const match = await bcrypt.compare(password, user.password);
     if (!match) {
       return res.status(401).json({ message: "Invalid credentials" });
@@ -5282,6 +5787,17 @@ app.get("/api/auth/profile", authenticate, async (req, res) => {
         last_name: user.last_name || "",
         gender: user.gender || "",
         role: user.role || "",
+        display_name: user.display_name || "",
+        bio: user.bio || "",
+        department: user.department || "",
+        status: user.status || "active",
+        avatar: user.avatar || "",
+        permissions_override: Array.isArray(normalizedUser?.permissions_override)
+          ? normalizedUser.permissions_override
+          : [],
+        effective_permissions: Array.isArray(normalizedUser?.effective_permissions)
+          ? normalizedUser.effective_permissions
+          : [],
       },
     });
   } catch (err) {
@@ -5294,7 +5810,18 @@ app.get("/api/auth/profile", authenticate, async (req, res) => {
 app.put("/api/auth/profile", authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { email, phone, first_name, last_name, gender } = req.body;
+    const {
+      email,
+      phone,
+      first_name,
+      last_name,
+      gender,
+      display_name,
+      bio,
+      department,
+      status,
+      avatar,
+    } = req.body;
 
     // Validate required fields
     if (!email) {
@@ -5322,15 +5849,30 @@ app.put("/api/auth/profile", authenticate, async (req, res) => {
     // Update admin profile
     const result = await db.query(
       `UPDATE "user" 
-       SET email = $1, phone = $2, first_name = $3, last_name = $4, gender = $5
-       WHERE id = $6
-       RETURNING id, user_name, email, phone, first_name, last_name, gender, role`,
+       SET email = $1,
+           phone = $2,
+           first_name = $3,
+           last_name = $4,
+           gender = $5,
+           display_name = $6,
+           bio = $7,
+           department = $8,
+           status = $9,
+           avatar = $10,
+           updated_at = now()
+       WHERE id = $11
+       RETURNING id, user_name, email, phone, first_name, last_name, gender, role, display_name, bio, department, status, avatar, permissions_override`,
       [
         email,
         phone || null,
         first_name || null,
         last_name || null,
         gender || null,
+        display_name || null,
+        bio || null,
+        department || null,
+        status || "active",
+        avatar || null,
         userId,
       ],
     );
@@ -5340,6 +5882,8 @@ app.put("/api/auth/profile", authenticate, async (req, res) => {
     }
 
     const updatedUser = result.rows[0];
+    const roleRecord = await getRoleAccessRow(updatedUser.role);
+    const normalizedUser = normalizeAdminUserRow(updatedUser, roleRecord);
 
     res.json({
       success: true,
@@ -5353,6 +5897,17 @@ app.put("/api/auth/profile", authenticate, async (req, res) => {
         last_name: updatedUser.last_name || "",
         gender: updatedUser.gender || "",
         role: updatedUser.role || "",
+        display_name: updatedUser.display_name || "",
+        bio: updatedUser.bio || "",
+        department: updatedUser.department || "",
+        status: updatedUser.status || "active",
+        avatar: updatedUser.avatar || "",
+        permissions_override: Array.isArray(normalizedUser?.permissions_override)
+          ? normalizedUser.permissions_override
+          : [],
+        effective_permissions: Array.isArray(normalizedUser?.effective_permissions)
+          ? normalizedUser.effective_permissions
+          : [],
       },
     });
   } catch (err) {
@@ -5651,6 +6206,168 @@ app.get("/api/auth/check-email", async (req, res) => {
     return res.status(500).json({ available: false });
   }
 });
+const listRbacPermissions = async () => {
+  const defaultRows = getPermissionMatrix().flatMap((module) =>
+    module.permissions.map((permission) => ({
+      id: permission.code,
+      name: permission.code,
+      description: `Allows ${permission.action} on ${module.label}`,
+      module: module.key,
+      module_label: module.label,
+      action: permission.action,
+      built_in: true,
+      created_at: null,
+      updated_at: null,
+    })),
+  );
+
+  const customRows = await db.query(
+    `
+    SELECT id, name, description, module_key, action, built_in, created_at, updated_at
+    FROM admin_permissions
+    ORDER BY built_in DESC, name ASC, id ASC
+  `,
+  );
+
+  const merged = new Map();
+  [...defaultRows, ...(customRows.rows || []).map(normalizeAdminPermissionRow)]
+    .filter(Boolean)
+    .forEach((permission) => {
+      const key = String(permission.name || permission.id || "").trim().toLowerCase();
+      if (!key) return;
+      merged.set(key, permission);
+    });
+
+  return Array.from(merged.values()).sort((a, b) =>
+    String(a.name || "").localeCompare(String(b.name || "")),
+  );
+};
+
+const listRbacRoles = async () => {
+  const defaultRows = Object.entries(ROLE_PRESETS).map(([name, preset]) => ({
+    id: name,
+    name,
+    title: preset.label,
+    description: preset.description,
+    permissions: getDefaultPermissionsForRole(name),
+    built_in: true,
+    created_at: null,
+    updated_at: null,
+  }));
+
+  const customRows = await db.query(
+    `
+    SELECT id, name, title, description, permissions, built_in, created_at, updated_at
+    FROM admin_roles
+    ORDER BY built_in DESC, title ASC, id ASC
+  `,
+  );
+
+  const merged = new Map();
+  [...defaultRows, ...(customRows.rows || []).map(normalizeAdminRoleRow)]
+    .filter(Boolean)
+    .forEach((role) => {
+      const key = String(role.name || role.id || "").trim().toLowerCase();
+      if (!key) return;
+      merged.set(key, role);
+    });
+
+  return Array.from(merged.values()).sort((a, b) =>
+    String(a.title || a.name || "").localeCompare(
+      String(b.title || b.name || ""),
+    ),
+  );
+};
+
+const listRbacUsers = async ({ includeInactive = true } = {}) => {
+  const [userRows, roleRows] = await Promise.all([
+    db.query(
+      `
+      SELECT
+        id,
+        user_name,
+        first_name,
+        last_name,
+        phone,
+        gender,
+        email,
+        role,
+        display_name,
+        bio,
+        department,
+        status,
+        avatar,
+        permissions_override,
+        last_login,
+        created_at,
+        updated_at
+      FROM "user"
+      ORDER BY created_at DESC, id DESC
+    `,
+    ),
+    listRbacRoles(),
+  ]);
+
+  const roleMap = new Map(
+    roleRows.map((role) => [normalizeRole(role.name || role.id), role]),
+  );
+
+  return userRows.rows
+    .map((user) =>
+      normalizeAdminUserRow(user, roleMap.get(normalizeRole(user.role))),
+    )
+    .filter(Boolean)
+    .filter((user) => (includeInactive ? true : user.status !== "inactive"))
+    .sort((a, b) =>
+      String(a.display_name || "").localeCompare(String(b.display_name || "")),
+    );
+};
+
+const listRbacActivities = async ({ limit = 200 } = {}) => {
+  const result = await db.query(
+    `
+    SELECT
+      id,
+      actor_user_id,
+      actor_name,
+      actor_role,
+      module_key,
+      action,
+      target_type,
+      target_id,
+      target_label,
+      note,
+      meta,
+      created_at
+    FROM admin_activity_log
+    ORDER BY created_at DESC, id DESC
+    LIMIT $1
+  `,
+    [Math.min(500, Math.max(1, Number(limit) || 200))],
+  );
+
+  return result.rows.map((entry) => ({
+    id: entry.id,
+    at: entry.created_at,
+    actor: entry.actor_name || "System",
+    actor_role: entry.actor_role || "admin",
+    module: entry.module_key || "system",
+    action: entry.action || "updated",
+    target: entry.target_label || entry.target_type || entry.target_id || "",
+    target_type: entry.target_type || "",
+    target_id: entry.target_id || null,
+    note: entry.note || "",
+    meta: entry.meta || {},
+  }));
+};
+
+const resolveRbacUserById = async (id) => {
+  const userId = Number(id);
+  if (!Number.isInteger(userId) || userId <= 0) return null;
+  const users = await listRbacUsers({ includeInactive: true });
+  return users.find((user) => Number(user.id) === userId) || null;
+};
+
 app.post("/api/auth/customer/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -6019,6 +6736,710 @@ app.post("/api/careers", async (req, res) => {
   }
 });
 
+app.get(
+  "/api/users",
+  authenticate,
+  requireRolePermissions(["users.view", "users.manage"], { any: true }),
+  async (req, res) => {
+    try {
+      const includeInactive = String(req.query.includeInactive || "true")
+        .trim()
+        .toLowerCase() !== "false";
+      const users = await listRbacUsers({ includeInactive });
+      return res.json(users);
+    } catch (err) {
+      console.error("GET /api/users error:", err);
+      return res.status(500).json({ message: "Failed to fetch users" });
+    }
+  },
+);
+
+app.get(
+  "/api/rbac/users",
+  authenticate,
+  requireRolePermissions(["users.view", "users.manage"], { any: true }),
+  async (req, res) => {
+    try {
+      const includeInactive = String(req.query.includeInactive || "true")
+        .trim()
+        .toLowerCase() !== "false";
+      const users = await listRbacUsers({ includeInactive });
+      return res.json(users);
+    } catch (err) {
+      console.error("GET /api/rbac/users error:", err);
+      return res.status(500).json({ message: "Failed to fetch users" });
+    }
+  },
+);
+
+app.get(
+  "/api/users/:id",
+  authenticate,
+  requireRolePermissions(["users.view", "users.manage"], { any: true }),
+  async (req, res) => {
+    try {
+      const user = await resolveRbacUserById(req.params.id);
+      if (!user) return res.status(404).json({ message: "User not found" });
+      return res.json({ user });
+    } catch (err) {
+      console.error("GET /api/users/:id error:", err);
+      return res.status(500).json({ message: "Failed to fetch user" });
+    }
+  },
+);
+
+app.put(
+  "/api/users/:id",
+  authenticate,
+  requireRolePermissions(["users.edit", "users.manage"], { any: true }),
+  async (req, res) => {
+    try {
+      const userId = Number(req.params.id);
+      if (!Number.isInteger(userId) || userId <= 0) {
+        return res.status(400).json({ message: "Invalid user id" });
+      }
+
+      const existingResult = await db.query('SELECT * FROM "user" WHERE id = $1', [userId]);
+      if (!existingResult.rows.length) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const existing = existingResult.rows[0];
+      const body = req.body || {};
+      const user_name = String(body.user_name || body.username || existing.user_name || "").trim() || null;
+      const first_name = String(body.first_name || existing.first_name || "").trim() || null;
+      const last_name = String(body.last_name || existing.last_name || "").trim() || null;
+      const phone = String(body.phone || existing.phone || "").trim() || null;
+      const gender = String(body.gender || existing.gender || "").trim() || null;
+      const email = String(body.email || existing.email || "").trim().toLowerCase();
+      const role = normalizeRole(body.role || existing.role || "viewer");
+      const displayName =
+        String(body.display_name || "").trim() ||
+        [first_name, last_name].filter(Boolean).join(" ").trim() ||
+        user_name ||
+        email ||
+        "User";
+      const bio = String(body.bio || existing.bio || "").trim() || null;
+      const department = String(body.department || existing.department || "").trim() || null;
+      const status = normalizeUserStatus(body.status || existing.status);
+      const avatar = String(body.avatar || body.avatar_url || existing.avatar || "").trim() || null;
+      const permissionsOverride = Array.from(
+        new Set(
+          parseJsonArray(body.permissions_override || body.permissions || existing.permissions_override || [], [])
+            .map((permission) => normalizePermissionToken(permission))
+            .filter(Boolean),
+        ),
+      );
+      const password = String(body.password || "").trim();
+
+      const duplicateEmail = await db.query(
+        'SELECT id FROM "user" WHERE LOWER(email) = $1 AND id != $2 LIMIT 1',
+        [email, userId],
+      );
+      if (duplicateEmail.rows.length) {
+        return res.status(409).json({ message: "Email already registered" });
+      }
+
+      const hashedPassword = password ? await bcrypt.hash(password, 10) : null;
+
+      const query = password
+        ? `
+          UPDATE "user"
+          SET user_name = $1,
+              first_name = $2,
+              last_name = $3,
+              phone = $4,
+              gender = $5,
+              email = $6,
+              role = $7,
+              display_name = $8,
+              bio = $9,
+              department = $10,
+              status = $11,
+              avatar = $12,
+              permissions_override = $13::jsonb,
+              password = $14,
+              updated_at = now()
+          WHERE id = $15
+          RETURNING *`
+        : `
+          UPDATE "user"
+          SET user_name = $1,
+              first_name = $2,
+              last_name = $3,
+              phone = $4,
+              gender = $5,
+              email = $6,
+              role = $7,
+              display_name = $8,
+              bio = $9,
+              department = $10,
+              status = $11,
+              avatar = $12,
+              permissions_override = $13::jsonb,
+              updated_at = now()
+          WHERE id = $14
+          RETURNING *`;
+
+      const params = password
+        ? [
+            user_name,
+            first_name,
+            last_name,
+            phone,
+            gender,
+            email,
+            role,
+            displayName,
+            bio,
+            department,
+            status,
+            avatar,
+            JSON.stringify(permissionsOverride),
+            hashedPassword,
+            userId,
+          ]
+        : [
+            user_name,
+            first_name,
+            last_name,
+            phone,
+            gender,
+            email,
+            role,
+            displayName,
+            bio,
+            department,
+            status,
+            avatar,
+            JSON.stringify(permissionsOverride),
+            userId,
+          ];
+
+      const result = await db.query(query, params);
+      const roleRecord = await getRoleAccessRow(result.rows[0]?.role);
+      const savedUser = normalizeAdminUserRow(result.rows[0], roleRecord);
+
+      await recordAdminActivity({
+        actorUserId: req.user?.id || null,
+        actorName: req.user?.username || req.user?.email || "System",
+        actorRole: req.user?.role || "admin",
+        moduleKey: "users",
+        action: "updated",
+        targetType: "user",
+        targetId: savedUser.id,
+        targetLabel: savedUser.display_name,
+        note: "Updated an admin user.",
+        meta: { role: savedUser.role },
+      });
+
+      return res.json({
+        message: "User updated successfully.",
+        user: savedUser,
+      });
+    } catch (err) {
+      console.error("PUT /api/users/:id error:", err);
+      return res.status(500).json({ message: "Failed to update user" });
+    }
+  },
+);
+
+app.delete(
+  "/api/users/:id",
+  authenticate,
+  requireRolePermissions(["users.delete", "users.manage"], { any: true }),
+  async (req, res) => {
+    try {
+      const userId = Number(req.params.id);
+      if (!Number.isInteger(userId) || userId <= 0) {
+        return res.status(400).json({ message: "Invalid user id" });
+      }
+
+      const result = await db.query(
+        'DELETE FROM "user" WHERE id = $1 RETURNING id, user_name, display_name, role',
+        [userId],
+      );
+
+      if (!result.rows.length) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      await recordAdminActivity({
+        actorUserId: req.user?.id || null,
+        actorName: req.user?.username || req.user?.email || "System",
+        actorRole: req.user?.role || "admin",
+        moduleKey: "users",
+        action: "deleted",
+        targetType: "user",
+        targetId: result.rows[0].id,
+        targetLabel: result.rows[0].display_name || result.rows[0].user_name,
+        note: "Deleted an admin user.",
+        meta: { role: result.rows[0].role || "viewer" },
+      });
+
+      return res.json({
+        message: "User deleted successfully",
+        user: result.rows[0],
+      });
+    } catch (err) {
+      console.error("DELETE /api/users/:id error:", err);
+      return res.status(500).json({ message: "Failed to delete user" });
+    }
+  },
+);
+
+app.post(
+  "/api/rbac/users/:id/roles",
+  authenticate,
+  requireRolePermissions(["users.assign", "roles.manage", "users.manage"], {
+    any: true,
+  }),
+  async (req, res) => {
+    try {
+      const userId = Number(req.params.id);
+      if (!Number.isInteger(userId) || userId <= 0) {
+        return res.status(400).json({ message: "Invalid user id" });
+      }
+
+      const roleId = String(req.body?.role_id || req.body?.roleId || "").trim();
+      if (!roleId) {
+        return res.status(400).json({ message: "role_id is required" });
+      }
+
+      const roleResult = await db.query(
+        `
+        SELECT id, name, title, description, permissions, built_in, created_at, updated_at
+        FROM admin_roles
+        WHERE CAST(id AS TEXT) = $1 OR LOWER(name) = LOWER($1)
+        LIMIT 1
+      `,
+        [roleId],
+      );
+      const roleRecord = normalizeAdminRoleRow(roleResult.rows[0] || null);
+      const roleName = roleRecord?.name || normalizeRole(roleId);
+
+      const updateResult = await db.query(
+        `
+        UPDATE "user"
+        SET role = $1, updated_at = now()
+        WHERE id = $2
+        RETURNING *
+      `,
+        [roleName, userId],
+      );
+      if (!updateResult.rows.length) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const savedUser = normalizeAdminUserRow(updateResult.rows[0], roleRecord);
+
+      await recordAdminActivity({
+        actorUserId: req.user?.id || null,
+        actorName: req.user?.username || req.user?.email || "System",
+        actorRole: req.user?.role || "admin",
+        moduleKey: "roles",
+        action: "assigned",
+        targetType: "user",
+        targetId: savedUser.id,
+        targetLabel: savedUser.display_name,
+        note: `Assigned ${roleName} role.`,
+        meta: { role: roleName },
+      });
+
+      return res.json({
+        message: "Role assigned successfully",
+        user: savedUser,
+        role: roleRecord,
+      });
+    } catch (err) {
+      console.error("POST /api/rbac/users/:id/roles error:", err);
+      return res.status(500).json({ message: "Failed to assign role" });
+    }
+  },
+);
+
+app.get(
+  "/api/rbac/roles",
+  authenticate,
+  requireRolePermissions(["roles.view", "permissions.view", "roles.manage"], {
+    any: true,
+  }),
+  async (_req, res) => {
+    try {
+      const roles = await listRbacRoles();
+      return res.json(roles);
+    } catch (err) {
+      console.error("GET /api/rbac/roles error:", err);
+      return res.status(500).json({ message: "Failed to fetch roles" });
+    }
+  },
+);
+
+app.post(
+  "/api/rbac/roles",
+  authenticate,
+  requireRolePermissions(["roles.create", "roles.manage"], { any: true }),
+  async (req, res) => {
+    try {
+      const name = normalizeRole(req.body?.name || req.body?.id || "");
+      if (!name) {
+        return res.status(400).json({ message: "Role name is required" });
+      }
+
+      const title = String(req.body?.title || getRolePreset(name).label || name).trim();
+      const description = String(req.body?.description || getRolePreset(name).description || "").trim();
+      const permissions = Array.from(
+        new Set(
+          parseJsonArray(req.body?.permissions || [], [])
+            .map((permission) => normalizePermissionToken(permission))
+            .filter(Boolean),
+        ),
+      );
+
+      const result = await db.query(
+        `
+        INSERT INTO admin_roles (name, title, description, permissions, built_in)
+        VALUES ($1,$2,$3,$4::jsonb,$5)
+        ON CONFLICT (name)
+        DO UPDATE SET
+          title = EXCLUDED.title,
+          description = EXCLUDED.description,
+          permissions = EXCLUDED.permissions,
+          built_in = EXCLUDED.built_in,
+          updated_at = now()
+        RETURNING id, name, title, description, permissions, built_in, created_at, updated_at
+      `,
+        [name, title, description, JSON.stringify(permissions), Boolean(req.body?.built_in)],
+      );
+
+      const role = normalizeAdminRoleRow(result.rows[0]);
+      await recordAdminActivity({
+        actorUserId: req.user?.id || null,
+        actorName: req.user?.username || req.user?.email || "System",
+        actorRole: req.user?.role || "admin",
+        moduleKey: "roles",
+        action: "created",
+        targetType: "role",
+        targetId: role.id,
+        targetLabel: role.title,
+        note: "Created or updated a role.",
+        meta: { permissions: role.permissions },
+      });
+
+      return res.status(201).json({ role });
+    } catch (err) {
+      console.error("POST /api/rbac/roles error:", err);
+      return res.status(500).json({ message: "Failed to save role" });
+    }
+  },
+);
+
+app.put(
+  "/api/rbac/roles/:id",
+  authenticate,
+  requireRolePermissions(["roles.edit", "roles.manage"], { any: true }),
+  async (req, res) => {
+    try {
+      const lookup = String(req.params.id || "").trim();
+      const existing = await db.query(
+        `
+        SELECT id, name, title, description, permissions, built_in, created_at, updated_at
+        FROM admin_roles
+        WHERE CAST(id AS TEXT) = $1 OR LOWER(name) = LOWER($1)
+        LIMIT 1
+      `,
+        [lookup],
+      );
+      if (!existing.rows.length) {
+        return res.status(404).json({ message: "Role not found" });
+      }
+
+      const current = normalizeAdminRoleRow(existing.rows[0]);
+      const name = normalizeRole(req.body?.name || current.name);
+      const title = String(req.body?.title || current.title || name).trim();
+      const description = String(req.body?.description || current.description || "").trim();
+      const permissions = Array.from(
+        new Set(
+          parseJsonArray(req.body?.permissions || current.permissions || [], [])
+            .map((permission) => normalizePermissionToken(permission))
+            .filter(Boolean),
+        ),
+      );
+
+      const result = await db.query(
+        `
+        UPDATE admin_roles
+        SET name = $1,
+            title = $2,
+            description = $3,
+            permissions = $4::jsonb,
+            built_in = $5,
+            updated_at = now()
+        WHERE id = $6
+        RETURNING id, name, title, description, permissions, built_in, created_at, updated_at
+      `,
+        [name, title, description, JSON.stringify(permissions), Boolean(req.body?.built_in), current.id],
+      );
+
+      const role = normalizeAdminRoleRow(result.rows[0]);
+      await recordAdminActivity({
+        actorUserId: req.user?.id || null,
+        actorName: req.user?.username || req.user?.email || "System",
+        actorRole: req.user?.role || "admin",
+        moduleKey: "roles",
+        action: "updated",
+        targetType: "role",
+        targetId: role.id,
+        targetLabel: role.title,
+        note: "Updated a role.",
+        meta: { permissions: role.permissions },
+      });
+
+      return res.json({ role });
+    } catch (err) {
+      console.error("PUT /api/rbac/roles/:id error:", err);
+      return res.status(500).json({ message: "Failed to update role" });
+    }
+  },
+);
+
+app.delete(
+  "/api/rbac/roles/:id",
+  authenticate,
+  requireRolePermissions(["roles.delete", "roles.manage"], { any: true }),
+  async (req, res) => {
+    try {
+      const lookup = String(req.params.id || "").trim();
+      const result = await db.query(
+        `
+        DELETE FROM admin_roles
+        WHERE CAST(id AS TEXT) = $1 OR LOWER(name) = LOWER($1)
+        RETURNING id, name, title
+      `,
+        [lookup],
+      );
+      if (!result.rows.length) {
+        return res.status(404).json({ message: "Role not found" });
+      }
+
+      await recordAdminActivity({
+        actorUserId: req.user?.id || null,
+        actorName: req.user?.username || req.user?.email || "System",
+        actorRole: req.user?.role || "admin",
+        moduleKey: "roles",
+        action: "deleted",
+        targetType: "role",
+        targetId: result.rows[0].id,
+        targetLabel: result.rows[0].title || result.rows[0].name,
+        note: "Deleted a role.",
+      });
+
+      return res.json({ role: result.rows[0] });
+    } catch (err) {
+      console.error("DELETE /api/rbac/roles/:id error:", err);
+      return res.status(500).json({ message: "Failed to delete role" });
+    }
+  },
+);
+
+app.get(
+  "/api/rbac/permissions",
+  authenticate,
+  requireRolePermissions(["permissions.view", "permissions.manage"], { any: true }),
+  async (_req, res) => {
+    try {
+      const permissions = await listRbacPermissions();
+      return res.json(permissions);
+    } catch (err) {
+      console.error("GET /api/rbac/permissions error:", err);
+      return res.status(500).json({ message: "Failed to fetch permissions" });
+    }
+  },
+);
+
+app.post(
+  "/api/rbac/permissions",
+  authenticate,
+  requireRolePermissions(["permissions.create", "permissions.manage"], {
+    any: true,
+  }),
+  async (req, res) => {
+    try {
+      const name = normalizePermissionToken(req.body?.name || req.body?.id || "");
+      if (!name) {
+        return res.status(400).json({ message: "Permission name is required" });
+      }
+
+      const description = String(req.body?.description || "").trim();
+      const moduleKey = String(req.body?.module || req.body?.module_key || "").trim();
+      const action = String(req.body?.action || "").trim();
+      const result = await db.query(
+        `
+        INSERT INTO admin_permissions (
+          name,
+          description,
+          module_key,
+          action,
+          built_in
+        )
+        VALUES ($1,$2,$3,$4,$5)
+        ON CONFLICT (name)
+        DO UPDATE SET
+          description = EXCLUDED.description,
+          module_key = EXCLUDED.module_key,
+          action = EXCLUDED.action,
+          built_in = EXCLUDED.built_in,
+          updated_at = now()
+        RETURNING id, name, description, module_key, action, built_in, created_at, updated_at
+      `,
+        [name, description, moduleKey || null, action || null, Boolean(req.body?.built_in)],
+      );
+
+      const permission = normalizeAdminPermissionRow({
+        ...result.rows[0],
+        module: result.rows[0]?.module_key,
+      });
+
+      await recordAdminActivity({
+        actorUserId: req.user?.id || null,
+        actorName: req.user?.username || req.user?.email || "System",
+        actorRole: req.user?.role || "admin",
+        moduleKey: "permissions",
+        action: "created",
+        targetType: "permission",
+        targetId: permission.id,
+        targetLabel: permission.name,
+        note: "Created or updated a permission.",
+      });
+
+      return res.status(201).json({ permission });
+    } catch (err) {
+      console.error("POST /api/rbac/permissions error:", err);
+      return res.status(500).json({ message: "Failed to save permission" });
+    }
+  },
+);
+
+app.put(
+  "/api/rbac/permissions/:id",
+  authenticate,
+  requireRolePermissions(["permissions.edit", "permissions.manage"], { any: true }),
+  async (req, res) => {
+    try {
+      const lookup = String(req.params.id || "").trim();
+      const existing = await db.query(
+        `
+        SELECT id, name, description, module_key, action, built_in, created_at, updated_at
+        FROM admin_permissions
+        WHERE CAST(id AS TEXT) = $1 OR LOWER(name) = LOWER($1)
+        LIMIT 1
+      `,
+        [lookup],
+      );
+      if (!existing.rows.length) {
+        return res.status(404).json({ message: "Permission not found" });
+      }
+
+      const current = normalizeAdminPermissionRow(existing.rows[0]);
+      const name = normalizePermissionToken(req.body?.name || current.name);
+      const description = String(req.body?.description || current.description || "").trim();
+      const moduleKey = String(req.body?.module || req.body?.module_key || current.module || "").trim();
+      const action = String(req.body?.action || current.action || "").trim();
+      const result = await db.query(
+        `
+        UPDATE admin_permissions
+        SET name = $1,
+            description = $2,
+            module_key = $3,
+            action = $4,
+            built_in = $5,
+            updated_at = now()
+        WHERE id = $6
+        RETURNING id, name, description, module_key, action, built_in, created_at, updated_at
+      `,
+        [name, description, moduleKey || null, action || null, Boolean(req.body?.built_in), current.id],
+      );
+
+      const permission = normalizeAdminPermissionRow({
+        ...result.rows[0],
+        module: result.rows[0]?.module_key,
+      });
+
+      await recordAdminActivity({
+        actorUserId: req.user?.id || null,
+        actorName: req.user?.username || req.user?.email || "System",
+        actorRole: req.user?.role || "admin",
+        moduleKey: "permissions",
+        action: "updated",
+        targetType: "permission",
+        targetId: permission.id,
+        targetLabel: permission.name,
+        note: "Updated a permission.",
+      });
+
+      return res.json({ permission });
+    } catch (err) {
+      console.error("PUT /api/rbac/permissions/:id error:", err);
+      return res.status(500).json({ message: "Failed to update permission" });
+    }
+  },
+);
+
+app.delete(
+  "/api/rbac/permissions/:id",
+  authenticate,
+  requireRolePermissions(["permissions.delete", "permissions.manage"], { any: true }),
+  async (req, res) => {
+    try {
+      const lookup = String(req.params.id || "").trim();
+      const result = await db.query(
+        `
+        DELETE FROM admin_permissions
+        WHERE CAST(id AS TEXT) = $1 OR LOWER(name) = LOWER($1)
+        RETURNING id, name
+      `,
+        [lookup],
+      );
+      if (!result.rows.length) {
+        return res.status(404).json({ message: "Permission not found" });
+      }
+
+      await recordAdminActivity({
+        actorUserId: req.user?.id || null,
+        actorName: req.user?.username || req.user?.email || "System",
+        actorRole: req.user?.role || "admin",
+        moduleKey: "permissions",
+        action: "deleted",
+        targetType: "permission",
+        targetId: result.rows[0].id,
+        targetLabel: result.rows[0].name,
+        note: "Deleted a permission.",
+      });
+
+      return res.json({ permission: result.rows[0] });
+    } catch (err) {
+      console.error("DELETE /api/rbac/permissions/:id error:", err);
+      return res.status(500).json({ message: "Failed to delete permission" });
+    }
+  },
+);
+
+app.get(
+  "/api/rbac/activity",
+  authenticate,
+  requireRolePermissions(["activity.view"], { any: true }),
+  async (req, res) => {
+    try {
+      const limit = Math.min(500, Number(req.query.limit || 100) || 100);
+      const activities = await listRbacActivities({ limit });
+      return res.json(activities);
+    } catch (err) {
+      console.error("GET /api/rbac/activity error:", err);
+      return res.status(500).json({ message: "Failed to fetch activity log" });
+    }
+  },
+);
+
 app.get("/api/admin/careers", authenticate, async (req, res) => {
   try {
     const pageRaw = Number(req.query.page);
@@ -6312,7 +7733,7 @@ app.post("/api/admin/careers/:id/notify", authenticate, async (req, res) => {
 /* ---- Blogs (Eligibility + Suggestions + Editor) ---- */
 app.get("/api/admin/blogs/candidates", authenticate, async (req, res) => {
   try {
-    if (!ensureBlogManagerAccess(req, res)) return;
+    if (!(await ensureBlogManagerAccess(req, res, "view"))) return;
 
     const rawType = String(req.query.type || "smartphone")
       .trim()
@@ -6336,7 +7757,14 @@ app.get("/api/admin/blogs/candidates", authenticate, async (req, res) => {
         bl.id AS existing_blog_id,
         bl.title AS existing_blog_title,
         bl.status AS existing_blog_status,
-        bl.category AS existing_blog_category
+        bl.category AS existing_blog_category,
+        bl.author_name AS existing_blog_author_name,
+        bl.hero_image_alt AS existing_blog_hero_image_alt,
+        bl.hero_image_caption AS existing_blog_hero_image_caption,
+        bl.tags AS existing_blog_tags,
+        bl.featured AS existing_blog_featured,
+        bl.trending AS existing_blog_trending,
+        bl.pinned AS existing_blog_pinned
       FROM products p
       LEFT JOIN brands b
         ON b.id = p.brand_id
@@ -6394,7 +7822,7 @@ app.get(
   authenticate,
   async (req, res) => {
     try {
-      if (!ensureBlogManagerAccess(req, res)) return;
+      if (!(await ensureBlogManagerAccess(req, res, "view"))) return;
 
       const productId = Number(req.params.productId);
       if (!Number.isInteger(productId) || productId <= 0) {
@@ -6421,6 +7849,8 @@ app.get(
         title,
         slug,
         excerpt,
+        author_name,
+        author_user_id,
         content_template,
         content_rendered,
         status,
@@ -6474,7 +7904,7 @@ app.get(
 
 app.post("/api/admin/blogs/preview", authenticate, async (req, res) => {
   try {
-    if (!ensureBlogManagerAccess(req, res)) return;
+    if (!(await ensureBlogManagerAccess(req, res, "edit"))) return;
 
     const productIdRaw = req.body?.product_id;
     const productId = Number(productIdRaw);
@@ -6514,7 +7944,7 @@ app.post("/api/admin/blogs/preview", authenticate, async (req, res) => {
 
 app.post("/api/admin/blogs", authenticate, async (req, res) => {
   try {
-    if (!ensureBlogManagerAccess(req, res)) return;
+    if (!(await ensureBlogManagerAccess(req, res, "edit"))) return;
 
     const rawBlogId = Number(req.body?.blog_id);
     const rawProductId = Number(req.body?.product_id);
@@ -6541,6 +7971,27 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       : "draft";
     const metaTitle = String(req.body?.meta_title || "").trim();
     const metaDescription = String(req.body?.meta_description || "").trim();
+    const authorName = String(
+      req.body?.author_name || req.body?.authorName || "",
+    ).trim();
+    const authorUserIdRaw = Number(req.body?.author_user_id);
+    const authorUserId =
+      Number.isInteger(authorUserIdRaw) && authorUserIdRaw > 0
+        ? authorUserIdRaw
+        : null;
+    const heroImageAlt = String(
+      req.body?.hero_image_alt || req.body?.heroImageAlt || "",
+    ).trim();
+    const heroImageCaption = String(
+      req.body?.hero_image_caption || req.body?.heroImageCaption || "",
+    ).trim();
+    const tags = parseBlogTags(req.body?.tags || req.body?.keywords);
+    const featured = parseBlogBoolean(req.body?.featured);
+    const trending = parseBlogBoolean(req.body?.trending);
+    const pinned = parseBlogBoolean(req.body?.pinned);
+    const publishedAtValue = parseBlogDate(
+      req.body?.published_at || req.body?.publishedAt,
+    );
     const heroImageSourceRaw = String(req.body?.hero_image_source || "")
       .trim()
       .toLowerCase();
@@ -6599,7 +8050,15 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
     const heroImage = String(
       req.body?.hero_image || snapshot?.hero_image || "",
     ).trim();
-    const nowPublishedAt = status === "published" ? new Date() : null;
+    const authorUser = authorUserId
+      ? await resolveRbacUserById(authorUserId)
+      : null;
+    const resolvedAuthorName =
+      authorName ||
+      authorUser?.display_name ||
+      authorUser?.author_name ||
+      authorUser?.user_name ||
+      null;
     const actorId =
       Number.isInteger(Number(req.user?.id)) && Number(req.user?.id) > 0
         ? Number(req.user.id)
@@ -6616,20 +8075,28 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           title = $4,
           slug = $5,
           excerpt = $6,
-          content_template = $7,
-          content_rendered = $8,
-          status = $9,
-          blog_eligible = $10,
-          eligibility_snapshot = $11::jsonb,
-          token_snapshot = $12::jsonb,
-          meta_title = $13,
-          meta_description = $14,
-          hero_image = $15,
-          hero_image_source = $16,
-          updated_by = $17,
+          author_name = $7,
+          author_user_id = $8,
+          content_template = $9,
+          content_rendered = $10,
+          status = $11,
+          blog_eligible = $12,
+          eligibility_snapshot = $13::jsonb,
+          token_snapshot = $14::jsonb,
+          meta_title = $15,
+          meta_description = $16,
+          hero_image = $17,
+          hero_image_source = $18,
+          hero_image_alt = $19,
+          hero_image_caption = $20,
+          tags = $21::jsonb,
+          featured = $22,
+          trending = $23,
+          pinned = $24,
+          updated_by = $25,
           published_at = CASE
-            WHEN $9 = 'published' THEN COALESCE(published_at, $18)
-            ELSE NULL
+            WHEN $11 = 'published' THEN COALESCE($26, published_at, now())
+            ELSE $26
           END,
           updated_at = now()
         WHERE id = $1
@@ -6640,6 +8107,8 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           title,
           slug,
           excerpt,
+          author_name,
+          author_user_id,
           content_template,
           content_rendered,
           status,
@@ -6650,6 +8119,12 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           meta_description,
           hero_image,
           hero_image_source,
+          hero_image_alt,
+          hero_image_caption,
+          tags,
+          featured,
+          trending,
+          pinned,
           published_at,
           created_at,
           updated_at
@@ -6661,6 +8136,8 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           title,
           slug,
           excerpt || null,
+          resolvedAuthorName || null,
+          authorUserId,
           contentTemplate,
           contentRendered,
           status,
@@ -6671,8 +8148,14 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           metaDescription || null,
           heroImage || null,
           heroImageSource,
+          heroImageAlt || null,
+          heroImageCaption || null,
+          JSON.stringify(tags),
+          featured,
+          trending,
+          pinned,
           actorId,
-          nowPublishedAt,
+          publishedAtValue,
         ],
       );
       if (!writeResult.rows.length) {
@@ -6687,6 +8170,8 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           title,
           slug,
           excerpt,
+          author_name,
+          author_user_id,
           content_template,
           content_rendered,
           status,
@@ -6697,13 +8182,19 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           meta_description,
           hero_image,
           hero_image_source,
+          hero_image_alt,
+          hero_image_caption,
+          tags,
+          featured,
+          trending,
+          pinned,
           created_by,
           updated_by,
           published_at,
           created_at,
           updated_at
         ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,now(),now()
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22,$23,$24,$25,$26,now(),now()
         )
         RETURNING
           id,
@@ -6712,6 +8203,8 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           title,
           slug,
           excerpt,
+          author_name,
+          author_user_id,
           content_template,
           content_rendered,
           status,
@@ -6722,6 +8215,12 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           meta_description,
           hero_image,
           hero_image_source,
+          hero_image_alt,
+          hero_image_caption,
+          tags,
+          featured,
+          trending,
+          pinned,
           published_at,
           created_at,
           updated_at
@@ -6732,6 +8231,8 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           title,
           slug,
           excerpt || null,
+          resolvedAuthorName || null,
+          authorUserId,
           contentTemplate,
           contentRendered,
           status,
@@ -6742,9 +8243,15 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           metaDescription || null,
           heroImage || null,
           heroImageSource,
+          heroImageAlt || null,
+          heroImageCaption || null,
+          JSON.stringify(tags),
+          featured,
+          trending,
+          pinned,
           actorId,
           actorId,
-          nowPublishedAt,
+          publishedAtValue,
         ],
       );
     }
@@ -6762,7 +8269,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
 
 app.get("/api/admin/blogs", authenticate, async (req, res) => {
   try {
-    if (!ensureBlogManagerAccess(req, res)) return;
+    if (!(await ensureBlogManagerAccess(req, res, "view"))) return;
 
     const page = toPositiveInt(req.query.page, 1);
     const limit = Math.min(100, toPositiveInt(req.query.limit, 20));
@@ -6784,9 +8291,18 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
         bl.category,
         bl.title,
         bl.slug,
+        bl.excerpt,
+        bl.author_name,
+        bl.author_user_id,
         bl.status,
         bl.blog_eligible,
         bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         COALESCE(
           bl.hero_image,
           (
@@ -6839,7 +8355,7 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
 
 app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
   try {
-    if (!ensureBlogManagerAccess(req, res)) return;
+    if (!(await ensureBlogManagerAccess(req, res, "view"))) return;
 
     const blogId = Number(req.params.id);
     if (!Number.isInteger(blogId) || blogId <= 0) {
@@ -6855,6 +8371,8 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
         bl.title,
         bl.slug,
         bl.excerpt,
+        bl.author_name,
+        bl.author_user_id,
         bl.content_template,
         bl.content_rendered,
         bl.status,
@@ -6864,6 +8382,12 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
         bl.meta_title,
         bl.meta_description,
         bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         COALESCE(
           bl.hero_image,
           (
@@ -6904,7 +8428,7 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
 
 app.delete("/api/admin/blogs/:id", authenticate, async (req, res) => {
   try {
-    if (!ensureBlogManagerAccess(req, res)) return;
+    if (!(await ensureBlogManagerAccess(req, res, "delete"))) return;
 
     const blogId = Number(req.params.id);
     if (!Number.isInteger(blogId) || blogId <= 0) {
@@ -6952,12 +8476,20 @@ app.get("/api/public/blogs", async (req, res) => {
         bl.category,
         bl.title,
         bl.excerpt,
+        bl.author_name,
+        bl.author_user_id,
         bl.content_template,
         bl.content_rendered,
         bl.token_snapshot,
         bl.meta_title,
         bl.meta_description,
         bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         COALESCE(
           bl.hero_image,
           (
@@ -7030,12 +8562,20 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
         bl.title,
         bl.slug,
         bl.excerpt,
+        bl.author_name,
+        bl.author_user_id,
         bl.content_template,
         bl.content_rendered,
         bl.token_snapshot,
         bl.meta_title,
         bl.meta_description,
         bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         COALESCE(
           bl.hero_image,
           (
