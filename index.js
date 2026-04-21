@@ -3149,9 +3149,9 @@ const resolveUniqueBlogSlug = async (
 async function runMigrations() {
   try {
     // Helper to run migration queries but ignore duplicate pg_type errors
-    async function safeQuery(sql) {
+    async function safeQuery(sql, params = []) {
       try {
-        await db.query(sql);
+        await db.query(sql, params);
       } catch (err) {
         // Postgres may raise a unique violation on pg_type when a previous
         // failed attempt left a composite type with the same name.
