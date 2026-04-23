@@ -65,6 +65,13 @@ const {
   isActionSupported,
   normalizePermissionToken,
 } = require("./utils/rbac");
+const {
+  NEWS_PUSH_TOPIC,
+  isFirebaseAdminConfigured,
+  sendPublishedNewsPush,
+  subscribeTokenToTopic,
+  unsubscribeTokenFromTopic,
+} = require("./utils/newsPush");
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
@@ -2630,6 +2637,25 @@ const parseBlogDate = (value) => {
   return date;
 };
 
+const normalizePushToken = (value) => {
+  const token = String(value || "").trim();
+  return token.length >= 20 ? token : "";
+};
+
+const normalizePushTopic = (value) => {
+  const topic = String(value || NEWS_PUSH_TOPIC)
+    .trim()
+    .toLowerCase();
+  return topic === NEWS_PUSH_TOPIC ? topic : "";
+};
+
+const normalizePushPermission = (value) => {
+  const permission = String(value || "").trim().toLowerCase();
+  return ["granted", "default", "denied"].includes(permission)
+    ? permission
+    : null;
+};
+
 const toSafeFiniteNumber = (value, fallback = 0) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -4162,6 +4188,53 @@ async function runMigrations() {
     await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_blogs_product
       ON blogs (product_id);
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id SERIAL PRIMARY KEY,
+        token TEXT NOT NULL,
+        topic TEXT NOT NULL DEFAULT 'news-all',
+        platform TEXT NOT NULL DEFAULT 'web',
+        permission TEXT,
+        user_agent TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        last_error TEXT,
+        last_registered_at TIMESTAMP DEFAULT now(),
+        created_at TIMESTAMP DEFAULT now(),
+        updated_at TIMESTAMP DEFAULT now(),
+        CONSTRAINT push_subscriptions_topic_token_unique UNIQUE (token, topic),
+        CONSTRAINT push_subscriptions_status_check
+          CHECK (status IN ('active', 'inactive', 'error'))
+      );
+    `);
+
+    await safeQuery(`
+      ALTER TABLE push_subscriptions
+      ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'web',
+      ADD COLUMN IF NOT EXISTS permission TEXT,
+      ADD COLUMN IF NOT EXISTS user_agent TEXT,
+      ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active',
+      ADD COLUMN IF NOT EXISTS last_error TEXT,
+      ADD COLUMN IF NOT EXISTS last_registered_at TIMESTAMP DEFAULT now(),
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT now(),
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now();
+    `);
+
+    await safeQuery(`
+      ALTER TABLE push_subscriptions
+      DROP CONSTRAINT IF EXISTS push_subscriptions_status_check;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE push_subscriptions
+      ADD CONSTRAINT push_subscriptions_status_check
+      CHECK (status IN ('active', 'inactive', 'error'));
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_push_subscriptions_topic_status
+      ON push_subscriptions (topic, status, updated_at DESC);
     `);
 
     // Marketing banners (campaigns / promotions)
@@ -8117,6 +8190,20 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       targetBlogId = Number(existingByProduct.rows[0]?.id) || null;
     }
 
+    let existingBlog = null;
+    if (targetBlogId) {
+      const existingBlogResult = await db.query(
+        `
+        SELECT id, status, slug
+        FROM blogs
+        WHERE id = $1
+        LIMIT 1
+      `,
+        [targetBlogId],
+      );
+      existingBlog = existingBlogResult.rows[0] || null;
+    }
+
     let snapshot = null;
     if (productId) {
       const profileConfig = await readDeviceFieldProfilesConfig();
@@ -8360,10 +8447,24 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       );
     }
 
+    const savedBlog = writeResult.rows[0] || null;
+    const shouldSendPublishedPush =
+      savedBlog?.status === "published" && existingBlog?.status !== "published";
+    let pushNotification = null;
+
+    if (shouldSendPublishedPush) {
+      try {
+        pushNotification = await sendPublishedNewsPush(savedBlog);
+      } catch (pushErr) {
+        console.error("News push dispatch failed:", pushErr);
+      }
+    }
+
     return res.status(201).json({
       message: "Blog saved successfully",
-      blog: writeResult.rows[0],
+      blog: savedBlog,
       unresolved_tokens: collectTemplateTokens(contentRendered),
+      push_notification: pushNotification,
     });
   } catch (err) {
     console.error("POST /api/admin/blogs error:", err);
@@ -8559,6 +8660,146 @@ app.delete("/api/admin/blogs/:id", authenticate, async (req, res) => {
   } catch (err) {
     console.error("DELETE /api/admin/blogs/:id error:", err);
     return res.status(500).json({ message: "Failed to delete blog" });
+  }
+});
+
+app.post("/api/public/push/fcm/register", async (req, res) => {
+  const token = normalizePushToken(req.body?.token);
+  const topic = normalizePushTopic(req.body?.topic || NEWS_PUSH_TOPIC);
+  const permission = normalizePushPermission(req.body?.permission);
+  const userAgent = String(req.get("user-agent") || "").trim() || null;
+
+  if (!token) {
+    return res.status(400).json({ message: "A valid FCM token is required" });
+  }
+
+  if (!topic) {
+    return res.status(400).json({ message: "Unsupported push topic" });
+  }
+
+  if (!isFirebaseAdminConfigured()) {
+    return res.status(503).json({
+      message: "Push notifications are not configured on the server yet",
+    });
+  }
+
+  try {
+    await subscribeTokenToTopic(token, topic);
+
+    const result = await db.query(
+      `
+      INSERT INTO push_subscriptions (
+        token,
+        topic,
+        platform,
+        permission,
+        user_agent,
+        status,
+        last_error,
+        last_registered_at,
+        updated_at
+      ) VALUES ($1,$2,'web',$3,$4,'active',NULL,now(),now())
+      ON CONFLICT (token, topic)
+      DO UPDATE SET
+        platform = 'web',
+        permission = EXCLUDED.permission,
+        user_agent = EXCLUDED.user_agent,
+        status = 'active',
+        last_error = NULL,
+        last_registered_at = now(),
+        updated_at = now()
+      RETURNING id, topic, status, last_registered_at, updated_at
+    `,
+      [token, topic, permission, userAgent],
+    );
+
+    return res.status(201).json({
+      message: "News alerts enabled",
+      subscription: result.rows[0] || null,
+    });
+  } catch (err) {
+    console.error("POST /api/public/push/fcm/register error:", err);
+
+    await db
+      .query(
+        `
+        INSERT INTO push_subscriptions (
+          token,
+          topic,
+          platform,
+          permission,
+          user_agent,
+          status,
+          last_error,
+          last_registered_at,
+          updated_at
+        ) VALUES ($1,$2,'web',$3,$4,'error',$5,now(),now())
+        ON CONFLICT (token, topic)
+        DO UPDATE SET
+          permission = EXCLUDED.permission,
+          user_agent = EXCLUDED.user_agent,
+          status = 'error',
+          last_error = EXCLUDED.last_error,
+          updated_at = now()
+      `,
+        [token, topic, permission, userAgent, err?.message || "Unknown error"],
+      )
+      .catch(() => undefined);
+
+    return res.status(502).json({
+      message: "Unable to enable news alerts right now",
+    });
+  }
+});
+
+app.post("/api/public/push/fcm/unregister", async (req, res) => {
+  const token = normalizePushToken(req.body?.token);
+  const topic = normalizePushTopic(req.body?.topic || NEWS_PUSH_TOPIC);
+
+  if (!token) {
+    return res.status(400).json({ message: "A valid FCM token is required" });
+  }
+
+  if (!topic) {
+    return res.status(400).json({ message: "Unsupported push topic" });
+  }
+
+  try {
+    if (isFirebaseAdminConfigured()) {
+      await unsubscribeTokenFromTopic(token, topic).catch((err) => {
+        console.warn("FCM unsubscribe warning:", err?.message || err);
+      });
+    }
+
+    const result = await db.query(
+      `
+      INSERT INTO push_subscriptions (
+        token,
+        topic,
+        platform,
+        status,
+        last_error,
+        updated_at
+      ) VALUES ($1,$2,'web','inactive',NULL,now())
+      ON CONFLICT (token, topic)
+      DO UPDATE SET
+        status = 'inactive',
+        last_error = NULL,
+        updated_at = now()
+      RETURNING id, topic, status, updated_at
+    `,
+      [token, topic],
+    );
+
+    return res.json({
+      message: "News alerts disabled",
+      subscription: result.rows[0] || null,
+    });
+  } catch (err) {
+    console.error("POST /api/public/push/fcm/unregister error:", err);
+    return res.status(500).json({
+      message: "Unable to disable news alerts right now",
+    });
   }
 });
 
