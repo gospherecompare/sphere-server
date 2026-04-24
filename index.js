@@ -8663,6 +8663,17 @@ app.delete("/api/admin/blogs/:id", authenticate, async (req, res) => {
   }
 });
 
+app.get("/api/public/push/fcm/status", (_req, res) => {
+  return res.json({
+    configured: isFirebaseAdminConfigured(),
+    topic: NEWS_PUSH_TOPIC,
+    routes: {
+      register: "/api/public/push/fcm/register",
+      unregister: "/api/public/push/fcm/unregister",
+    },
+  });
+});
+
 app.post("/api/public/push/fcm/register", async (req, res) => {
   const token = normalizePushToken(req.body?.token);
   const topic = normalizePushTopic(req.body?.topic || NEWS_PUSH_TOPIC);

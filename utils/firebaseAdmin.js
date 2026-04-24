@@ -1,3 +1,4 @@
+const fs = require("node:fs");
 const path = require("node:path");
 const admin = require("firebase-admin");
 
@@ -30,7 +31,16 @@ const getFirebaseAdmin = () => {
   }
 };
 
-const isFirebaseAdminConfigured = () => Boolean(getServiceAccountPath());
+const isFirebaseAdminConfigured = () => {
+  const serviceAccountPath = getServiceAccountPath();
+  if (!serviceAccountPath) return false;
+
+  try {
+    return fs.existsSync(path.resolve(serviceAccountPath));
+  } catch (_err) {
+    return false;
+  }
+};
 
 module.exports = {
   getFirebaseAdmin,
