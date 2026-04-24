@@ -15,13 +15,18 @@ const cleanText = (value = "") =>
 const clipText = (value = "", maxLength = 140) => {
   const text = cleanText(value);
   if (text.length <= maxLength) return text;
-  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+  return `${text.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+};
+
+const createNewsPushPath = (slug = "") => {
+  const normalizedSlug = String(slug || "").trim();
+  if (!normalizedSlug) return "/news";
+  return `/news/${encodeURIComponent(normalizedSlug)}`;
 };
 
 const createNewsPushUrl = (slug = "") => {
-  const normalizedSlug = String(slug || "").trim();
-  if (!normalizedSlug) return `${DEFAULT_SITE_ORIGIN}/news`;
-  return `${DEFAULT_SITE_ORIGIN}/news/${encodeURIComponent(normalizedSlug)}`;
+  const path = createNewsPushPath(slug);
+  return `${DEFAULT_SITE_ORIGIN}${path}`;
 };
 
 const getAdminMessaging = () => {
@@ -64,6 +69,7 @@ const sendPublishedNewsPush = async (blog = {}) => {
       "Fresh mobile news and launch coverage from the Hooks newsroom.",
     140,
   );
+  const path = createNewsPushPath(slug);
   const url = createNewsPushUrl(slug);
   const image = String(blog.hero_image || blog.heroImage || "").trim();
 
@@ -76,7 +82,10 @@ const sendPublishedNewsPush = async (blog = {}) => {
     data: {
       kind: "news",
       slug,
+      path,
       url,
+      link: url,
+      click_action: url,
     },
     webpush: {
       fcmOptions: {
@@ -91,7 +100,12 @@ const sendPublishedNewsPush = async (blog = {}) => {
         tag: slug ? `news-${slug}` : "news-latest",
         renotify: true,
         data: {
+          kind: "news",
+          slug,
+          path,
           url,
+          link: url,
+          click_action: url,
         },
       },
     },
@@ -108,6 +122,7 @@ const sendPublishedNewsPush = async (blog = {}) => {
 
 module.exports = {
   NEWS_PUSH_TOPIC,
+  createNewsPushPath,
   createNewsPushUrl,
   isFirebaseAdminConfigured,
   sendPublishedNewsPush,
