@@ -561,6 +561,27 @@ const normalizeDateOnlyInput = (value) => {
   return parsed ? String(parsed).slice(0, 10) : null;
 };
 
+const toDateOnlyUtcMillis = (value) => {
+  const normalized = normalizeDateOnlyInput(value);
+  if (!normalized) return null;
+
+  const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+
+  return Date.UTC(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+  );
+};
+
+const diffDateOnlyDays = (fromValue, toValue) => {
+  const fromUtc = toDateOnlyUtcMillis(fromValue);
+  const toUtc = toDateOnlyUtcMillis(toValue);
+  if (!Number.isFinite(fromUtc) || !Number.isFinite(toUtc)) return null;
+  return Math.round((toUtc - fromUtc) / 86400000);
+};
+
 const toOfferPriceNumber = (value) => {
   if (value === undefined || value === null || value === "") return null;
   const numeric =
@@ -13986,6 +14007,211 @@ app.get("/api/reports/products-by-category", authenticate, async (req, res) => {
     return res.json({ categories: catRes.rows, totals: totalsRes.rows });
   } catch (err) {
     console.error("GET /api/reports/products-by-category error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Launch timing analytics across device families
+app.get("/api/reports/launch-timing", authenticate, async (req, res) => {
+  try {
+    const laptopBrandSql = `
+      COALESCE(
+        b.name,
+        NULLIF(TRIM(l.meta->>'brand'), ''),
+        NULLIF(TRIM(l.spec_sections#>>'{basic_info_json,brand_name}'), ''),
+        NULLIF(TRIM(l.spec_sections#>>'{basic_info_json,brand}'), ''),
+        'Unknown'
+      )
+    `;
+
+    const laptopCategorySql = `
+      COALESCE(
+        NULLIF(TRIM(l.meta->>'category'), ''),
+        NULLIF(TRIM(l.spec_sections#>>'{basic_info_json,category}'), ''),
+        'Laptop'
+      )
+    `;
+
+    const laptopLaunchDateSql = `
+      COALESCE(
+        CASE
+          WHEN NULLIF(TRIM(l.meta->>'launch_date'), '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN (l.meta->>'launch_date')::date
+          ELSE NULL
+        END,
+        CASE
+          WHEN NULLIF(TRIM(l.spec_sections#>>'{basic_info_json,launch_date}'), '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN (l.spec_sections#>>'{basic_info_json,launch_date}')::date
+          ELSE NULL
+        END,
+        l.created_at::date,
+        p.created_at::date
+      )
+    `;
+
+    const tvCategorySql = `
+      COALESCE(
+        NULLIF(TRIM(t.category), ''),
+        NULLIF(TRIM(t.basic_info_json->>'category'), ''),
+        'TV'
+      )
+    `;
+
+    const tvLaunchDateSql = `
+      COALESCE(
+        CASE
+          WHEN NULLIF(TRIM(t.basic_info_json->>'launch_date'), '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN (t.basic_info_json->>'launch_date')::date
+          ELSE NULL
+        END,
+        CASE
+          WHEN NULLIF(TRIM(t.product_details_json->>'launch_date'), '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN (t.product_details_json->>'launch_date')::date
+          ELSE NULL
+        END,
+        CASE
+          WHEN NULLIF(TRIM(t.product_details_json->>'launch_year'), '') ~ '^[0-9]{4}$'
+            THEN make_date((t.product_details_json->>'launch_year')::int, 1, 1)
+          ELSE NULL
+        END,
+        CASE
+          WHEN NULLIF(TRIM(t.basic_info_json->>'launch_year'), '') ~ '^[0-9]{4}$'
+            THEN make_date((t.basic_info_json->>'launch_year')::int, 1, 1)
+          ELSE NULL
+        END,
+        t.created_at::date,
+        p.created_at::date
+      )
+    `;
+
+    const [smartphoneRes, laptopRes, tvRes] = await Promise.all([
+      db.query(`
+        SELECT
+          p.id AS product_id,
+          p.product_type,
+          p.name AS product_name,
+          COALESCE(b.name, NULLIF(TRIM(s.brand), ''), 'Unknown') AS brand_name,
+          COALESCE(NULLIF(TRIM(s.category), ''), 'Uncategorized') AS category,
+          s.launch_date,
+          MIN(sp.sale_start_date) AS sale_start_date
+        FROM products p
+        INNER JOIN smartphones s
+          ON s.product_id = p.id
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        LEFT JOIN product_variants v
+          ON v.product_id = p.id
+        LEFT JOIN variant_store_prices sp
+          ON sp.variant_id = v.id
+        WHERE p.product_type = 'smartphone'
+        GROUP BY
+          p.id,
+          p.product_type,
+          p.name,
+          b.name,
+          s.brand,
+          s.category,
+          s.launch_date
+      `),
+      db.query(`
+        SELECT
+          p.id AS product_id,
+          p.product_type,
+          p.name AS product_name,
+          ${laptopBrandSql} AS brand_name,
+          ${laptopCategorySql} AS category,
+          ${laptopLaunchDateSql} AS launch_date,
+          MIN(sp.sale_start_date) AS sale_start_date
+        FROM products p
+        INNER JOIN laptop l
+          ON l.product_id = p.id
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        LEFT JOIN product_variants v
+          ON v.product_id = p.id
+        LEFT JOIN variant_store_prices sp
+          ON sp.variant_id = v.id
+        WHERE p.product_type = 'laptop'
+        GROUP BY
+          p.id,
+          p.product_type,
+          p.name,
+          ${laptopBrandSql},
+          ${laptopCategorySql},
+          ${laptopLaunchDateSql}
+      `),
+      db.query(`
+        SELECT
+          p.id AS product_id,
+          p.product_type,
+          p.name AS product_name,
+          COALESCE(b.name, 'Unknown') AS brand_name,
+          ${tvCategorySql} AS category,
+          ${tvLaunchDateSql} AS launch_date,
+          MIN(sp.sale_start_date) AS sale_start_date
+        FROM products p
+        INNER JOIN tvs t
+          ON t.product_id = p.id
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        LEFT JOIN product_variants v
+          ON v.product_id = p.id
+        LEFT JOIN variant_store_prices sp
+          ON sp.variant_id = v.id
+        WHERE p.product_type = 'tv'
+        GROUP BY
+          p.id,
+          p.product_type,
+          p.name,
+          b.name,
+          ${tvCategorySql},
+          ${tvLaunchDateSql}
+      `),
+    ]);
+
+    const normalizeTimingRow = (row) => {
+      const launchDate = normalizeDateOnlyInput(row?.launch_date);
+      const saleStartDate = normalizeDateOnlyInput(row?.sale_start_date);
+
+      return {
+        product_id: Number(row?.product_id),
+        product_type: String(row?.product_type || ""),
+        product_name: String(row?.product_name || "Unnamed device"),
+        brand_name: row?.brand_name ? String(row.brand_name) : null,
+        category: row?.category ? String(row.category) : "Uncategorized",
+        launch_date: launchDate,
+        sale_start_date: saleStartDate,
+        sale_gap_days: diffDateOnlyDays(launchDate, saleStartDate),
+      };
+    };
+
+    const devices = [
+      ...(smartphoneRes.rows || []),
+      ...(laptopRes.rows || []),
+      ...(tvRes.rows || []),
+    ]
+      .map(normalizeTimingRow)
+      .sort((left, right) => {
+        const launchDiff =
+          (toDateOnlyUtcMillis(right?.launch_date) || 0) -
+          (toDateOnlyUtcMillis(left?.launch_date) || 0);
+        if (launchDiff !== 0) return launchDiff;
+        return Number(right?.product_id || 0) - Number(left?.product_id || 0);
+      });
+
+    return res.json({
+      devices,
+      totals: {
+        total_devices: devices.length,
+        devices_with_sale_date: devices.filter((item) => item.sale_start_date)
+          .length,
+        devices_with_gap: devices.filter((item) =>
+          Number.isFinite(item.sale_gap_days),
+        ).length,
+      },
+    });
+  } catch (err) {
+    console.error("GET /api/reports/launch-timing error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
