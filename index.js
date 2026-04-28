@@ -3002,8 +3002,14 @@ const fetchBlogProductSnapshot = async (
 
 const buildBlogTokenMap = (snapshot) => {
   const scored = toPlainObject(snapshot?.scored);
+  const productType = normalizeProfileDeviceType(snapshot?.product_type);
   const display = toPlainObject(scored.field_profile?.display_display);
   const mandatory = toPlainObject(scored.field_profile?.mandatory_display);
+  const defaultProfile = toPlainObject(
+    DEFAULT_DEVICE_FIELD_PROFILES[productType],
+  );
+  const defaultDisplayPaths = toPlainObject(defaultProfile.display);
+  const defaultMandatoryPaths = toPlainObject(defaultProfile.mandatory);
   const tokenMap = {};
 
   const setToken = (key, value) => {
@@ -3012,6 +3018,26 @@ const buildBlogTokenMap = (snapshot) => {
     const formatted = formatBlogValue(value);
     if (!formatted) return;
     tokenMap[normalizedKey] = formatted;
+  };
+
+  const ensureToken = (key, ...candidates) => {
+    const normalizedKey = normalizeBlogTokenKey(key);
+    if (!normalizedKey || profileHasValue(tokenMap[normalizedKey])) return;
+
+    for (const candidate of candidates) {
+      if (!profileHasValue(candidate)) continue;
+      setToken(key, candidate);
+      if (profileHasValue(tokenMap[normalizedKey])) return;
+    }
+  };
+
+  const resolveTokenValueByPaths = (...pathGroups) => {
+    for (const paths of pathGroups) {
+      if (!Array.isArray(paths) || !paths.length) continue;
+      const resolved = resolveProfileValueByPaths(scored, paths);
+      if (profileHasValue(resolved)) return resolved;
+    }
+    return null;
   };
 
   setToken("product_name", scored.name || snapshot?.core?.name);
@@ -3057,6 +3083,46 @@ const buildBlogTokenMap = (snapshot) => {
   for (const [key, value] of Object.entries(mandatory)) {
     setToken(key, value);
   }
+
+  for (const [key, paths] of Object.entries(defaultDisplayPaths)) {
+    ensureToken(key, resolveTokenValueByPaths(paths));
+  }
+
+  for (const [key, paths] of Object.entries(defaultMandatoryPaths)) {
+    ensureToken(key, resolveTokenValueByPaths(paths));
+  }
+
+  ensureToken(
+    "display",
+    tokenMap.display_size,
+    tokenMap.screen_size,
+    resolveTokenValueByPaths(
+      defaultMandatoryPaths.display,
+      defaultDisplayPaths.display_size,
+    ),
+  );
+  ensureToken(
+    "main_camera",
+    tokenMap.camera,
+    resolveTokenValueByPaths(
+      defaultDisplayPaths.main_camera,
+      defaultMandatoryPaths.camera,
+    ),
+  );
+  ensureToken(
+    "processor",
+    resolveTokenValueByPaths(
+      defaultDisplayPaths.processor,
+      defaultMandatoryPaths.processor,
+    ),
+  );
+  ensureToken(
+    "battery",
+    resolveTokenValueByPaths(
+      defaultDisplayPaths.battery,
+      defaultMandatoryPaths.battery,
+    ),
+  );
 
   return tokenMap;
 };
