@@ -47,6 +47,7 @@ const {
   normalizeSearchQuery,
   resolveSearchInterestProduct,
 } = require("./utils/searchPopularity");
+const { ensureProperHtmlEncoding } = require("./utils/htmlDecoder");
 const {
   normalizeRole,
   RBAC_MODULES,
@@ -568,11 +569,7 @@ const toDateOnlyUtcMillis = (value) => {
   const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!match) return null;
 
-  return Date.UTC(
-    Number(match[1]),
-    Number(match[2]) - 1,
-    Number(match[3]),
-  );
+  return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
 };
 
 const diffDateOnlyDays = (fromValue, toValue) => {
@@ -2671,7 +2668,9 @@ const normalizePushTopic = (value) => {
 };
 
 const normalizePushPermission = (value) => {
-  const permission = String(value || "").trim().toLowerCase();
+  const permission = String(value || "")
+    .trim()
+    .toLowerCase();
   return ["granted", "default", "denied"].includes(permission)
     ? permission
     : null;
@@ -3154,6 +3153,11 @@ const resolvePublicBlogRow = async (
   blog.content_rendered = renderBlogTemplateWithTokens(template, tokenMap, {
     preserveUnknown: false,
   });
+
+  // Ensure proper HTML encoding for API responses
+  blog.content_template = ensureProperHtmlEncoding(blog.content_template);
+  blog.content_rendered = ensureProperHtmlEncoding(blog.content_rendered);
+
   return blog;
 };
 
@@ -8481,6 +8485,16 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       }
     }
 
+    // Ensure proper HTML encoding for API responses
+    if (savedBlog) {
+      savedBlog.content_template = ensureProperHtmlEncoding(
+        savedBlog.content_template,
+      );
+      savedBlog.content_rendered = ensureProperHtmlEncoding(
+        savedBlog.content_rendered,
+      );
+    }
+
     return res.status(201).json({
       message: "Blog saved successfully",
       blog: savedBlog,
@@ -8645,7 +8659,12 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
       return res.status(404).json({ message: "Blog not found" });
     }
 
-    return res.json({ blog: result.rows[0] });
+    const blog = result.rows[0];
+    // Ensure proper HTML encoding for API responses
+    blog.content_template = ensureProperHtmlEncoding(blog.content_template);
+    blog.content_rendered = ensureProperHtmlEncoding(blog.content_rendered);
+
+    return res.json({ blog });
   } catch (err) {
     console.error("GET /api/admin/blogs/:id error:", err);
     return res.status(500).json({ message: "Failed to fetch blog" });
@@ -8844,6 +8863,20 @@ app.get("/api/public/blogs", async (req, res) => {
     const category = BLOG_ALLOWED_CATEGORIES.has(rawCategory)
       ? rawCategory
       : null;
+    const productId = toPositiveInt(req.query.productId, null);
+    const params = [limit];
+    const whereClauses = [`bl.status = 'published'`];
+
+    if (category) {
+      params.push(category);
+      whereClauses.push(`bl.category = $${params.length}`);
+    }
+
+    if (productId) {
+      params.push(productId);
+      whereClauses.push(`bl.product_id = $${params.length}`);
+    }
+
     const result = await db.query(
       `
       SELECT
@@ -8888,12 +8921,11 @@ app.get("/api/public/blogs", async (req, res) => {
         ON p.id = bl.product_id
       LEFT JOIN brands b
         ON b.id = p.brand_id
-      WHERE bl.status = 'published'
-        ${category ? "AND bl.category = $2" : ""}
+      WHERE ${whereClauses.join("\n        AND ")}
       ORDER BY bl.published_at DESC NULLS LAST, bl.updated_at DESC
       LIMIT $1
     `,
-      category ? [limit, category] : [limit],
+      params,
     );
 
     const rows = result.rows || [];
@@ -8910,11 +8942,16 @@ app.get("/api/public/blogs", async (req, res) => {
             ),
           );
         })()
-      : rows;
+      : rows.map((blog) => ({
+          ...blog,
+          content_template: ensureProperHtmlEncoding(blog.content_template),
+          content_rendered: ensureProperHtmlEncoding(blog.content_rendered),
+        }));
 
     return res.json({
       limit,
       category,
+      productId,
       blogs,
     });
   } catch (err) {
