@@ -1,5 +1,6 @@
 // index _fixed.js
 require("dotenv").config();
+const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
@@ -76,6 +77,7 @@ const {
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
+const compression = require("compression");
 
 const SECRET = process.env.JWT_SECRET || "smartarena_secret_key_25";
 const PORT = process.env.PORT || 5000;
@@ -106,13 +108,67 @@ app.use(
   }),
 );
 
-// Security middlewares
+// Security middlewares - Enhanced with explicit HSTS
 app.disable("x-powered-by");
-app.use(helmet());
+
+// Enable gzip compression for all responses (reduces file size by 70-80%)
+app.use(
+  compression({
+    filter: (req, res) => {
+      // Don't compress responses with this request header
+      if (req.headers["x-no-compression"]) {
+        return false;
+      }
+      // Use compression filter function
+      return compression.filter(req, res);
+    },
+    level: 6, // Balance between speed and compression (1-9, default 6)
+  }),
+);
+
+app.use(
+  helmet({
+    hsts: {
+      maxAge: 31536000, // 1 year in seconds
+      includeSubDomains: true,
+      preload: true,
+    },
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'", "fonts.googleapis.com"],
+        scriptSrc: [
+          "'self'",
+          "www.googletagmanager.com",
+          "pagead2.googlesyndication.com",
+        ],
+        fontSrc: ["'self'", "fonts.gstatic.com"],
+        imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: ["'self'", "https:"],
+      },
+    },
+  }),
+);
 // Limit JSON body size to mitigate large payload abuse
 app.use(express.json({ limit: "10kb" }));
 // Parse URL-encoded bodies (for form submissions)
 app.use(express.urlencoded({ extended: true }));
+
+// ===== URL CANONICALIZATION MIDDLEWARE =====
+// Enforce canonical URL structure: https://tryhook.shop (non-www)
+// Only do essential redirects to avoid redirect chains
+app.use((req, res, next) => {
+  // Only redirect www to non-www if explicitly requested
+  // Skip for API endpoints and direct https traffic
+  if (req.hostname === "www.tryhook.shop") {
+    const newUrl = `https://tryhook.shop${req.originalUrl}`;
+    return res.redirect(301, newUrl);
+  }
+
+  // Let React Router handle trailing slashes and path normalization
+  // Avoid redirect chains
+  next();
+});
 
 const API_ALIAS_REWRITE_RULES = [
   { alias: /^\/api\/gateway\/catalog\/handset$/i, target: "/api/smartphones" },
@@ -272,6 +328,50 @@ app.use(function xssSafe(req, res, next) {
 
   next();
 });
+
+// ===== STATIC FILE SERVING FOR REACT SPA =====
+// Serve built React app from client/dist directory
+const distPath = path.join(__dirname, "../client/dist");
+const HASHED_STATIC_ASSET_PATTERN = /-[A-Za-z0-9_-]{8,}\.[^./\\]+$/i;
+
+const applyNoCacheHtmlHeaders = (res) => {
+  res.set("Cache-Control", "no-cache, no-store, must-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+};
+
+const isHtmlFilePath = (filePath = "") =>
+  path.extname(String(filePath || "")).toLowerCase() === ".html";
+
+const isHashedStaticAsset = (filePath = "") =>
+  HASHED_STATIC_ASSET_PATTERN.test(path.basename(String(filePath || "")));
+
+const isDirectFileRequest = (requestPath = "") =>
+  Boolean(path.extname(String(requestPath || "")));
+
+app.use(
+  express.static(distPath, {
+    // Set proper cache control headers for static assets
+    setHeaders: (res, filePath) => {
+      if (isHtmlFilePath(filePath)) {
+        // HTML must be revalidated so it does not point at stale hashed bundles.
+        applyNoCacheHtmlHeaders(res);
+      }
+      // Cache static assets with hashes for 1 year (they won't change)
+      else if (isHashedStaticAsset(filePath)) {
+        res.set("Cache-Control", "public, max-age=31536000, immutable");
+      }
+      // Cache other non-hashed static files for 1 hour to allow updates.
+      else {
+        res.set("Cache-Control", "public, max-age=3600, must-revalidate");
+      }
+      // Ensure proper MIME types for JavaScript modules
+      if (filePath.endsWith(".js") || filePath.endsWith(".mjs")) {
+        res.set("Content-Type", "application/javascript; charset=utf-8");
+      }
+    },
+  }),
+);
 
 // Global rate limiting is not enabled, but targeted auth limits are applied below.
 
@@ -18219,6 +18319,20 @@ const smartphonesReqRouter = require("./routes/smartphonesReq");
 app.use("/api/import", authenticate, importSmartphonesRouter);
 app.use("/api/import", authenticate, importLaptopsRouter);
 app.use("/api/smartphones", authenticate, smartphonesReqRouter);
+
+// ===== SPA CATCH-ALL ROUTE =====
+// Serve index.html for any route that doesn't match an API endpoint.
+// This allows React Router to handle client-side routing.
+app.get("*", (req, res) => {
+  // Missing file requests should return 404 instead of HTML to avoid
+  // module/CSS MIME mismatches when an outdated page references old assets.
+  if (isDirectFileRequest(req.path)) {
+    return res.status(404).end();
+  }
+
+  applyNoCacheHtmlHeaders(res);
+  res.sendFile(path.join(distPath, "index.html"));
+});
 
 async function start() {
   try {
