@@ -112,19 +112,6 @@ app.use(
 app.disable("x-powered-by");
 
 // Enable gzip compression for all responses (reduces file size by 70-80%)
-app.use(
-  compression({
-    filter: (req, res) => {
-      // Don't compress responses with this request header
-      if (req.headers["x-no-compression"]) {
-        return false;
-      }
-      // Use compression filter function
-      return compression.filter(req, res);
-    },
-    level: 6, // Balance between speed and compression (1-9, default 6)
-  }),
-);
 
 app.use(
   helmet({
@@ -18323,7 +18310,7 @@ app.use("/api/smartphones", authenticate, smartphonesReqRouter);
 // ===== SPA CATCH-ALL ROUTE =====
 // Serve index.html for any route that doesn't match an API endpoint.
 // This allows React Router to handle client-side routing.
-app.get("*", (req, res) => {
+app.get("/{*splat}", (req, res) => {
   // Missing file requests should return 404 instead of HTML to avoid
   // module/CSS MIME mismatches when an outdated page references old assets.
   if (isDirectFileRequest(req.path)) {
