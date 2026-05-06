@@ -99,7 +99,7 @@ const buildProductDetailPath = (productType, name, id) => {
   const basePath = getCategoryPath(productType);
 
   if (productType === "smartphone") {
-    return `${basePath}/${slug}-price-in-india?id=${id}`;
+    return `${basePath}/${slug}-price-in-india`;
   }
 
   return `${basePath}/${slug}?id=${id}`;
