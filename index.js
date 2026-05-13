@@ -2056,8 +2056,9 @@ const readLargestComparePageNumber = (value, { min = null, max = null } = {}) =>
 
 const getDaysSinceDateOnly = (value, today = getIndiaDateOnly()) => {
   const date = normalizeDateOnlyInput(value);
-  if (!date || !today) return null;
-  return Math.floor((today.getTime() - date.getTime()) / (24 * 60 * 60 * 1000));
+  const normalizedToday = normalizeDateOnlyInput(today);
+  if (!date || !normalizedToday) return null;
+  return diffDateOnlyDays(date, normalizedToday);
 };
 
 const deriveSmartphoneTypeLabelFromProduct = (product = {}) => {
