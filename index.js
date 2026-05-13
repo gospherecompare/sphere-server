@@ -445,17 +445,17 @@ const hasStoreMarketSignal = (store) => {
         store.offer_price ??
         store.mrp,
     ) ||
-      store.url ||
-      store.store ||
-      store.store_name ||
-      store.storeName ||
-      store.display_store_name ||
-      store.sale_start_date ||
-      store.saleStartDate ||
-      store.sale_date ||
-      store.saleDate ||
-      store.available_from ||
-      store.availableFrom,
+    store.url ||
+    store.store ||
+    store.store_name ||
+    store.storeName ||
+    store.display_store_name ||
+    store.sale_start_date ||
+    store.saleStartDate ||
+    store.sale_date ||
+    store.saleDate ||
+    store.available_from ||
+    store.availableFrom,
   );
 };
 
@@ -1865,11 +1865,14 @@ const normalizeComparePageLabel = (value, maxLength = 160) =>
   normalizeComparePageText(value).slice(0, Math.max(0, maxLength));
 
 const normalizeComparePageStatus = (value) =>
-  String(value || "").trim().toLowerCase() === "draft"
+  String(value || "")
+    .trim()
+    .toLowerCase() === "draft"
     ? "draft"
     : "published";
 
-const getComparePageRoutePath = (slug = "") => `/compare/${String(slug || "").trim()}`;
+const getComparePageRoutePath = (slug = "") =>
+  `/compare/${String(slug || "").trim()}`;
 
 const normalizePublishedComparePageRow = (row) => {
   const items = Array.isArray(row?.items)
@@ -1881,8 +1884,13 @@ const normalizePublishedComparePageRow = (row) => {
           brand_name: item?.brand_name || "",
           position: Number(item?.position) || null,
         }))
-        .filter((item) => Number.isInteger(item.product_id) && item.product_id > 0)
-        .sort((left, right) => Number(left.position || 0) - Number(right.position || 0))
+        .filter(
+          (item) => Number.isInteger(item.product_id) && item.product_id > 0,
+        )
+        .sort(
+          (left, right) =>
+            Number(left.position || 0) - Number(right.position || 0),
+        )
     : [];
 
   return {
@@ -2042,7 +2050,9 @@ async function readSmartphoneCompareSuggestions(productId, limit = 2) {
     return { primary_product: null, suggestions: [] };
   }
 
-  const primaryRows = await readSmartphoneComparePageProductSummaries([normalizedId]);
+  const primaryRows = await readSmartphoneComparePageProductSummaries([
+    normalizedId,
+  ]);
   const primaryProduct = primaryRows[0] || null;
   if (!primaryProduct) {
     return { primary_product: null, suggestions: [] };
@@ -2120,13 +2130,19 @@ async function readSmartphoneCompareSuggestions(productId, limit = 2) {
   };
 }
 
-async function savePublishedComparePage({ pageId = null, payload = {}, userId = null }) {
+async function savePublishedComparePage({
+  pageId = null,
+  payload = {},
+  userId = null,
+}) {
   const rawProductIds = Array.isArray(payload.product_ids)
     ? payload.product_ids
     : Array.isArray(payload.productIds)
       ? payload.productIds
       : Array.isArray(payload.items)
-        ? payload.items.map((item) => item?.product_id ?? item?.productId ?? item?.id)
+        ? payload.items.map(
+            (item) => item?.product_id ?? item?.productId ?? item?.id,
+          )
         : [];
 
   const requestedProductIds = Array.from(
@@ -2138,21 +2154,28 @@ async function savePublishedComparePage({ pageId = null, payload = {}, userId = 
   ).slice(0, 3);
 
   if (requestedProductIds.length < 2) {
-    const error = new Error("Select at least 2 smartphones for a compare page.");
+    const error = new Error(
+      "Select at least 2 smartphones for a compare page.",
+    );
     error.statusCode = 400;
     throw error;
   }
 
-  const productRows = await readSmartphoneComparePageProductSummaries(requestedProductIds);
+  const productRows =
+    await readSmartphoneComparePageProductSummaries(requestedProductIds);
   if (productRows.length !== requestedProductIds.length) {
-    const error = new Error("All compare page products must be published smartphones.");
+    const error = new Error(
+      "All compare page products must be published smartphones.",
+    );
     error.statusCode = 400;
     throw error;
   }
 
   const productMap = new Map(productRows.map((row) => [row.product_id, row]));
   const requestedPrimaryProductId = Number(
-    payload.primary_product_id ?? payload.primaryProductId ?? requestedProductIds[0],
+    payload.primary_product_id ??
+      payload.primaryProductId ??
+      requestedProductIds[0],
   );
   const primaryProductId = productMap.has(requestedPrimaryProductId)
     ? requestedPrimaryProductId
@@ -2160,7 +2183,9 @@ async function savePublishedComparePage({ pageId = null, payload = {}, userId = 
 
   const orderedProductIds = [
     primaryProductId,
-    ...requestedProductIds.filter((productId) => productId !== primaryProductId),
+    ...requestedProductIds.filter(
+      (productId) => productId !== primaryProductId,
+    ),
   ].slice(0, 3);
 
   const orderedProducts = orderedProductIds
@@ -2172,11 +2197,15 @@ async function savePublishedComparePage({ pageId = null, payload = {}, userId = 
     .filter((value) => value != null);
   const averagePrice =
     priceCandidates.length > 0
-      ? priceCandidates.reduce((sum, value) => sum + value, 0) / priceCandidates.length
+      ? priceCandidates.reduce((sum, value) => sum + value, 0) /
+        priceCandidates.length
       : null;
 
   const segmentLabel =
-    normalizeComparePageLabel(payload.segment_label ?? payload.segmentLabel, 80) ||
+    normalizeComparePageLabel(
+      payload.segment_label ?? payload.segmentLabel,
+      80,
+    ) ||
     resolveSmartphoneSegmentLabel(
       productMap.get(primaryProductId)?.best_price ?? averagePrice,
     );
@@ -2203,7 +2232,10 @@ async function savePublishedComparePage({ pageId = null, payload = {}, userId = 
       smartphoneTypeLabel,
     });
   const metaDescription =
-    normalizeComparePageLabel(payload.meta_description ?? payload.metaDescription, 320) ||
+    normalizeComparePageLabel(
+      payload.meta_description ?? payload.metaDescription,
+      320,
+    ) ||
     buildComparePageDescription({
       names,
       segmentLabel,
@@ -2327,7 +2359,10 @@ async function savePublishedComparePage({ pageId = null, payload = {}, userId = 
     }
 
     await client.query("COMMIT");
-    const pages = await readPublishedComparePages({ id: savedPageId, limit: 1 });
+    const pages = await readPublishedComparePages({
+      id: savedPageId,
+      limit: 1,
+    });
     return pages[0] || null;
   } catch (err) {
     try {
@@ -17240,7 +17275,9 @@ app.get("/api/public/compare-pages/routes", async (_req, res) => {
     });
   } catch (err) {
     console.error("GET /api/public/compare-pages/routes error:", err);
-    return res.status(500).json({ message: "Failed to load compare page routes" });
+    return res
+      .status(500)
+      .json({ message: "Failed to load compare page routes" });
   }
 });
 
@@ -19221,7 +19258,7 @@ async function start() {
   }
 
   app.listen(PORT, "0.0.0.0", async () => {
-    console.log(`Server running at http://localhost:${PORT}`);
+    console.log(`Server running at ${PORT}`);
     try {
       const r = await db.query("SELECT now()");
       console.log("DB time:", r.rows[0].now);
