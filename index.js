@@ -40,6 +40,16 @@ const {
   recomputeSmartphoneCompetitorAnalysis,
 } = require("./utils/competitorAnalysis");
 const {
+  normalizeText: normalizeComparePageText,
+  toFiniteNumber: toComparePageFiniteNumber,
+  toSlug: toComparePageSlug,
+  joinNamesWithoutCommas,
+  resolveSmartphoneSegmentLabel,
+  buildComparePageSlug,
+  buildComparePageTitle,
+  buildComparePageDescription,
+} = require("./utils/comparePageSeo");
+const {
   cleanText,
   cleanToken,
   getSearchPopularityDevices,
@@ -322,19 +332,12 @@ const resolveSmartphoneLaunchStage = (
   todayIndia = getIndiaDateOnly(),
 ) => {
   if (!device) return null;
-  const override = normalizeLaunchStatusOverride(
+  const explicitStatus = normalizeLaunchStatusOverride(
     device.launch_status_override ||
       device.launchStatusOverride ||
       device.launch_status ||
       device.launchStatus,
   );
-  if (override) return override;
-
-  const statusHint = normalizeLaunchStatusOverride(
-    device.status || device.availability || device.badge || device.status_text,
-  );
-  if (statusHint) return statusHint;
-
   const saleStartDirect = normalizeDateOnlyInput(
     device.sale_start_date ??
       device.saleStartDate ??
@@ -345,14 +348,65 @@ const resolveSmartphoneLaunchStage = (
   const saleStart =
     saleStartDirect ||
     getEarliestSaleStartDateFromVariants(device.variants || []);
+  const launchDate = normalizeDateOnlyInput(
+    device.launch_date || device.launchDate || null,
+  );
+
+  if (explicitStatus === "rumored" || explicitStatus === "announced") {
+    return explicitStatus;
+  }
+
+  if (explicitStatus === "released") {
+    return "released";
+  }
+
+  if (explicitStatus === "available") {
+    if (saleStart) {
+      if (todayIndia && saleStart > todayIndia) return "upcoming";
+      return "available";
+    }
+    return "available";
+  }
+
+  if (explicitStatus === "upcoming") {
+    if (saleStart) {
+      return todayIndia && saleStart > todayIndia ? "upcoming" : "released";
+    }
+    if (launchDate) {
+      return todayIndia && launchDate > todayIndia ? "upcoming" : "released";
+    }
+    return "released";
+  }
+
+  const statusHint = normalizeLaunchStatusOverride(
+    device.status || device.availability || device.badge || device.status_text,
+  );
+  if (statusHint) {
+    if (statusHint === "released") return "released";
+    if (statusHint === "available") {
+      if (saleStart) {
+        if (todayIndia && saleStart > todayIndia) return "upcoming";
+        return "available";
+      }
+      return "available";
+    }
+    if (statusHint === "upcoming") {
+      if (saleStart) {
+        return todayIndia && saleStart > todayIndia ? "upcoming" : "released";
+      }
+      if (launchDate) {
+        return todayIndia && launchDate > todayIndia ? "upcoming" : "released";
+      }
+      return "released";
+    }
+    return statusHint;
+  }
+
   if (saleStart) {
     if (todayIndia && saleStart <= todayIndia) return "available";
     return "upcoming";
   }
 
-  const launchDate = normalizeDateOnlyInput(
-    device.launch_date || device.launchDate || null,
-  );
   if (launchDate) {
     if (todayIndia && launchDate > todayIndia) return "upcoming";
     return "released";
@@ -364,8 +418,112 @@ const resolveSmartphoneLaunchStage = (
 const SMARTPHONE_COMPARE_LIMIT_DEFAULT = 4;
 const SMARTPHONE_COMPETITOR_LIMIT_DEFAULT = 5;
 
-const resolveSmartphoneLaunchPolicy = (launchStage) => {
+const parseMarketPriceValue = (value) => {
+  if (value == null || value === "") return null;
+  const normalized = Number(String(value).replace(/[^0-9.]/g, ""));
+  return Number.isFinite(normalized) && normalized > 0 ? normalized : null;
+};
+
+const readArrayValue = (value) => {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+const hasStoreMarketSignal = (store) => {
+  if (!store || typeof store !== "object") return false;
+  return Boolean(
+    parseMarketPriceValue(
+      store.price ??
+        store.current_price ??
+        store.sale_price ??
+        store.offer_price ??
+        store.mrp,
+    ) ||
+      store.url ||
+      store.store ||
+      store.store_name ||
+      store.storeName ||
+      store.display_store_name ||
+      store.sale_start_date ||
+      store.saleStartDate ||
+      store.sale_date ||
+      store.saleDate ||
+      store.available_from ||
+      store.availableFrom,
+  );
+};
+
+const hasSpecScoreMarketSignal = (item) => {
+  if (!item || typeof item !== "object") return false;
+
+  if (
+    normalizeDateOnlyInput(
+      item.sale_start_date ??
+        item.saleStartDate ??
+        item.sale_date ??
+        item.saleDate ??
+        null,
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    parseMarketPriceValue(
+      item.price ??
+        item.current_price ??
+        item.launch_price ??
+        item.starting_price ??
+        item.price_in_india ??
+        item.expected_price,
+    )
+  ) {
+    return true;
+  }
+
+  const directStores = readArrayValue(item.store_prices ?? item.storePrices);
+  if (directStores.some(hasStoreMarketSignal)) return true;
+
+  const variants = readArrayValue(item.variants);
+  return variants.some((variant) => {
+    if (!variant || typeof variant !== "object") return false;
+    if (
+      normalizeDateOnlyInput(
+        variant.sale_start_date ??
+          variant.saleStartDate ??
+          variant.sale_date ??
+          variant.saleDate ??
+          null,
+      )
+    ) {
+      return true;
+    }
+    if (
+      parseMarketPriceValue(
+        variant.price ??
+          variant.current_price ??
+          variant.launch_price ??
+          variant.starting_price ??
+          variant.expected_price,
+      )
+    ) {
+      return true;
+    }
+    return readArrayValue(variant.store_prices ?? variant.storePrices).some(
+      hasStoreMarketSignal,
+    );
+  });
+};
+
+const resolveSmartphoneLaunchPolicy = (launchStage, item = null) => {
   const stage = normalizeLaunchStatusOverride(launchStage) || "released";
+  const hasMarketSignal = hasSpecScoreMarketSignal(item);
   const base = {
     allow_compare: true,
     allow_competitors: true,
@@ -390,14 +548,14 @@ const resolveSmartphoneLaunchPolicy = (launchStage) => {
       ...base,
       compare_limit: 2,
       competitor_limit: 2,
-      allow_spec_score: false,
+      allow_spec_score: hasMarketSignal,
     };
   }
 
   if (stage === "upcoming") {
     return {
       ...base,
-      allow_spec_score: false,
+      allow_spec_score: hasMarketSignal,
     };
   }
 
@@ -406,7 +564,7 @@ const resolveSmartphoneLaunchPolicy = (launchStage) => {
 
 const applySmartphoneLaunchPolicy = (item, launchStage) => {
   if (!item) return item;
-  const policy = resolveSmartphoneLaunchPolicy(launchStage);
+  const policy = resolveSmartphoneLaunchPolicy(launchStage, item);
   item.allow_compare = policy.allow_compare;
   item.allowCompare = policy.allow_compare;
   item.allow_competitors = policy.allow_competitors;
@@ -1689,6 +1847,498 @@ async function readDeviceFieldProfilesConfig() {
     profiles: normalizeDeviceFieldProfilesConfig(row.profiles),
     updated_at: row.updated_at || null,
   };
+}
+
+const normalizeComparePageSlugInput = (value) => {
+  const raw = String(value || "")
+    .replace(/^\/+compare\/+/i, "")
+    .replace(/^compare\/+/i, "")
+    .replace(/^\/+|\/+$/g, "")
+    .trim();
+  if (!raw) return "";
+  const base = raw.replace(/-comparison$/i, "");
+  const slugBase = toComparePageSlug(base);
+  return slugBase ? `${slugBase}-comparison` : "";
+};
+
+const normalizeComparePageLabel = (value, maxLength = 160) =>
+  normalizeComparePageText(value).slice(0, Math.max(0, maxLength));
+
+const normalizeComparePageStatus = (value) =>
+  String(value || "").trim().toLowerCase() === "draft"
+    ? "draft"
+    : "published";
+
+const getComparePageRoutePath = (slug = "") => `/compare/${String(slug || "").trim()}`;
+
+const normalizePublishedComparePageRow = (row) => {
+  const items = Array.isArray(row?.items)
+    ? row.items
+        .map((item) => ({
+          product_id: Number(item?.product_id) || null,
+          product_name: item?.product_name || item?.name || "",
+          product_type: item?.product_type || "smartphone",
+          brand_name: item?.brand_name || "",
+          position: Number(item?.position) || null,
+        }))
+        .filter((item) => Number.isInteger(item.product_id) && item.product_id > 0)
+        .sort((left, right) => Number(left.position || 0) - Number(right.position || 0))
+    : [];
+
+  return {
+    id: Number(row?.id) || null,
+    slug: row?.slug || "",
+    route_path: row?.slug ? getComparePageRoutePath(row.slug) : "/compare",
+    entity_type: row?.entity_type || "smartphone",
+    primary_product_id: Number(row?.primary_product_id) || null,
+    primary_product_name: row?.primary_product_name || "",
+    segment_label: row?.segment_label || "",
+    smartphone_type_label: row?.smartphone_type_label || "",
+    title: row?.title || "",
+    meta_description: row?.meta_description || "",
+    status: row?.status || "published",
+    published_at: row?.published_at || null,
+    created_at: row?.created_at || null,
+    updated_at: row?.updated_at || null,
+    items,
+  };
+};
+
+async function readPublishedComparePages({
+  id = null,
+  slug = "",
+  publishedOnly = false,
+  limit = 100,
+} = {}) {
+  const params = [];
+  const where = [`cp.entity_type = 'smartphone'`];
+
+  if (publishedOnly) {
+    where.push(`cp.status = 'published'`);
+  }
+
+  const normalizedId = Number(id);
+  if (Number.isInteger(normalizedId) && normalizedId > 0) {
+    params.push(normalizedId);
+    where.push(`cp.id = $${params.length}`);
+  }
+
+  const normalizedSlug = normalizeComparePageSlugInput(slug);
+  if (normalizedSlug) {
+    params.push(normalizedSlug);
+    where.push(`cp.slug = $${params.length}`);
+  }
+
+  params.push(Math.min(200, Math.max(1, Number(limit) || 100)));
+
+  const result = await db.query(
+    `
+    SELECT
+      cp.id,
+      cp.slug,
+      cp.entity_type,
+      cp.primary_product_id,
+      cp.segment_label,
+      cp.smartphone_type_label,
+      cp.title,
+      cp.meta_description,
+      cp.status,
+      cp.published_at,
+      cp.created_at,
+      cp.updated_at,
+      primary_product.name AS primary_product_name,
+      COALESCE(
+        json_agg(
+          jsonb_build_object(
+            'product_id', item_product.id,
+            'product_name', item_product.name,
+            'product_type', item_product.product_type,
+            'brand_name', item_brand.name,
+            'position', cpi.position
+          )
+          ORDER BY cpi.position
+        ) FILTER (WHERE cpi.id IS NOT NULL),
+        '[]'::json
+      ) AS items
+    FROM published_compare_pages cp
+    INNER JOIN products primary_product
+      ON primary_product.id = cp.primary_product_id
+    LEFT JOIN published_compare_page_items cpi
+      ON cpi.compare_page_id = cp.id
+    LEFT JOIN products item_product
+      ON item_product.id = cpi.product_id
+    LEFT JOIN brands item_brand
+      ON item_brand.id = item_product.brand_id
+    WHERE ${where.join(" AND ")}
+    GROUP BY cp.id, primary_product.name
+    ORDER BY cp.updated_at DESC, cp.id DESC
+    LIMIT $${params.length}
+    `,
+    params,
+  );
+
+  return (result.rows || []).map(normalizePublishedComparePageRow);
+}
+
+async function readSmartphoneComparePageProductSummaries(productIds = []) {
+  const ids = Array.from(
+    new Set(
+      (Array.isArray(productIds) ? productIds : [])
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  );
+
+  if (!ids.length) return [];
+
+  const result = await db.query(
+    `
+    SELECT
+      p.id AS product_id,
+      p.name,
+      p.product_type,
+      b.name AS brand_name,
+      COALESCE(
+        (
+          SELECT MIN(vsp.price)::numeric
+          FROM product_variants pv
+          INNER JOIN variant_store_prices vsp
+            ON vsp.variant_id = pv.id
+          WHERE pv.product_id = p.id
+            AND vsp.price IS NOT NULL
+        ),
+        (
+          SELECT MIN(pv.base_price)::numeric
+          FROM product_variants pv
+          WHERE pv.product_id = p.id
+            AND pv.base_price IS NOT NULL
+        )
+      ) AS best_price
+    FROM products p
+    INNER JOIN product_publish pub
+      ON pub.product_id = p.id
+     AND pub.is_published = true
+    LEFT JOIN brands b
+      ON b.id = p.brand_id
+    WHERE p.product_type = 'smartphone'
+      AND p.id = ANY($1::int[])
+    `,
+    [ids],
+  );
+
+  return (result.rows || []).map((row) => ({
+    product_id: Number(row?.product_id) || null,
+    name: row?.name || "",
+    product_type: row?.product_type || "smartphone",
+    brand_name: row?.brand_name || "",
+    best_price: toComparePageFiniteNumber(row?.best_price),
+  }));
+}
+
+async function readSmartphoneCompareSuggestions(productId, limit = 2) {
+  const normalizedId = Number(productId);
+  const normalizedLimit = Math.min(3, Math.max(1, Number(limit) || 2));
+  if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
+    return { primary_product: null, suggestions: [] };
+  }
+
+  const primaryRows = await readSmartphoneComparePageProductSummaries([normalizedId]);
+  const primaryProduct = primaryRows[0] || null;
+  if (!primaryProduct) {
+    return { primary_product: null, suggestions: [] };
+  }
+
+  const fetchSuggestions = async () => {
+    const result = await db.query(
+      `
+      SELECT
+        ca.competitor_id AS product_id,
+        p.name,
+        p.product_type,
+        b.name AS brand_name,
+        ca.competition_score,
+        ca.reason,
+        COALESCE(
+          (
+            SELECT MIN(vsp.price)::numeric
+            FROM product_variants pv
+            INNER JOIN variant_store_prices vsp
+              ON vsp.variant_id = pv.id
+            WHERE pv.product_id = p.id
+              AND vsp.price IS NOT NULL
+          ),
+          (
+            SELECT MIN(pv.base_price)::numeric
+            FROM product_variants pv
+            WHERE pv.product_id = p.id
+              AND pv.base_price IS NOT NULL
+          )
+        ) AS best_price
+      FROM competitor_analysis ca
+      INNER JOIN products p
+        ON p.id = ca.competitor_id
+       AND p.product_type = 'smartphone'
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      WHERE ca.product_id = $1
+      ORDER BY ca.competition_score DESC, ca.competitor_id ASC
+      LIMIT $2
+      `,
+      [normalizedId, normalizedLimit],
+    );
+
+    return (result.rows || []).map((row) => ({
+      product_id: Number(row?.product_id) || null,
+      name: row?.name || "",
+      product_type: row?.product_type || "smartphone",
+      brand_name: row?.brand_name || "",
+      best_price: toComparePageFiniteNumber(row?.best_price),
+      competition_score: toComparePageFiniteNumber(row?.competition_score),
+      reason: row?.reason || "",
+    }));
+  };
+
+  let suggestions = await fetchSuggestions();
+  if (suggestions.length === 0) {
+    try {
+      await recomputeSmartphoneCompetitorAnalysis(db, {
+        limit: normalizedLimit,
+        productIds: [normalizedId],
+      });
+    } catch (err) {
+      console.error("Compare page suggestion recompute failed:", err.message);
+    }
+    suggestions = await fetchSuggestions();
+  }
+
+  return {
+    primary_product: primaryProduct,
+    suggestions,
+  };
+}
+
+async function savePublishedComparePage({ pageId = null, payload = {}, userId = null }) {
+  const rawProductIds = Array.isArray(payload.product_ids)
+    ? payload.product_ids
+    : Array.isArray(payload.productIds)
+      ? payload.productIds
+      : Array.isArray(payload.items)
+        ? payload.items.map((item) => item?.product_id ?? item?.productId ?? item?.id)
+        : [];
+
+  const requestedProductIds = Array.from(
+    new Set(
+      rawProductIds
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  ).slice(0, 3);
+
+  if (requestedProductIds.length < 2) {
+    const error = new Error("Select at least 2 smartphones for a compare page.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const productRows = await readSmartphoneComparePageProductSummaries(requestedProductIds);
+  if (productRows.length !== requestedProductIds.length) {
+    const error = new Error("All compare page products must be published smartphones.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const productMap = new Map(productRows.map((row) => [row.product_id, row]));
+  const requestedPrimaryProductId = Number(
+    payload.primary_product_id ?? payload.primaryProductId ?? requestedProductIds[0],
+  );
+  const primaryProductId = productMap.has(requestedPrimaryProductId)
+    ? requestedPrimaryProductId
+    : requestedProductIds[0];
+
+  const orderedProductIds = [
+    primaryProductId,
+    ...requestedProductIds.filter((productId) => productId !== primaryProductId),
+  ].slice(0, 3);
+
+  const orderedProducts = orderedProductIds
+    .map((productId) => productMap.get(productId))
+    .filter(Boolean);
+
+  const priceCandidates = orderedProducts
+    .map((item) => item?.best_price)
+    .filter((value) => value != null);
+  const averagePrice =
+    priceCandidates.length > 0
+      ? priceCandidates.reduce((sum, value) => sum + value, 0) / priceCandidates.length
+      : null;
+
+  const segmentLabel =
+    normalizeComparePageLabel(payload.segment_label ?? payload.segmentLabel, 80) ||
+    resolveSmartphoneSegmentLabel(
+      productMap.get(primaryProductId)?.best_price ?? averagePrice,
+    );
+  const smartphoneTypeLabel = normalizeComparePageLabel(
+    payload.smartphone_type_label ?? payload.smartphoneTypeLabel,
+    80,
+  );
+  const names = orderedProducts.map((product) => product.name).filter(Boolean);
+
+  const slug =
+    normalizeComparePageSlugInput(payload.slug) || buildComparePageSlug(names);
+  if (!slug) {
+    const error = new Error("Unable to generate compare page slug.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const status = normalizeComparePageStatus(payload.status);
+  const title =
+    normalizeComparePageLabel(payload.title, 220) ||
+    buildComparePageTitle({
+      names,
+      segmentLabel,
+      smartphoneTypeLabel,
+    });
+  const metaDescription =
+    normalizeComparePageLabel(payload.meta_description ?? payload.metaDescription, 320) ||
+    buildComparePageDescription({
+      names,
+      segmentLabel,
+      smartphoneTypeLabel,
+      updatedAt: new Date(),
+    });
+
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+
+    let savedPageId = Number(pageId);
+    if (Number.isInteger(savedPageId) && savedPageId > 0) {
+      const result = await client.query(
+        `
+        UPDATE published_compare_pages
+        SET
+          slug = $1,
+          entity_type = 'smartphone',
+          primary_product_id = $2,
+          segment_label = $3,
+          smartphone_type_label = $4,
+          title = $5,
+          meta_description = $6,
+          status = $7,
+          updated_by = $8,
+          updated_at = now(),
+          published_at = CASE
+            WHEN $7 = 'published' AND published_at IS NULL THEN now()
+            WHEN $7 <> 'published' THEN NULL
+            ELSE published_at
+          END
+        WHERE id = $9
+        RETURNING id
+        `,
+        [
+          slug,
+          primaryProductId,
+          segmentLabel || null,
+          smartphoneTypeLabel || null,
+          title,
+          metaDescription,
+          status,
+          userId,
+          savedPageId,
+        ],
+      );
+
+      if (!result.rows.length) {
+        const error = new Error("Compare page not found.");
+        error.statusCode = 404;
+        throw error;
+      }
+    } else {
+      const result = await client.query(
+        `
+        INSERT INTO published_compare_pages (
+          slug,
+          entity_type,
+          primary_product_id,
+          segment_label,
+          smartphone_type_label,
+          title,
+          meta_description,
+          status,
+          created_by,
+          updated_by,
+          published_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1,
+          'smartphone',
+          $2,
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          $8,
+          $8,
+          CASE WHEN $7 = 'published' THEN now() ELSE NULL END,
+          now(),
+          now()
+        )
+        RETURNING id
+        `,
+        [
+          slug,
+          primaryProductId,
+          segmentLabel || null,
+          smartphoneTypeLabel || null,
+          title,
+          metaDescription,
+          status,
+          userId,
+        ],
+      );
+      savedPageId = Number(result.rows[0]?.id) || null;
+    }
+
+    await client.query(
+      `DELETE FROM published_compare_page_items WHERE compare_page_id = $1`,
+      [savedPageId],
+    );
+
+    for (let index = 0; index < orderedProductIds.length; index += 1) {
+      await client.query(
+        `
+        INSERT INTO published_compare_page_items (
+          compare_page_id,
+          product_id,
+          position,
+          created_at
+        )
+        VALUES ($1, $2, $3, now())
+        `,
+        [savedPageId, orderedProductIds[index], index + 1],
+      );
+    }
+
+    await client.query("COMMIT");
+    const pages = await readPublishedComparePages({ id: savedPageId, limit: 1 });
+    return pages[0] || null;
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_rollbackErr) {
+      // ignore rollback errors
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 const parseJsonLikeValue = (value) => {
@@ -3990,6 +4640,54 @@ async function runMigrations() {
     await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_competitor_analysis_product_score
       ON competitor_analysis (product_id, competition_score DESC);
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS published_compare_pages (
+        id SERIAL PRIMARY KEY,
+        slug TEXT NOT NULL UNIQUE,
+        entity_type TEXT NOT NULL DEFAULT 'smartphone',
+        primary_product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        segment_label TEXT,
+        smartphone_type_label TEXT,
+        title TEXT NOT NULL,
+        meta_description TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'published',
+        created_by INT REFERENCES "user"(id),
+        updated_by INT REFERENCES "user"(id),
+        published_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT now(),
+        updated_at TIMESTAMP DEFAULT now(),
+        CHECK (status IN ('draft', 'published'))
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS published_compare_page_items (
+        id SERIAL PRIMARY KEY,
+        compare_page_id INT NOT NULL REFERENCES published_compare_pages(id) ON DELETE CASCADE,
+        product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        position INT NOT NULL,
+        created_at TIMESTAMP DEFAULT now(),
+        UNIQUE (compare_page_id, product_id),
+        UNIQUE (compare_page_id, position),
+        CHECK (position BETWEEN 1 AND 3)
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_published_compare_pages_status_updated
+      ON published_compare_pages (status, updated_at DESC);
+    `);
+
+    await safeQuery(`
+      ALTER TABLE published_compare_pages
+      ALTER COLUMN status SET DEFAULT 'published';
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_published_compare_page_items_page_position
+      ON published_compare_page_items (compare_page_id, position ASC);
     `);
 
     // Hook Dynamic Score (precomputed ranking signals)
@@ -14876,6 +15574,139 @@ app.put("/api/admin/compare-scoring", authenticate, async (req, res) => {
   }
 });
 
+app.get("/api/admin/compare-pages", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const pages = await readPublishedComparePages({
+      limit: Math.min(100, Math.max(1, Number(req.query?.limit) || 100)),
+    });
+    return res.json({ pages });
+  } catch (err) {
+    console.error("GET /api/admin/compare-pages error:", err);
+    return res.status(500).json({ message: "Failed to load compare pages" });
+  }
+});
+
+app.get(
+  "/api/admin/compare-pages/suggestions/:productId",
+  authenticate,
+  async (req, res) => {
+    try {
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
+      const result = await readSmartphoneCompareSuggestions(
+        req.params.productId,
+        2,
+      );
+      return res.json(result);
+    } catch (err) {
+      console.error(
+        "GET /api/admin/compare-pages/suggestions/:productId error:",
+        err,
+      );
+      return res.status(500).json({ message: "Failed to load suggestions" });
+    }
+  },
+);
+
+app.get("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const pageId = Number(req.params.id);
+    if (!Number.isInteger(pageId) || pageId <= 0) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const pages = await readPublishedComparePages({ id: pageId, limit: 1 });
+    if (!pages.length) {
+      return res.status(404).json({ message: "Compare page not found" });
+    }
+
+    return res.json({ page: pages[0] });
+  } catch (err) {
+    console.error("GET /api/admin/compare-pages/:id error:", err);
+    return res.status(500).json({ message: "Failed to load compare page" });
+  }
+});
+
+app.post("/api/admin/compare-pages", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const page = await savePublishedComparePage({
+      payload: req.body || {},
+      userId: req.user?.id ?? null,
+    });
+    return res.status(201).json({ success: true, page });
+  } catch (err) {
+    console.error("POST /api/admin/compare-pages error:", err);
+    return res
+      .status(err.statusCode || 500)
+      .json({ message: err.message || "Failed to create compare page" });
+  }
+});
+
+app.put("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const pageId = Number(req.params.id);
+    if (!Number.isInteger(pageId) || pageId <= 0) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const page = await savePublishedComparePage({
+      pageId,
+      payload: req.body || {},
+      userId: req.user?.id ?? null,
+    });
+    return res.json({ success: true, page });
+  } catch (err) {
+    console.error("PUT /api/admin/compare-pages/:id error:", err);
+    return res
+      .status(err.statusCode || 500)
+      .json({ message: err.message || "Failed to update compare page" });
+  }
+});
+
+app.delete("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const pageId = Number(req.params.id);
+    if (!Number.isInteger(pageId) || pageId <= 0) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const result = await db.query(
+      `DELETE FROM published_compare_pages WHERE id = $1 RETURNING id`,
+      [pageId],
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Compare page not found" });
+    }
+
+    return res.json({ success: true, id: pageId });
+  } catch (err) {
+    console.error("DELETE /api/admin/compare-pages/:id error:", err);
+    return res.status(500).json({ message: "Failed to delete compare page" });
+  }
+});
+
 // Popular feature clicks (public) - aggregated per day
 app.post("/api/public/feature-click", async (req, res) => {
   try {
@@ -16391,6 +17222,56 @@ app.get("/api/public/trending/all", async (req, res) => {
   }
 });
 
+app.get("/api/public/compare-pages/routes", async (_req, res) => {
+  try {
+    const pages = await readPublishedComparePages({
+      publishedOnly: true,
+      limit: 400,
+    });
+
+    return res.json({
+      routes: pages.map((page) => ({
+        slug: page.slug,
+        route_path: page.route_path,
+        title: page.title,
+        meta_description: page.meta_description,
+        updated_at: page.updated_at,
+      })),
+    });
+  } catch (err) {
+    console.error("GET /api/public/compare-pages/routes error:", err);
+    return res.status(500).json({ message: "Failed to load compare page routes" });
+  }
+});
+
+app.get("/api/public/compare-pages/resolve", async (req, res) => {
+  try {
+    const slug = normalizeComparePageSlugInput(req.query?.slug);
+    if (!slug) {
+      return res.status(400).json({ message: "slug is required" });
+    }
+
+    const pages = await readPublishedComparePages({
+      slug,
+      publishedOnly: true,
+      limit: 1,
+    });
+    const page = pages[0] || null;
+    if (!page) {
+      return res.status(404).json({ message: "Compare page not found" });
+    }
+
+    return res.json({
+      matched: true,
+      page,
+      compare_path: page.route_path,
+    });
+  } catch (err) {
+    console.error("GET /api/public/compare-pages/resolve error:", err);
+    return res.status(500).json({ message: "Failed to resolve compare page" });
+  }
+});
+
 app.get("/api/public/compare/resolve", async (req, res) => {
   try {
     const normalizeCompareSlug = (value) =>
@@ -16469,7 +17350,11 @@ app.get("/api/public/compare/resolve", async (req, res) => {
       matched,
       left,
       right,
-      compare_path: matched ? `/compare/${left.slug}-vs-${right.slug}` : null,
+      compare_path: matched
+        ? getComparePageRoutePath(
+            buildComparePageSlug([left.product_name, right.product_name]),
+          )
+        : null,
     });
   } catch (err) {
     console.error("GET /api/public/compare/resolve error:", err);
