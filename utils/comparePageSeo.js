@@ -31,6 +31,15 @@ const joinNamesWithoutCommas = (names = []) => {
   return clean.join(" and ");
 };
 
+const joinNamesWithVs = (names = []) => {
+  const clean = (Array.isArray(names) ? names : [])
+    .map((name) => normalizeText(name))
+    .filter(Boolean);
+  if (clean.length === 0) return "";
+  if (clean.length === 1) return clean[0];
+  return clean.join(" vs ");
+};
+
 const resolveSmartphoneSegmentLabel = (price) => {
   const amount = toFiniteNumber(price);
   if (amount == null) return "";
@@ -113,15 +122,145 @@ const buildComparePageDescription = ({
   )}`;
 };
 
+const resolveAutomaticPriceBandLabel = (price) => {
+  const amount = toFiniteNumber(price);
+  if (amount == null) return "";
+  if (amount <= 20000) return "Under \u20b920,000";
+  if (amount <= 30000) return "Under \u20b930,000";
+  if (amount <= 50000) return "Under \u20b950,000";
+  if (amount <= 70000) return "Under \u20b970,000";
+  if (amount <= 100000) return "Under \u20b91,00,000";
+  return "";
+};
+
+const buildAutomaticComparePageTitle = ({
+  names = [],
+  segmentLabel = "",
+  smartphoneTypeLabel = "",
+  price = null,
+} = {}) => {
+  const titleNames = joinNamesWithVs(names);
+  if (!titleNames) {
+    return "Smartphone Comparison Price Specifications and Features in India";
+  }
+
+  const count = (Array.isArray(names) ? names : []).filter(Boolean).length;
+  const segment = normalizeText(segmentLabel);
+  const type = normalizeText(smartphoneTypeLabel);
+  const typeKey = type.toLowerCase();
+  const priceBand = resolveAutomaticPriceBandLabel(price);
+  const isFlagshipSegment = ["Premium", "Flagship", "Ultra Flagship"].includes(segment);
+
+  if (count >= 3) {
+    if (isFlagshipSegment) return `${titleNames} - Full Flagship Comparison`;
+    if (typeKey === "gaming") return `${titleNames} - Gaming Comparison`;
+    if (typeKey === "camera flagship" || typeKey === "camera") {
+      return `${titleNames} - Camera Comparison`;
+    }
+    if (priceBand) return `Best Phones ${priceBand} - ${titleNames}`;
+    return `${titleNames} - Which Phone is Better`;
+  }
+
+  if (typeKey === "gaming") {
+    return priceBand
+      ? `${titleNames} - Best Gaming Phone ${priceBand}?`
+      : `${titleNames} - Gaming Comparison`;
+  }
+
+  if (typeKey === "camera flagship" || typeKey === "camera") {
+    return `${titleNames} - Best Camera Phone Comparison`;
+  }
+
+  if (typeKey === "battery focused") {
+    return `${titleNames} - Best Battery Phone`;
+  }
+
+  if (typeKey === "fast charging") {
+    return `${titleNames} - Battery and Charging Comparison`;
+  }
+
+  if (typeKey === "value 5g") {
+    return priceBand
+      ? `${titleNames} - Best 5G Phone ${priceBand}?`
+      : `${titleNames} - 5G Phone Comparison`;
+  }
+
+  if (typeKey === "selfie") return `${titleNames} - Selfie Camera Comparison`;
+  if (typeKey === "compact") return `${titleNames} - Compact Phone Comparison`;
+  if (typeKey === "clean android") return `${titleNames} - Clean Android Comparison`;
+  if (typeKey === "slim design") return `${titleNames} - Design Comparison`;
+  if (typeKey === "ai") return `${titleNames} - AI Features Comparison`;
+  if (typeKey === "rugged") return `${titleNames} - Rugged Phone Comparison`;
+  if (typeKey === "flip foldable" || typeKey === "book foldable") {
+    return `${titleNames} - Full Foldable Comparison`;
+  }
+  if (typeKey === "new launch") {
+    return `${titleNames} - Latest Price and Specs Comparison`;
+  }
+
+  if (isFlagshipSegment) return `${titleNames} - Ultimate Flagship Comparison`;
+  if (priceBand) return `Best Phone ${priceBand} - ${titleNames}`;
+
+  return `${titleNames} - Which Phone is Better`;
+};
+
+const buildAutomaticComparePageDescription = ({
+  names = [],
+  segmentLabel = "",
+  smartphoneTypeLabel = "",
+  price = null,
+  updatedAt = null,
+} = {}) => {
+  const joinedNames = joinNamesWithoutCommas(names);
+  if (!joinedNames) {
+    return "Compare smartphones with latest price specifications camera battery processor performance and features in India.";
+  }
+
+  const segment = normalizeText(segmentLabel);
+  const type = normalizeText(smartphoneTypeLabel).toLowerCase();
+  const priceBand = resolveAutomaticPriceBandLabel(price);
+  const updatedLabel = formatUpdatedDate(updatedAt);
+
+  if (type === "gaming") {
+    return `Compare ${joinedNames} for gaming performance processor battery display and latest price in India Updated ${updatedLabel}`;
+  }
+
+  if (type === "camera flagship" || type === "camera" || type === "selfie") {
+    return `Compare ${joinedNames} for camera quality battery performance and latest price in India Updated ${updatedLabel}`;
+  }
+
+  if (type === "battery focused" || type === "fast charging") {
+    return `Compare ${joinedNames} for battery backup charging speed performance and latest price in India Updated ${updatedLabel}`;
+  }
+
+  if (type === "value 5g") {
+    return `Compare ${joinedNames} for 5G connectivity battery performance and latest price in India Updated ${updatedLabel}`;
+  }
+
+  if (segment) {
+    return `Compare ${joinedNames} in the ${segment} segment with latest price specifications camera battery performance processor and features in India Updated ${updatedLabel}`;
+  }
+
+  if (priceBand) {
+    return `Compare ${joinedNames} for the best smartphone value ${priceBand} with latest price specifications battery camera and performance in India Updated ${updatedLabel}`;
+  }
+
+  return `Compare ${joinedNames} with latest price specifications camera battery processor performance and features in India Updated ${updatedLabel}`;
+};
+
 module.exports = {
   clamp,
   normalizeText,
   toFiniteNumber,
   toSlug,
   joinNamesWithoutCommas,
+  joinNamesWithVs,
   resolveSmartphoneSegmentLabel,
   buildComparePageSlug,
   buildComparePageTitle,
   buildComparePageDescription,
+  resolveAutomaticPriceBandLabel,
+  buildAutomaticComparePageTitle,
+  buildAutomaticComparePageDescription,
   formatUpdatedDate,
 };

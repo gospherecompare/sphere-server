@@ -49,6 +49,8 @@ const {
   buildComparePageSlug,
   buildComparePageTitle,
   buildComparePageDescription,
+  buildAutomaticComparePageTitle,
+  buildAutomaticComparePageDescription,
 } = require("./utils/comparePageSeo");
 const {
   cleanText,
@@ -2849,15 +2851,19 @@ async function syncAutomaticSmartphoneComparePages({
       primaryProductId: primaryId,
       segmentLabel,
       smartphoneTypeLabel,
-      title: buildComparePageTitle({
+      title: buildAutomaticComparePageTitle({
         names,
         segmentLabel,
         smartphoneTypeLabel,
+        price:
+          toComparePageFiniteNumber(primaryProduct.best_price) ?? averagePrice,
       }),
-      metaDescription: buildComparePageDescription({
+      metaDescription: buildAutomaticComparePageDescription({
         names,
         segmentLabel,
         smartphoneTypeLabel,
+        price:
+          toComparePageFiniteNumber(primaryProduct.best_price) ?? averagePrice,
         updatedAt: new Date(),
       }),
       source: AUTOMATIC_COMPARE_PAGE_SOURCE,
@@ -16727,27 +16733,147 @@ app.delete("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
   }
 });
 
+const FEATURE_CLICK_DEVICE_TYPE_LABELS = {
+  smartphone: "Smartphone",
+  laptop: "Laptop",
+  tv: "TV",
+  "home-appliance": "Home Appliance",
+  networking: "Networking",
+};
+
+const FEATURE_CLICK_DEVICE_TYPE_ALIASES = {
+  mobile: "smartphone",
+  mobiles: "smartphone",
+  phone: "smartphone",
+  phones: "smartphone",
+  notebook: "laptop",
+  notebooks: "laptop",
+  television: "tv",
+  televisions: "tv",
+  appliance: "home-appliance",
+  appliances: "home-appliance",
+  "home-appliances": "home-appliance",
+};
+
+const FEATURE_CLICK_META = {
+  "ai-features": { label: "AI Features", category: "Smart Features" },
+  "high-camera": { label: "High MP Camera", category: "Camera" },
+  "long-battery": { label: "Long Battery", category: "Battery" },
+  "fast-charging": { label: "Fast Charging", category: "Battery" },
+  "wireless-charging": { label: "Wireless Charging", category: "Battery" },
+  amoled: { label: "AMOLED Display", category: "Display" },
+  "high-refresh-rate": { label: "120Hz+ Refresh Rate", category: "Display" },
+  "5g": { label: "5G Connectivity", category: "Connectivity" },
+  "wifi-7": { label: "Wi-Fi 7", category: "Connectivity" },
+  "ip-rating": { label: "IP Rating", category: "Security" },
+  "high-ram": { label: "High RAM", category: "Performance" },
+  gaming: { label: "Gaming Ready", category: "Performance" },
+  esim: { label: "eSIM", category: "Connectivity" },
+  nfc: { label: "NFC", category: "Connectivity" },
+  ois: { label: "OIS Camera", category: "Camera" },
+  periscope: { label: "Periscope Lens", category: "Camera" },
+  "ufs-4": { label: "UFS 4.x Storage", category: "Performance" },
+  lpddr5x: { label: "LPDDR5X Memory", category: "Performance" },
+  fingerprint: { label: "Fingerprint Security", category: "Security" },
+  "high-storage": { label: "High Storage", category: "Performance" },
+  lightweight: { label: "Lightweight Design", category: "Design" },
+  "oled-display": { label: "OLED Display", category: "Display" },
+  touchscreen: { label: "Touchscreen", category: "Display" },
+  intel: { label: "Intel Powered", category: "Performance" },
+  amd: { label: "AMD Powered", category: "Performance" },
+  "large-screen": { label: "Large Screen", category: "Display" },
+  "ultra-hd-4k": { label: "4K Ultra HD", category: "Display" },
+  "oled-qled": { label: "OLED / QLED", category: "Display" },
+  "smart-tv": { label: "Smart TV", category: "Smart Features" },
+  hdr: { label: "HDR", category: "Display" },
+  "dolby-audio": { label: "Dolby Audio", category: "Audio" },
+  wifi: { label: "Wi-Fi", category: "Connectivity" },
+  "voice-assistant": { label: "Voice Assistant", category: "Smart Features" },
+};
+
+const normalizeFeatureClickToken = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+const normalizeFeatureClickDeviceType = (value, allowAll = false) => {
+  const normalized = normalizeFeatureClickToken(value);
+  if (allowAll && (!normalized || normalized === "all")) {
+    return "all";
+  }
+  return FEATURE_CLICK_DEVICE_TYPE_ALIASES[normalized] || normalized;
+};
+
+const isSafeFeatureClickId = (value) =>
+  /^[a-z0-9][a-z0-9-]{0,63}$/.test(String(value || ""));
+
+const toFeatureClickLabel = (value) =>
+  String(value || "")
+    .split("-")
+    .filter(Boolean)
+    .map((token) => token.charAt(0).toUpperCase() + token.slice(1))
+    .join(" ");
+
+const getFeatureClickMeta = (featureId) => {
+  const normalized = normalizeFeatureClickToken(featureId);
+  const matched = FEATURE_CLICK_META[normalized] || null;
+  return {
+    feature_id: normalized,
+    feature_label: matched?.label || toFeatureClickLabel(normalized) || "Feature",
+    category: matched?.category || "Other",
+  };
+};
+
+const getFeatureClickDeviceLabel = (deviceType) => {
+  const normalized = normalizeFeatureClickDeviceType(deviceType);
+  return (
+    FEATURE_CLICK_DEVICE_TYPE_LABELS[normalized] ||
+    toFeatureClickLabel(normalized) ||
+    "Unknown"
+  );
+};
+
+const roundFeatureMetric = (value, digits = 1) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Number(parsed.toFixed(digits));
+};
+
+const computeFeatureChangePercent = (currentValue, previousValue) => {
+  const current = Number(currentValue) || 0;
+  const previous = Number(previousValue) || 0;
+  if (current === 0 && previous === 0) return 0;
+  if (previous <= 0) return current > 0 ? 100 : 0;
+  return roundFeatureMetric(((current - previous) / previous) * 100, 1);
+};
+
+const shiftFeatureDateOnly = (value, offsetDays) => {
+  const base = new Date(`${String(value || "").slice(0, 10)}T00:00:00Z`);
+  if (Number.isNaN(base.getTime())) return null;
+  base.setUTCDate(base.getUTCDate() + Number(offsetDays || 0));
+  return base.toISOString().slice(0, 10);
+};
+
 // Popular feature clicks (public) - aggregated per day
 app.post("/api/public/feature-click", async (req, res) => {
   try {
     const b = req.body || {};
-    const normalize = (v) =>
-      String(v || "")
-        .trim()
-        .toLowerCase()
-        .replace(/\s+/g, "-");
-
-    const deviceType = normalize(b.device_type ?? b.deviceType ?? "");
-    const featureId = normalize(b.feature_id ?? b.featureId ?? b.id ?? "");
-
-    const isSafeId = (s) => /^[a-z0-9][a-z0-9-]{0,63}$/.test(String(s));
+    const deviceType = normalizeFeatureClickDeviceType(
+      b.device_type ?? b.deviceType ?? "",
+    );
+    const featureId = normalizeFeatureClickToken(
+      b.feature_id ?? b.featureId ?? b.id ?? "",
+    );
 
     if (!deviceType || !featureId) {
       return res
         .status(400)
         .json({ message: "device_type and feature_id are required" });
     }
-    if (!isSafeId(deviceType) || !isSafeId(featureId)) {
+    if (!isSafeFeatureClickId(deviceType) || !isSafeFeatureClickId(featureId)) {
       return res
         .status(400)
         .json({ message: "Invalid device_type/feature_id" });
@@ -16854,15 +16980,10 @@ app.post("/api/public/search-interest", async (req, res) => {
 app.get("/api/public/popular-features", async (req, res) => {
   try {
     const q = req.query || {};
-    const normalize = (v) =>
-      String(v || "")
-        .trim()
-        .toLowerCase()
-        .replace(/\s+/g, "-");
-
-    const deviceType = normalize(q.deviceType ?? q.device_type ?? "smartphone");
-    const isSafeId = (s) => /^[a-z0-9][a-z0-9-]{0,63}$/.test(String(s));
-    if (!isSafeId(deviceType)) {
+    const deviceType = normalizeFeatureClickDeviceType(
+      q.deviceType ?? q.device_type ?? "smartphone",
+    );
+    if (!isSafeFeatureClickId(deviceType)) {
       return res.status(400).json({ message: "Invalid deviceType" });
     }
 
@@ -16899,6 +17020,313 @@ app.get("/api/public/popular-features", async (req, res) => {
   } catch (err) {
     console.error("GET /api/public/popular-features error:", err);
     return res.status(500).json({ message: "Failed to load popular features" });
+  }
+});
+
+app.get("/api/reports/feature-clicks", authenticate, async (req, res) => {
+  try {
+    const q = req.query || {};
+    const deviceType = normalizeFeatureClickDeviceType(
+      q.deviceType ?? q.device_type ?? "all",
+      true,
+    );
+    const daysRaw = Number(q.days ?? 7);
+    const days = Number.isFinite(daysRaw)
+      ? Math.min(90, Math.max(1, Math.floor(daysRaw)))
+      : 7;
+
+    if (deviceType !== "all" && !isSafeFeatureClickId(deviceType)) {
+      return res.status(400).json({ message: "Invalid deviceType" });
+    }
+
+    const currentRangeSql =
+      deviceType === "all"
+        ? "day >= (CURRENT_DATE - (($1::int) - 1))"
+        : "device_type = $1 AND day >= (CURRENT_DATE - (($2::int) - 1))";
+    const previousRangeSql =
+      deviceType === "all"
+        ? "day >= (CURRENT_DATE - ((($1::int) * 2) - 1)) AND day < (CURRENT_DATE - (($1::int) - 1))"
+        : "device_type = $1 AND day >= (CURRENT_DATE - ((($2::int) * 2) - 1)) AND day < (CURRENT_DATE - (($2::int) - 1))";
+    const scopedParams = deviceType === "all" ? [days] : [deviceType, days];
+
+    const [
+      todayRes,
+      dailyRes,
+      previousDailyRes,
+      featureRes,
+      previousFeatureRes,
+      deviceRes,
+    ] =
+      await Promise.all([
+        db.query(`SELECT CURRENT_DATE::text AS current_date`),
+        db.query(
+          `
+          SELECT day::text AS day, SUM(clicks)::int AS clicks
+          FROM feature_click_stats
+          WHERE ${currentRangeSql}
+          GROUP BY day
+          ORDER BY day ASC
+          `,
+          scopedParams,
+        ),
+        db.query(
+          `
+          SELECT day::text AS day, SUM(clicks)::int AS clicks
+          FROM feature_click_stats
+          WHERE ${previousRangeSql}
+          GROUP BY day
+          ORDER BY day ASC
+          `,
+          scopedParams,
+        ),
+        db.query(
+          `
+          SELECT
+            feature_id,
+            ARRAY_AGG(DISTINCT device_type ORDER BY device_type) AS device_types,
+            SUM(clicks)::int AS clicks,
+            MAX(last_clicked_at) AS last_clicked_at
+          FROM feature_click_stats
+          WHERE ${currentRangeSql}
+          GROUP BY feature_id
+          ORDER BY clicks DESC, last_clicked_at DESC
+          `,
+          scopedParams,
+        ),
+        db.query(
+          `
+          SELECT
+            feature_id,
+            SUM(clicks)::int AS clicks
+          FROM feature_click_stats
+          WHERE ${previousRangeSql}
+          GROUP BY feature_id
+          `,
+          scopedParams,
+        ),
+        db.query(
+          `
+          SELECT device_type, SUM(clicks)::int AS clicks
+          FROM feature_click_stats
+          WHERE ${currentRangeSql}
+          GROUP BY device_type
+          ORDER BY clicks DESC, device_type ASC
+          `,
+          scopedParams,
+        ),
+      ]);
+
+    const currentDate =
+      todayRes.rows?.[0]?.current_date ||
+      new Date().toISOString().slice(0, 10);
+    const rangeEnd = currentDate;
+    const rangeStart = shiftFeatureDateOnly(currentDate, -(days - 1)) || currentDate;
+    const previousRangeEnd = shiftFeatureDateOnly(rangeStart, -1) || rangeStart;
+    const previousRangeStart =
+      shiftFeatureDateOnly(previousRangeEnd, -(days - 1)) || previousRangeEnd;
+
+    const dailyMap = new Map(
+      (dailyRes.rows || []).map((row) => [
+        String(row.day || "").slice(0, 10),
+        Number(row.clicks) || 0,
+      ]),
+    );
+    const previousDailyMap = new Map(
+      (previousDailyRes.rows || []).map((row) => [
+        String(row.day || "").slice(0, 10),
+        Number(row.clicks) || 0,
+      ]),
+    );
+
+    const series = [];
+    for (let index = 0; index < days; index += 1) {
+      const dateValue = shiftFeatureDateOnly(rangeStart, index) || rangeStart;
+      series.push({
+        date: dateValue,
+        clicks: dailyMap.get(dateValue) || 0,
+      });
+    }
+
+    const activeDays = series.filter((item) => Number(item.clicks) > 0).length;
+    const previousSeries = [];
+    for (let index = 0; index < days; index += 1) {
+      const dateValue =
+        shiftFeatureDateOnly(previousRangeStart, index) || previousRangeStart;
+      previousSeries.push({
+        date: dateValue,
+        clicks: previousDailyMap.get(dateValue) || 0,
+      });
+    }
+    const previousActiveDays = previousSeries.filter(
+      (item) => Number(item.clicks) > 0,
+    ).length;
+    const previousFeatureMap = new Map(
+      (previousFeatureRes.rows || []).map((row) => [
+        normalizeFeatureClickToken(row.feature_id),
+        Number(row.clicks) || 0,
+      ]),
+    );
+
+    const currentFeatureRows = (featureRes.rows || []).map((row) => {
+      const featureId = normalizeFeatureClickToken(row.feature_id);
+      const meta = getFeatureClickMeta(featureId);
+      const clicks = Number(row.clicks) || 0;
+      const previousClicks = previousFeatureMap.get(featureId) || 0;
+      const normalizedDevices = Array.isArray(row.device_types)
+        ? row.device_types
+            .map((item) => normalizeFeatureClickDeviceType(item))
+            .filter(Boolean)
+        : [];
+
+      return {
+        feature_id: featureId,
+        feature_label: meta.feature_label,
+        category: meta.category,
+        clicks,
+        change_pct: computeFeatureChangePercent(clicks, previousClicks),
+        last_clicked_at: row.last_clicked_at || null,
+        device_types: normalizedDevices,
+        device_labels: normalizedDevices.map(getFeatureClickDeviceLabel),
+      };
+    });
+
+    const totalClicks = currentFeatureRows.reduce(
+      (sum, row) => sum + Number(row.clicks || 0),
+      0,
+    );
+    const previousTotalClicks = Array.from(previousFeatureMap.values()).reduce(
+      (sum, value) => sum + Number(value || 0),
+      0,
+    );
+
+    const categoryMap = new Map();
+    const previousCategoryMap = new Map();
+
+    for (const row of currentFeatureRows) {
+      const existing = categoryMap.get(row.category) || 0;
+      categoryMap.set(row.category, existing + Number(row.clicks || 0));
+    }
+
+    for (const [featureId, clicks] of previousFeatureMap.entries()) {
+      const meta = getFeatureClickMeta(featureId);
+      const existing = previousCategoryMap.get(meta.category) || 0;
+      previousCategoryMap.set(meta.category, existing + Number(clicks || 0));
+    }
+
+    const categoryBreakdown = Array.from(categoryMap.entries())
+      .map(([label, clicks]) => {
+        const previousClicks = previousCategoryMap.get(label) || 0;
+        const percent = totalClicks > 0 ? (Number(clicks) / totalClicks) * 100 : 0;
+        return {
+          label,
+          clicks: Number(clicks) || 0,
+          percent: roundFeatureMetric(percent, 1),
+          change_pct: computeFeatureChangePercent(clicks, previousClicks),
+        };
+      })
+      .sort((left, right) => right.clicks - left.clicks);
+
+    const previousCategoryBreakdown = Array.from(previousCategoryMap.entries())
+      .map(([label, clicks]) => {
+        const percent =
+          previousTotalClicks > 0
+            ? (Number(clicks) / previousTotalClicks) * 100
+            : 0;
+        return {
+          label,
+          clicks: Number(clicks) || 0,
+          percent: roundFeatureMetric(percent, 1),
+        };
+      })
+      .sort((left, right) => right.clicks - left.clicks);
+
+    const topCategory = categoryBreakdown[0] || null;
+    const previousTopCategory = previousCategoryBreakdown[0] || null;
+    const uniqueFeatures = currentFeatureRows.length;
+    const previousUniqueFeatures = previousFeatureMap.size;
+    const avgDailyClicks = days > 0 ? totalClicks / days : 0;
+    const previousAvgDailyClicks = days > 0 ? previousTotalClicks / days : 0;
+    const avgClicksPerFeature =
+      uniqueFeatures > 0 ? totalClicks / uniqueFeatures : 0;
+    const previousAvgClicksPerFeature =
+      previousUniqueFeatures > 0
+        ? previousTotalClicks / previousUniqueFeatures
+        : 0;
+
+    const deviceBreakdown = (deviceRes.rows || []).map((row) => {
+      const clicks = Number(row.clicks) || 0;
+      return {
+        key: normalizeFeatureClickDeviceType(row.device_type),
+        label: getFeatureClickDeviceLabel(row.device_type),
+        clicks,
+        percent:
+          totalClicks > 0 ? roundFeatureMetric((clicks / totalClicks) * 100, 1) : 0,
+      };
+    });
+
+    const topFeatures = currentFeatureRows.slice(0, 8).map((row, index) => ({
+      ...row,
+      rank: index + 1,
+      share_pct:
+        totalClicks > 0
+          ? roundFeatureMetric((Number(row.clicks || 0) / totalClicks) * 100, 1)
+          : 0,
+    }));
+
+    return res.json({
+      success: true,
+      generated_at: new Date().toISOString(),
+      filters: {
+        days,
+        device_type: deviceType,
+        range_start: rangeStart,
+        range_end: rangeEnd,
+        previous_range_start: previousRangeStart,
+        previous_range_end: previousRangeEnd,
+      },
+      summary: {
+        total_clicks: totalClicks,
+        total_clicks_change_pct: computeFeatureChangePercent(
+          totalClicks,
+          previousTotalClicks,
+        ),
+        avg_daily_clicks: roundFeatureMetric(avgDailyClicks, 1),
+        avg_daily_clicks_change_pct: computeFeatureChangePercent(
+          avgDailyClicks,
+          previousAvgDailyClicks,
+        ),
+        avg_clicks_per_feature: roundFeatureMetric(avgClicksPerFeature, 1),
+        avg_clicks_per_feature_change_pct: computeFeatureChangePercent(
+          avgClicksPerFeature,
+          previousAvgClicksPerFeature,
+        ),
+        features_clicked: uniqueFeatures,
+        features_clicked_change_pct: computeFeatureChangePercent(
+          uniqueFeatures,
+          previousUniqueFeatures,
+        ),
+        top_category_label: topCategory?.label || "None",
+        top_category_share_pct: roundFeatureMetric(topCategory?.percent || 0, 1),
+        top_category_share_change_pct: computeFeatureChangePercent(
+          topCategory?.percent || 0,
+          previousTopCategory?.percent || 0,
+        ),
+        active_days: activeDays,
+        active_days_change_pct: computeFeatureChangePercent(
+          activeDays,
+          previousActiveDays,
+        ),
+      },
+      series,
+      top_features: topFeatures,
+      device_breakdown: deviceBreakdown,
+      category_breakdown: categoryBreakdown,
+    });
+  } catch (err) {
+    console.error("GET /api/reports/feature-clicks error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to load feature clicks report" });
   }
 });
 
