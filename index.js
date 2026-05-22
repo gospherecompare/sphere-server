@@ -4560,7 +4560,6 @@ const fetchBlogProductSnapshot = async (
       detailRow?.image,
       detailRow?.images,
       images,
-      baseRow?.brand_logo,
     )[0] || null;
 
   const source = stripScoreRecursively({
@@ -4761,6 +4760,360 @@ const buildBlogSuggestions = (snapshot, tokenMap) => {
   }));
 };
 
+const normalizeBlogProductIds = (...sources) => {
+  const seen = new Set();
+  const ids = [];
+
+  const pushValue = (value) => {
+    const normalized = Number(
+      value && typeof value === "object"
+        ? value.product_id ?? value.productId ?? value.id
+        : value,
+    );
+    if (!Number.isInteger(normalized) || normalized <= 0 || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    ids.push(normalized);
+  };
+
+  sources.forEach((source) => {
+    if (Array.isArray(source)) {
+      source.forEach(pushValue);
+      return;
+    }
+
+    if (source && typeof source === "object" && Array.isArray(source.product_ids)) {
+      source.product_ids.forEach(pushValue);
+      return;
+    }
+
+    pushValue(source);
+  });
+
+  return ids;
+};
+
+const orderBlogProductIds = (productIds = [], primaryProductId = null) => {
+  const ordered = normalizeBlogProductIds(productIds);
+  const primaryId = Number(primaryProductId);
+  if (!Number.isInteger(primaryId) || primaryId <= 0) return ordered;
+  if (!ordered.includes(primaryId)) return ordered;
+  return [primaryId, ...ordered.filter((value) => value !== primaryId)];
+};
+
+const fetchBlogSnapshotsByProductIds = async (productIds = [], profiles = []) => {
+  const normalizedIds = normalizeBlogProductIds(productIds);
+  const snapshots = [];
+  const missingIds = [];
+
+  for (const productId of normalizedIds) {
+    const snapshot = await fetchBlogProductSnapshot(productId, profiles);
+    if (!snapshot) {
+      missingIds.push(productId);
+      continue;
+    }
+    snapshots.push(snapshot);
+  }
+
+  return {
+    productIds: normalizedIds,
+    snapshots,
+    missingIds,
+  };
+};
+
+const buildBlogProductSummary = (snapshot) => ({
+  product_id: Number(snapshot?.product_id) || null,
+  product_type: normalizeProfileDeviceType(snapshot?.product_type),
+  name: String(snapshot?.core?.name || "").trim(),
+  brand_name: String(snapshot?.core?.brand_name || "").trim(),
+  spec_score: toSafeFiniteNumber(snapshot?.scored?.spec_score, 0),
+  price: formatBlogPrice(snapshot?.lowest_price) || null,
+  image: snapshot?.hero_image || null,
+  images: Array.isArray(snapshot?.images) ? snapshot.images : [],
+});
+
+const buildBlogSelectionContext = (
+  snapshots = [],
+  requestedTokenMap = {},
+) => {
+  const validSnapshots = Array.isArray(snapshots)
+    ? snapshots.filter((snapshot) => {
+        const productId = Number(snapshot?.product_id);
+        return Number.isInteger(productId) && productId > 0;
+      })
+    : [];
+  const primarySnapshot = validSnapshots[0] || null;
+  const mergedTokenMap = primarySnapshot ? buildBlogTokenMap(primarySnapshot) : {};
+  const productSummaries = [];
+
+  validSnapshots.forEach((snapshot, index) => {
+    const productIndex = index + 1;
+    const summary = buildBlogProductSummary(snapshot);
+    const scopedTokenMap = buildBlogTokenMap(snapshot);
+    const productName = summary.name || `Product ${productIndex}`;
+    const productBrand = summary.brand_name || "";
+
+    productSummaries.push(summary);
+
+    mergedTokenMap[`product_${productIndex}_id`] = String(summary.product_id || "");
+    mergedTokenMap[`product_${productIndex}_name`] = productName;
+    mergedTokenMap[`product_${productIndex}_brand`] = productBrand;
+    mergedTokenMap[`product_${productIndex}_type`] = summary.product_type || "";
+
+    Object.entries(scopedTokenMap).forEach(([key, value]) => {
+      if (!profileHasValue(value)) return;
+      mergedTokenMap[`product_${productIndex}_${key}`] = value;
+      if (productIndex === 1) {
+        mergedTokenMap[`primary_${key}`] = value;
+      }
+    });
+  });
+
+  const productNames = productSummaries
+    .map((product) => String(product?.name || "").trim())
+    .filter(Boolean);
+  const productBrands = productSummaries
+    .map((product) => String(product?.brand_name || "").trim())
+    .filter(Boolean);
+
+  if (primarySnapshot) {
+    mergedTokenMap.primary_product_id = String(primarySnapshot.product_id || "");
+    mergedTokenMap.primary_product_type = normalizeProfileDeviceType(
+      primarySnapshot.product_type,
+    );
+  }
+
+  if (productNames.length) {
+    mergedTokenMap.product_count = String(productNames.length);
+    mergedTokenMap.product_names = productNames.join(", ");
+    mergedTokenMap.primary_product_name = productNames[0];
+  }
+
+  if (productBrands.length) {
+    mergedTokenMap.product_brands = productBrands.join(", ");
+  }
+
+  if (productNames.length > 1) {
+    mergedTokenMap.secondary_product_names = productNames.slice(1).join(", ");
+  }
+
+  const tokenMap = {
+    ...mergedTokenMap,
+    ...toPlainObject(requestedTokenMap),
+  };
+  const tokenKeys = Object.keys(tokenMap).sort((left, right) =>
+    left.localeCompare(right),
+  );
+
+  return {
+    primarySnapshot,
+    productIds: productSummaries
+      .map((product) => Number(product?.product_id))
+      .filter((value) => Number.isInteger(value) && value > 0),
+    products: productSummaries,
+    tokenMap,
+    tokenKeys,
+  };
+};
+
+const buildBlogSuggestionsForSelection = (snapshots = [], tokenMap = {}) => {
+  const validSnapshots = Array.isArray(snapshots)
+    ? snapshots.filter((snapshot) => {
+        const productId = Number(snapshot?.product_id);
+        return Number.isInteger(productId) && productId > 0;
+      })
+    : [];
+  const primarySnapshot = validSnapshots[0] || null;
+  const multiProductTemplates = [];
+
+  if (validSnapshots.length > 1) {
+    multiProductTemplates.push(
+      "This roundup tracks {{product_names}} and highlights the biggest differences in pricing, positioning, and day-to-day value.",
+      "Among the selected launches, {{product_1_name}} leads the story while {{secondary_product_names}} add the broader market context.",
+    );
+
+    if (validSnapshots.length >= 2) {
+      multiProductTemplates.push(
+        "{{product_1_name}} starts around {{product_1_price}}, while {{product_2_name}} is listed near {{product_2_price}} for buyers comparing the two releases.",
+      );
+    }
+  }
+
+  const primarySuggestions = primarySnapshot
+    ? buildBlogSuggestions(primarySnapshot, tokenMap).map((entry) => entry.template)
+    : [];
+  const templates = [...multiProductTemplates, ...primarySuggestions];
+
+  return templates.map((template, index) => ({
+    id: index + 1,
+    template,
+    rendered: renderBlogTemplateWithTokens(template, tokenMap, {
+      preserveUnknown: true,
+    }),
+  }));
+};
+
+const findExistingBlogByOrderedProductSet = async (
+  productIds = [],
+  queryable = db,
+) => {
+  const normalizedIds = normalizeBlogProductIds(productIds);
+  if (!normalizedIds.length) return null;
+
+  const result = await queryable.query(
+    `
+      SELECT
+        bl.id,
+        bl.product_id,
+        bl.status,
+        bl.slug
+      FROM blogs bl
+      WHERE COALESCE(
+        (
+          SELECT array_agg(bp.product_id ORDER BY bp.position ASC, bp.id ASC)
+          FROM blog_products bp
+          WHERE bp.blog_id = bl.id
+        ),
+        CASE
+          WHEN bl.product_id IS NOT NULL THEN ARRAY[bl.product_id]::int[]
+          ELSE ARRAY[]::int[]
+        END
+      ) = $1::int[]
+      ORDER BY bl.updated_at DESC NULLS LAST, bl.id DESC
+      LIMIT 1
+    `,
+    [normalizedIds],
+  );
+
+  return result.rows[0] || null;
+};
+
+const attachBlogProductsToRows = async (rows = []) => {
+  if (!Array.isArray(rows) || rows.length === 0) return rows;
+
+  const blogIds = Array.from(
+    new Set(
+      rows
+        .map((row) => Number(row?.id))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  );
+  if (!blogIds.length) return rows;
+
+  const result = await db.query(
+    `
+      SELECT
+        bp.blog_id,
+        bp.product_id,
+        bp.position,
+        p.name,
+        p.product_type,
+        b.name AS brand_name,
+        (
+          SELECT pi.image_url
+          FROM product_images pi
+          WHERE pi.product_id = bp.product_id
+          ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+          LIMIT 1
+        ) AS image
+      FROM blog_products bp
+      JOIN products p
+        ON p.id = bp.product_id
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      WHERE bp.blog_id = ANY($1::int[])
+      ORDER BY bp.blog_id ASC, bp.position ASC, bp.id ASC
+    `,
+    [blogIds],
+  );
+
+  const productsByBlogId = new Map();
+  (result.rows || []).forEach((row) => {
+    const blogId = Number(row?.blog_id);
+    if (!Number.isInteger(blogId) || blogId <= 0) return;
+    const current = productsByBlogId.get(blogId) || [];
+    current.push({
+      product_id: Number(row?.product_id) || null,
+      product_type: normalizeProfileDeviceType(row?.product_type),
+      name: String(row?.name || "").trim(),
+      brand_name: String(row?.brand_name || "").trim(),
+      image: row?.image || null,
+    });
+    productsByBlogId.set(blogId, current);
+  });
+
+  rows.forEach((row) => {
+    const blogId = Number(row?.id);
+    const existingProductMap = new Map(
+      (Array.isArray(row?.products) ? row.products : [])
+        .map((product) => [Number(product?.product_id), product])
+        .filter(([productId]) => Number.isInteger(productId) && productId > 0),
+    );
+    const linkedProducts = (productsByBlogId.get(blogId) || []).map((product) => ({
+      ...(existingProductMap.get(Number(product?.product_id)) || {}),
+      ...product,
+    }));
+    const fallbackProducts =
+      linkedProducts.length === 0 &&
+      Number.isInteger(Number(row?.product_id)) &&
+      Number(row?.product_id) > 0
+        ? [
+            {
+              product_id: Number(row.product_id),
+              product_type: normalizeProfileDeviceType(row?.product_type),
+              name: String(row?.product_name || "").trim(),
+              brand_name: String(row?.brand_name || "").trim(),
+              image: row?.hero_image || null,
+            },
+          ]
+        : [];
+    const products = linkedProducts.length ? linkedProducts : fallbackProducts;
+    const productIds = normalizeBlogProductIds(products);
+
+    row.product_ids = productIds;
+    row.products = products;
+    row.linked_product_count = productIds.length;
+    row.product_names = products
+      .map((product) => String(product?.name || "").trim())
+      .filter(Boolean)
+      .join(", ");
+
+    const primaryProduct = products[0] || null;
+    if (primaryProduct) {
+      row.primary_product_id = primaryProduct.product_id || null;
+      row.product_id = row.product_id || primaryProduct.product_id || null;
+      row.product_name = row.product_name || primaryProduct.name || "";
+      row.product_type = row.product_type || primaryProduct.product_type || null;
+      row.brand_name = row.brand_name || primaryProduct.brand_name || "";
+    }
+  });
+
+  return rows;
+};
+
+const syncBlogProducts = async (queryable, blogId, productIds = []) => {
+  const normalizedBlogId = Number(blogId);
+  if (!Number.isInteger(normalizedBlogId) || normalizedBlogId <= 0) return;
+
+  const orderedProductIds = normalizeBlogProductIds(productIds);
+  await queryable.query(`DELETE FROM blog_products WHERE blog_id = $1`, [
+    normalizedBlogId,
+  ]);
+
+  if (!orderedProductIds.length) return;
+
+  await queryable.query(
+    `
+      INSERT INTO blog_products (blog_id, product_id, position)
+      SELECT $1, linked_product_id, linked_position::int
+      FROM unnest($2::int[]) WITH ORDINALITY AS linked(linked_product_id, linked_position)
+    `,
+    [normalizedBlogId, orderedProductIds],
+  );
+};
+
 const resolvePublicBlogRow = async (
   row,
   profileConfig = null,
@@ -4776,44 +5129,72 @@ const resolvePublicBlogRow = async (
     }
   }
   const template = String(blog.content_template || "").trim();
-  const productId = Number(blog.product_id);
+  const productIds = normalizeBlogProductIds(blog.product_ids, blog.product_id);
 
   if (!template) return blog;
 
-  const tokenMap = { ...toPlainObject(blog.token_snapshot) };
+  let tokenMap = { ...toPlainObject(blog.token_snapshot) };
 
-  if (Number.isInteger(productId) && productId > 0) {
-    let snapshot =
-      snapshotCache instanceof Map ? snapshotCache.get(productId) : null;
-    if (snapshot === undefined) snapshot = null;
+  if (productIds.length > 0) {
+    const config =
+      profileConfig ||
+      (await readDeviceFieldProfilesConfig().catch(() => ({ profiles: [] })));
+    const snapshots = [];
 
-    if (snapshot === null) {
-      const config =
-        profileConfig ||
-        (await readDeviceFieldProfilesConfig().catch(() => ({ profiles: [] })));
-      snapshot = await fetchBlogProductSnapshot(
-        productId,
-        config?.profiles || [],
-      );
-      if (snapshotCache instanceof Map) {
-        snapshotCache.set(productId, snapshot);
+    for (const productId of productIds) {
+      let snapshot =
+        snapshotCache instanceof Map ? snapshotCache.get(productId) : undefined;
+
+      if (typeof snapshot === "undefined") {
+        snapshot = await fetchBlogProductSnapshot(productId, config?.profiles || []);
+        if (snapshotCache instanceof Map) {
+          snapshotCache.set(productId, snapshot || null);
+        }
+      }
+
+      if (snapshot) {
+        snapshots.push(snapshot);
       }
     }
 
-    if (snapshot) {
-      Object.assign(tokenMap, buildBlogTokenMap(snapshot));
-      if (!blog.hero_image && snapshot.hero_image) {
-        blog.hero_image = snapshot.hero_image;
+    if (snapshots.length > 0) {
+      const selectionContext = buildBlogSelectionContext(snapshots, tokenMap);
+      const primarySnapshot = selectionContext.primarySnapshot;
+      tokenMap = selectionContext.tokenMap;
+      blog.product_ids = selectionContext.productIds;
+      blog.products = selectionContext.products;
+      blog.product_names = selectionContext.products
+        .map((product) => String(product?.name || "").trim())
+        .filter(Boolean)
+        .join(", ");
+
+      if (
+        blog.hero_image_source !== "none" &&
+        !blog.hero_image &&
+        primarySnapshot?.hero_image
+      ) {
+        blog.hero_image = primarySnapshot.hero_image;
       }
       if (!blog.hero_image_source && blog.hero_image) {
         blog.hero_image_source =
-          snapshot.hero_image && blog.hero_image === snapshot.hero_image
+          primarySnapshot?.hero_image && blog.hero_image === primarySnapshot.hero_image
             ? "asset"
             : "url";
       }
-      if (!blog.brand_logo && snapshot?.core?.brand_logo) {
-        blog.brand_logo = snapshot.core.brand_logo;
+      if (!blog.brand_logo && primarySnapshot?.core?.brand_logo) {
+        blog.brand_logo = primarySnapshot.core.brand_logo;
       }
+      if (!blog.product_name && selectionContext.products[0]?.name) {
+        blog.product_name = selectionContext.products[0].name;
+      }
+      if (!blog.product_type && selectionContext.products[0]?.product_type) {
+        blog.product_type = selectionContext.products[0].product_type;
+      }
+      if (!blog.brand_name && selectionContext.products[0]?.brand_name) {
+        blog.brand_name = selectionContext.products[0].brand_name;
+      }
+    } else {
+      blog.product_ids = productIds;
     }
   }
 
@@ -4850,7 +5231,6 @@ const resolveUniqueBlogSlug = async (
     if (!existing.rows.length) return slug;
 
     const existingId = Number(existing.rows[0]?.id);
-    const existingProductId = Number(existing.rows[0]?.product_id);
     if (
       Number.isInteger(Number(blogId)) &&
       Number(blogId) > 0 &&
@@ -4858,7 +5238,6 @@ const resolveUniqueBlogSlug = async (
     ) {
       return slug;
     }
-    if (hasProductId && existingProductId === Number(productId)) return slug;
     slug = `${baseSlug}-${counter}`;
     counter += 1;
   }
@@ -5974,6 +6353,44 @@ async function runMigrations() {
     await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_blogs_product
       ON blogs (product_id);
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS blog_products (
+        id SERIAL PRIMARY KEY,
+        blog_id INT NOT NULL REFERENCES blogs(id) ON DELETE CASCADE,
+        product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        position INT NOT NULL DEFAULT 1,
+        created_at TIMESTAMP DEFAULT now(),
+        updated_at TIMESTAMP DEFAULT now(),
+        CONSTRAINT blog_products_blog_product_unique UNIQUE (blog_id, product_id)
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_blog_products_blog_position
+      ON blog_products (blog_id, position ASC, id ASC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_blog_products_product
+      ON blog_products (product_id, blog_id);
+    `);
+
+    await safeQuery(`
+      INSERT INTO blog_products (blog_id, product_id, position)
+      SELECT
+        bl.id,
+        bl.product_id,
+        1
+      FROM blogs bl
+      WHERE bl.product_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM blog_products bp
+          WHERE bp.blog_id = bl.id
+            AND bp.product_id = bl.product_id
+        );
     `);
 
     await safeQuery(`
@@ -9716,25 +10133,12 @@ app.get("/api/admin/blogs/candidates", authenticate, async (req, res) => {
         p.name,
         p.product_type,
         b.name AS brand_name,
-        COALESCE(pub.is_published, false) AS is_published,
-        bl.id AS existing_blog_id,
-        bl.title AS existing_blog_title,
-        bl.status AS existing_blog_status,
-        bl.category AS existing_blog_category,
-        bl.author_name AS existing_blog_author_name,
-        bl.hero_image_alt AS existing_blog_hero_image_alt,
-        bl.hero_image_caption AS existing_blog_hero_image_caption,
-        bl.tags AS existing_blog_tags,
-        bl.featured AS existing_blog_featured,
-        bl.trending AS existing_blog_trending,
-        bl.pinned AS existing_blog_pinned
+        COALESCE(pub.is_published, false) AS is_published
       FROM products p
       LEFT JOIN brands b
         ON b.id = p.brand_id
       LEFT JOIN product_publish pub
         ON pub.product_id = p.id
-      LEFT JOIN blogs bl
-        ON bl.product_id = p.id
       WHERE p.product_type = $1
       ORDER BY p.id DESC
       LIMIT $2
@@ -9761,10 +10165,6 @@ app.get("/api/admin/blogs/candidates", authenticate, async (req, res) => {
         spec_score: toSafeFiniteNumber(snapshot?.scored?.spec_score, 0),
         price: price || null,
         image: snapshot.hero_image || null,
-        existing_blog_id: Number(baseRow.existing_blog_id) || null,
-        existing_blog_title: baseRow.existing_blog_title || "",
-        existing_blog_status: baseRow.existing_blog_status || null,
-        existing_blog_category: baseRow.existing_blog_category || null,
       });
     }
 
@@ -9801,58 +10201,68 @@ app.get(
         return res.status(404).json({ message: "Product not found" });
       }
 
-      const tokenMap = buildBlogTokenMap(snapshot);
-      const suggestions = buildBlogSuggestions(snapshot, tokenMap);
-      const existing = await db.query(
-        `
-      SELECT
-        id,
-        product_id,
-        category,
-        title,
-        slug,
-        excerpt,
-        author_name,
-        author_user_id,
-        content_template,
-        content_rendered,
-        status,
-        blog_eligible,
-        meta_title,
-        meta_description,
-        COALESCE(
-          hero_image,
-          (
-            SELECT pi.image_url
-            FROM product_images pi
-            WHERE pi.product_id = blogs.product_id
-            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-            LIMIT 1
-          )
-        ) AS hero_image,
-        published_at,
-        created_at,
-        updated_at
-      FROM blogs
-      WHERE product_id = $1
-      LIMIT 1
-    `,
-        [productId],
+      const selectionContext = buildBlogSelectionContext([snapshot]);
+      const suggestions = buildBlogSuggestionsForSelection(
+        [snapshot],
+        selectionContext.tokenMap,
       );
+      const existingMatch = await findExistingBlogByOrderedProductSet([productId]);
+      const existing = existingMatch?.id
+        ? await db.query(
+            `
+              SELECT
+                id,
+                product_id,
+                category,
+                title,
+                slug,
+                excerpt,
+                author_name,
+                author_user_id,
+                content_template,
+                content_rendered,
+                status,
+                blog_eligible,
+                meta_title,
+                meta_description,
+                hero_image_source,
+                hero_image_alt,
+                hero_image_caption,
+                tags,
+                featured,
+                trending,
+                pinned,
+                CASE
+                  WHEN hero_image_source = 'none' THEN NULL
+                  ELSE COALESCE(
+                    hero_image,
+                    (
+                      SELECT pi.image_url
+                      FROM product_images pi
+                      WHERE pi.product_id = blogs.product_id
+                      ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+                      LIMIT 1
+                    )
+                  )
+                END AS hero_image,
+                published_at,
+                created_at,
+                updated_at
+              FROM blogs
+              WHERE id = $1
+              LIMIT 1
+            `,
+            [existingMatch.id],
+          )
+        : { rows: [] };
 
       return res.json({
-        product: {
-          product_id: snapshot.product_id,
-          product_type: snapshot.product_type,
-          name: snapshot.core?.name || "",
-          brand_name: snapshot.core?.brand_name || "",
-          spec_score: snapshot.scored?.spec_score ?? 0,
-          price: formatBlogPrice(snapshot.lowest_price) || null,
-          image: snapshot.hero_image || null,
-          images: Array.isArray(snapshot.images) ? snapshot.images : [],
-        },
-        token_map: tokenMap,
-        token_keys: Object.keys(tokenMap).sort(),
+        primary_product_id: selectionContext.productIds[0] || null,
+        product: selectionContext.products[0] || null,
+        products: selectionContext.products,
+        product_ids: selectionContext.productIds,
+        token_map: selectionContext.tokenMap,
+        token_keys: selectionContext.tokenKeys,
         suggestions,
         existing_blog: existing.rows[0] || null,
       });
@@ -9869,25 +10279,31 @@ app.post("/api/admin/blogs/preview", authenticate, async (req, res) => {
   try {
     if (!(await ensureBlogManagerAccess(req, res, "edit"))) return;
 
-    const productIdRaw = req.body?.product_id;
-    const productId = Number(productIdRaw);
-    const hasProductId = Number.isInteger(productId) && productId > 0;
+    const productIds = orderBlogProductIds(
+      req.body?.product_ids ?? req.body?.productIds,
+      req.body?.primary_product_id ?? req.body?.primaryProductId ?? req.body?.product_id,
+    );
     const content = String(req.body?.content || "");
     if (!content.trim()) {
       return res.status(400).json({ message: "content is required" });
     }
 
     let tokenMap = toPlainObject(req.body?.token_map);
-    if (hasProductId) {
+    if (productIds.length > 0) {
       const profileConfig = await readDeviceFieldProfilesConfig();
-      const snapshot = await fetchBlogProductSnapshot(
-        productId,
+      const snapshotResult = await fetchBlogSnapshotsByProductIds(
+        productIds,
         profileConfig.profiles,
       );
-      if (!snapshot) {
-        return res.status(404).json({ message: "Product not found" });
+      if (snapshotResult.missingIds.length) {
+        return res.status(404).json({
+          message: `Products not found: ${snapshotResult.missingIds.join(", ")}`,
+        });
       }
-      tokenMap = buildBlogTokenMap(snapshot);
+      tokenMap = buildBlogSelectionContext(
+        snapshotResult.snapshots,
+        tokenMap,
+      ).tokenMap;
     }
     const rendered = renderBlogTemplateWithTokens(content, tokenMap, {
       preserveUnknown: true,
@@ -9910,11 +10326,15 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
     if (!(await ensureBlogManagerAccess(req, res, "edit"))) return;
 
     const rawBlogId = Number(req.body?.blog_id);
-    const rawProductId = Number(req.body?.product_id);
     const hasBlogId = Number.isInteger(rawBlogId) && rawBlogId > 0;
-    const hasProductId = Number.isInteger(rawProductId) && rawProductId > 0;
+    const productIds = orderBlogProductIds(
+      req.body?.product_ids ?? req.body?.productIds ?? req.body?.products,
+      req.body?.primary_product_id ??
+        req.body?.primaryProductId ??
+        req.body?.product_id,
+    );
     let targetBlogId = hasBlogId ? rawBlogId : null;
-    const productId = hasProductId ? rawProductId : null;
+    const productId = productIds[0] || null;
 
     const title = String(req.body?.title || "").trim();
     const excerpt = String(req.body?.excerpt || "").trim();
@@ -9959,7 +10379,9 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       .trim()
       .toLowerCase();
     const heroImageSource =
-      heroImageSourceRaw === "asset" || heroImageSourceRaw === "url"
+      heroImageSourceRaw === "asset" ||
+      heroImageSourceRaw === "url" ||
+      heroImageSourceRaw === "none"
         ? heroImageSourceRaw
         : null;
 
@@ -9968,12 +10390,11 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       return res.status(400).json({ message: "content_template is required" });
     }
 
-    if (!targetBlogId && productId) {
-      const existingByProduct = await db.query(
-        "SELECT id FROM blogs WHERE product_id = $1 LIMIT 1",
-        [productId],
+    if (!targetBlogId && productIds.length > 0) {
+      const existingBySelection = await findExistingBlogByOrderedProductSet(
+        productIds,
       );
-      targetBlogId = Number(existingByProduct.rows[0]?.id) || null;
+      targetBlogId = Number(existingBySelection?.id) || null;
     }
 
     let existingBlog = null;
@@ -9990,27 +10411,37 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       existingBlog = existingBlogResult.rows[0] || null;
     }
 
-    let snapshot = null;
-    if (productId) {
+    let selectionContext = {
+      primarySnapshot: null,
+      productIds: [],
+      products: [],
+      tokenMap: toPlainObject(req.body?.token_map),
+      tokenKeys: Object.keys(toPlainObject(req.body?.token_map)).sort(),
+    };
+    if (productIds.length > 0) {
       const profileConfig = await readDeviceFieldProfilesConfig();
-      snapshot = await fetchBlogProductSnapshot(
-        productId,
+      const snapshotResult = await fetchBlogSnapshotsByProductIds(
+        productIds,
         profileConfig.profiles,
       );
-      if (!snapshot) {
-        return res.status(404).json({ message: "Product not found" });
+      if (snapshotResult.missingIds.length) {
+        return res.status(404).json({
+          message: `Products not found: ${snapshotResult.missingIds.join(", ")}`,
+        });
       }
+      selectionContext = buildBlogSelectionContext(
+        snapshotResult.snapshots,
+        req.body?.token_map,
+      );
     }
 
     const eligibilitySnapshot = {
       advisory_only: true,
-      product_linked: Boolean(productId),
+      product_linked: productIds.length > 0,
+      linked_product_count: productIds.length,
+      product_ids: productIds,
     };
-
-    const requestedTokenMap = toPlainObject(req.body?.token_map);
-    const tokenMap = snapshot
-      ? { ...buildBlogTokenMap(snapshot), ...requestedTokenMap }
-      : requestedTokenMap;
+    const tokenMap = selectionContext.tokenMap;
 
     const contentRendered = renderBlogTemplateWithTokens(
       contentTemplate,
@@ -10020,13 +10451,18 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       },
     );
     const slug = await resolveUniqueBlogSlug(
-      requestedSlug || title || snapshot?.core?.name,
+      requestedSlug || title || selectionContext.primarySnapshot?.core?.name,
       productId,
       targetBlogId,
     );
-    const heroImage = String(
-      req.body?.hero_image || snapshot?.hero_image || "",
-    ).trim();
+    const heroImage =
+      heroImageSource === "none"
+        ? ""
+        : String(
+            req.body?.hero_image ||
+              selectionContext.primarySnapshot?.hero_image ||
+              "",
+          ).trim();
     const authorUser = authorUserId
       ? await resolveRbacUserById(authorUserId)
       : null;
@@ -10041,199 +10477,226 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
         ? Number(req.user.id)
         : null;
 
+    const client = await db.connect();
     let writeResult;
-    if (targetBlogId) {
-      writeResult = await db.query(
-        `
-        UPDATE blogs
-        SET
-          product_id = $2,
-          category = $3,
-          title = $4,
-          slug = $5,
-          excerpt = $6,
-          author_name = $7,
-          author_user_id = $8,
-          content_template = $9,
-          content_rendered = $10,
-          status = $11,
-          blog_eligible = $12,
-          eligibility_snapshot = $13::jsonb,
-          token_snapshot = $14::jsonb,
-          meta_title = $15,
-          meta_description = $16,
-          hero_image = $17,
-          hero_image_source = $18,
-          hero_image_alt = $19,
-          hero_image_caption = $20,
-          tags = $21::jsonb,
-          featured = $22,
-          trending = $23,
-          pinned = $24,
-          updated_by = $25,
-          published_at = CASE
-            WHEN $11 = 'published' THEN COALESCE($26, published_at, now())
-            ELSE $26
-          END,
-          updated_at = now()
-        WHERE id = $1
-        RETURNING
-          id,
-          product_id,
-          category,
-          title,
-          slug,
-          excerpt,
-          author_name,
-          author_user_id,
-          content_template,
-          content_rendered,
-          status,
-          blog_eligible,
-          eligibility_snapshot,
-          token_snapshot,
-          meta_title,
-          meta_description,
-          hero_image,
-          hero_image_source,
-          hero_image_alt,
-          hero_image_caption,
-          tags,
-          featured,
-          trending,
-          pinned,
-          published_at,
-          created_at,
-          updated_at
-      `,
-        [
-          targetBlogId,
-          productId,
-          category,
-          title,
-          slug,
-          excerpt || null,
-          resolvedAuthorName || null,
-          authorUserId,
-          contentTemplate,
-          contentRendered,
-          status,
-          Boolean(productId),
-          JSON.stringify(eligibilitySnapshot),
-          JSON.stringify(tokenMap),
-          metaTitle || null,
-          metaDescription || null,
-          heroImage || null,
-          heroImageSource,
-          heroImageAlt || null,
-          heroImageCaption || null,
-          JSON.stringify(tags),
-          featured,
-          trending,
-          pinned,
-          actorId,
-          publishedAtValue,
-        ],
-      );
-      if (!writeResult.rows.length) {
-        return res.status(404).json({ message: "Blog not found" });
+
+    try {
+      await client.query("BEGIN");
+
+      if (targetBlogId) {
+        writeResult = await client.query(
+          `
+            UPDATE blogs
+            SET
+              product_id = $2,
+              category = $3,
+              title = $4,
+              slug = $5,
+              excerpt = $6,
+              author_name = $7,
+              author_user_id = $8,
+              content_template = $9,
+              content_rendered = $10,
+              status = $11,
+              blog_eligible = $12,
+              eligibility_snapshot = $13::jsonb,
+              token_snapshot = $14::jsonb,
+              meta_title = $15,
+              meta_description = $16,
+              hero_image = $17,
+              hero_image_source = $18,
+              hero_image_alt = $19,
+              hero_image_caption = $20,
+              tags = $21::jsonb,
+              featured = $22,
+              trending = $23,
+              pinned = $24,
+              updated_by = $25,
+              published_at = CASE
+                WHEN $11 = 'published' THEN COALESCE($26, published_at, now())
+                ELSE $26
+              END,
+              updated_at = now()
+            WHERE id = $1
+            RETURNING
+              id,
+              product_id,
+              category,
+              title,
+              slug,
+              excerpt,
+              author_name,
+              author_user_id,
+              content_template,
+              content_rendered,
+              status,
+              blog_eligible,
+              eligibility_snapshot,
+              token_snapshot,
+              meta_title,
+              meta_description,
+              hero_image,
+              hero_image_source,
+              hero_image_alt,
+              hero_image_caption,
+              tags,
+              featured,
+              trending,
+              pinned,
+              published_at,
+              created_at,
+              updated_at
+          `,
+          [
+            targetBlogId,
+            productId,
+            category,
+            title,
+            slug,
+            excerpt || null,
+            resolvedAuthorName || null,
+            authorUserId,
+            contentTemplate,
+            contentRendered,
+            status,
+            productIds.length > 0,
+            JSON.stringify(eligibilitySnapshot),
+            JSON.stringify(tokenMap),
+            metaTitle || null,
+            metaDescription || null,
+            heroImage || null,
+            heroImageSource,
+            heroImageAlt || null,
+            heroImageCaption || null,
+            JSON.stringify(tags),
+            featured,
+            trending,
+            pinned,
+            actorId,
+            publishedAtValue,
+          ],
+        );
+        if (!writeResult.rows.length) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ message: "Blog not found" });
+        }
+      } else {
+        writeResult = await client.query(
+          `
+            INSERT INTO blogs (
+              product_id,
+              category,
+              title,
+              slug,
+              excerpt,
+              author_name,
+              author_user_id,
+              content_template,
+              content_rendered,
+              status,
+              blog_eligible,
+              eligibility_snapshot,
+              token_snapshot,
+              meta_title,
+              meta_description,
+              hero_image,
+              hero_image_source,
+              hero_image_alt,
+              hero_image_caption,
+              tags,
+              featured,
+              trending,
+              pinned,
+              created_by,
+              updated_by,
+              published_at,
+              created_at,
+              updated_at
+            ) VALUES (
+              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14,$15,$16,$17,$18,$19,$20::jsonb,$21,$22,$23,$24,$25,$26,now(),now()
+            )
+            RETURNING
+              id,
+              product_id,
+              category,
+              title,
+              slug,
+              excerpt,
+              author_name,
+              author_user_id,
+              content_template,
+              content_rendered,
+              status,
+              blog_eligible,
+              eligibility_snapshot,
+              token_snapshot,
+              meta_title,
+              meta_description,
+              hero_image,
+              hero_image_source,
+              hero_image_alt,
+              hero_image_caption,
+              tags,
+              featured,
+              trending,
+              pinned,
+              published_at,
+              created_at,
+              updated_at
+          `,
+          [
+            productId,
+            category,
+            title,
+            slug,
+            excerpt || null,
+            resolvedAuthorName || null,
+            authorUserId,
+            contentTemplate,
+            contentRendered,
+            status,
+            productIds.length > 0,
+            JSON.stringify(eligibilitySnapshot),
+            JSON.stringify(tokenMap),
+            metaTitle || null,
+            metaDescription || null,
+            heroImage || null,
+            heroImageSource,
+            heroImageAlt || null,
+            heroImageCaption || null,
+            JSON.stringify(tags),
+            featured,
+            trending,
+            pinned,
+            actorId,
+            actorId,
+            publishedAtValue,
+          ],
+        );
       }
-    } else {
-      writeResult = await db.query(
-        `
-        INSERT INTO blogs (
-          product_id,
-          category,
-          title,
-          slug,
-          excerpt,
-          author_name,
-          author_user_id,
-          content_template,
-          content_rendered,
-          status,
-          blog_eligible,
-          eligibility_snapshot,
-          token_snapshot,
-          meta_title,
-          meta_description,
-          hero_image,
-          hero_image_source,
-          hero_image_alt,
-          hero_image_caption,
-          tags,
-          featured,
-          trending,
-          pinned,
-          created_by,
-          updated_by,
-          published_at,
-          created_at,
-          updated_at
-        ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14,$15,$16,$17,$18,$19,$20::jsonb,$21,$22,$23,$24,$25,$26,now(),now()
-        )
-        RETURNING
-          id,
-          product_id,
-          category,
-          title,
-          slug,
-          excerpt,
-          author_name,
-          author_user_id,
-          content_template,
-          content_rendered,
-          status,
-          blog_eligible,
-          eligibility_snapshot,
-          token_snapshot,
-          meta_title,
-          meta_description,
-          hero_image,
-          hero_image_source,
-          hero_image_alt,
-          hero_image_caption,
-          tags,
-          featured,
-          trending,
-          pinned,
-          published_at,
-          created_at,
-          updated_at
-      `,
-        [
-          productId,
-          category,
-          title,
-          slug,
-          excerpt || null,
-          resolvedAuthorName || null,
-          authorUserId,
-          contentTemplate,
-          contentRendered,
-          status,
-          Boolean(productId),
-          JSON.stringify(eligibilitySnapshot),
-          JSON.stringify(tokenMap),
-          metaTitle || null,
-          metaDescription || null,
-          heroImage || null,
-          heroImageSource,
-          heroImageAlt || null,
-          heroImageCaption || null,
-          JSON.stringify(tags),
-          featured,
-          trending,
-          pinned,
-          actorId,
-          actorId,
-          publishedAtValue,
-        ],
-      );
+
+      const savedBlogId = Number(writeResult.rows[0]?.id) || null;
+      await syncBlogProducts(client, savedBlogId, productIds);
+      await client.query("COMMIT");
+    } catch (writeErr) {
+      await client.query("ROLLBACK");
+      throw writeErr;
+    } finally {
+      client.release();
     }
 
     const savedBlog = writeResult.rows[0] || null;
+    if (savedBlog) {
+      savedBlog.product_ids = productIds;
+      savedBlog.products = selectionContext.products;
+      savedBlog.linked_product_count = productIds.length;
+      savedBlog.token_map = tokenMap;
+      savedBlog.token_keys = selectionContext.tokenKeys;
+      savedBlog.product_names = selectionContext.products
+        .map((product) => String(product?.name || "").trim())
+        .filter(Boolean)
+        .join(", ");
+    }
     const shouldSendPublishedPush =
       savedBlog?.status === "published" && existingBlog?.status !== "published";
     let pushNotification = null;
@@ -10248,6 +10711,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
 
     // Ensure proper HTML encoding for API responses
     if (savedBlog) {
+      await attachBlogProductsToRows([savedBlog]);
       savedBlog.content_template = ensureProperHtmlEncoding(
         savedBlog.content_template,
       );
@@ -10304,16 +10768,19 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
         bl.featured,
         bl.trending,
         bl.pinned,
-        COALESCE(
-          bl.hero_image,
-          (
-            SELECT pi.image_url
-            FROM product_images pi
-            WHERE pi.product_id = bl.product_id
-            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-            LIMIT 1
+        CASE
+          WHEN bl.hero_image_source = 'none' THEN NULL
+          ELSE COALESCE(
+            bl.hero_image,
+            (
+              SELECT pi.image_url
+              FROM product_images pi
+              WHERE pi.product_id = bl.product_id
+              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+              LIMIT 1
+            )
           )
-        ) AS hero_image,
+        END AS hero_image,
         bl.published_at,
         bl.updated_at,
         p.name AS product_name,
@@ -10341,12 +10808,14 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
       db.query(listSql, params),
       db.query(countSql, countParams),
     ]);
+    const rows = Array.isArray(listRes.rows) ? listRes.rows : [];
+    await attachBlogProductsToRows(rows);
 
     return res.json({
       page,
       limit,
       total: countRes.rows[0]?.total || 0,
-      rows: listRes.rows || [],
+      rows,
     });
   } catch (err) {
     console.error("GET /api/admin/blogs error:", err);
@@ -10389,16 +10858,19 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
         bl.featured,
         bl.trending,
         bl.pinned,
-        COALESCE(
-          bl.hero_image,
-          (
-            SELECT pi.image_url
-            FROM product_images pi
-            WHERE pi.product_id = bl.product_id
-            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-            LIMIT 1
+        CASE
+          WHEN bl.hero_image_source = 'none' THEN NULL
+          ELSE COALESCE(
+            bl.hero_image,
+            (
+              SELECT pi.image_url
+              FROM product_images pi
+              WHERE pi.product_id = bl.product_id
+              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+              LIMIT 1
+            )
           )
-        ) AS hero_image,
+        END AS hero_image,
         bl.published_at,
         bl.created_at,
         bl.updated_at,
@@ -10421,6 +10893,42 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
     }
 
     const blog = result.rows[0];
+    await attachBlogProductsToRows([blog]);
+    const productIds = normalizeBlogProductIds(blog.product_ids, blog.product_id);
+
+    if (productIds.length > 0) {
+      const profileConfig = await readDeviceFieldProfilesConfig().catch(() => ({
+        profiles: [],
+      }));
+      const snapshotResult = await fetchBlogSnapshotsByProductIds(
+        productIds,
+        profileConfig.profiles,
+      );
+      const selectionContext = buildBlogSelectionContext(
+        snapshotResult.snapshots,
+        blog.token_snapshot,
+      );
+
+      blog.product_ids = selectionContext.productIds;
+      blog.products = selectionContext.products;
+      blog.linked_product_count = selectionContext.productIds.length;
+      blog.product_names = selectionContext.products
+        .map((product) => String(product?.name || "").trim())
+        .filter(Boolean)
+        .join(", ");
+      blog.token_map = selectionContext.tokenMap;
+      blog.token_keys = selectionContext.tokenKeys;
+      if (!blog.product_name && selectionContext.products[0]?.name) {
+        blog.product_name = selectionContext.products[0].name;
+      }
+      if (!blog.product_type && selectionContext.products[0]?.product_type) {
+        blog.product_type = selectionContext.products[0].product_type;
+      }
+      if (!blog.brand_name && selectionContext.products[0]?.brand_name) {
+        blog.brand_name = selectionContext.products[0].brand_name;
+      }
+    }
+
     // Ensure proper HTML encoding for API responses
     blog.content_template = ensureProperHtmlEncoding(blog.content_template);
     blog.content_rendered = ensureProperHtmlEncoding(blog.content_rendered);
@@ -10635,7 +11143,14 @@ app.get("/api/public/blogs", async (req, res) => {
 
     if (productId) {
       params.push(productId);
-      whereClauses.push(`bl.product_id = $${params.length}`);
+      whereClauses.push(`
+        EXISTS (
+          SELECT 1
+          FROM blog_products bp
+          WHERE bp.blog_id = bl.id
+            AND bp.product_id = $${params.length}
+        )
+      `);
     }
 
     const result = await db.query(
@@ -10661,16 +11176,19 @@ app.get("/api/public/blogs", async (req, res) => {
         bl.featured,
         bl.trending,
         bl.pinned,
-        COALESCE(
-          bl.hero_image,
-          (
-            SELECT pi.image_url
-            FROM product_images pi
-            WHERE pi.product_id = bl.product_id
-            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-            LIMIT 1
+        CASE
+          WHEN bl.hero_image_source = 'none' THEN NULL
+          ELSE COALESCE(
+            bl.hero_image,
+            (
+              SELECT pi.image_url
+              FROM product_images pi
+              WHERE pi.product_id = bl.product_id
+              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+              LIMIT 1
+            )
           )
-        ) AS hero_image,
+        END AS hero_image,
         bl.published_at,
         bl.updated_at,
         p.name AS product_name,
@@ -10690,6 +11208,7 @@ app.get("/api/public/blogs", async (req, res) => {
     );
 
     const rows = result.rows || [];
+    await attachBlogProductsToRows(rows);
     const needsResolution = rows.some((row) => Number(row.product_id) > 0);
     const blogs = needsResolution
       ? await (async () => {
@@ -10751,16 +11270,19 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
         bl.featured,
         bl.trending,
         bl.pinned,
-        COALESCE(
-          bl.hero_image,
-          (
-            SELECT pi.image_url
-            FROM product_images pi
-            WHERE pi.product_id = bl.product_id
-            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-            LIMIT 1
+        CASE
+          WHEN bl.hero_image_source = 'none' THEN NULL
+          ELSE COALESCE(
+            bl.hero_image,
+            (
+              SELECT pi.image_url
+              FROM product_images pi
+              WHERE pi.product_id = bl.product_id
+              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+              LIMIT 1
+            )
           )
-        ) AS hero_image,
+        END AS hero_image,
         bl.published_at,
         bl.updated_at,
         p.name AS product_name,
@@ -10782,6 +11304,7 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
       return res.status(404).json({ message: "Blog not found" });
     }
 
+    await attachBlogProductsToRows(result.rows);
     const blog = await resolvePublicBlogRow(result.rows[0]);
     return res.json({ blog });
   } catch (err) {
@@ -16707,6 +17230,107 @@ app.post(
   },
 );
 
+app.post("/api/admin/blogs/context", authenticate, async (req, res) => {
+  try {
+    if (!(await ensureBlogManagerAccess(req, res, "view"))) return;
+
+    const productIds = orderBlogProductIds(
+      req.body?.product_ids ?? req.body?.productIds ?? req.body?.products,
+      req.body?.primary_product_id ?? req.body?.primaryProductId ?? req.body?.product_id,
+    );
+    if (!productIds.length) {
+      return res.status(400).json({ message: "At least one product is required" });
+    }
+
+    const profileConfig = await readDeviceFieldProfilesConfig();
+    const snapshotResult = await fetchBlogSnapshotsByProductIds(
+      productIds,
+      profileConfig.profiles,
+    );
+    if (snapshotResult.missingIds.length) {
+      return res.status(404).json({
+        message: `Products not found: ${snapshotResult.missingIds.join(", ")}`,
+      });
+    }
+
+    const selectionContext = buildBlogSelectionContext(
+      snapshotResult.snapshots,
+      req.body?.token_map,
+    );
+    const suggestions = buildBlogSuggestionsForSelection(
+      snapshotResult.snapshots,
+      selectionContext.tokenMap,
+    );
+    const shouldMatchExisting = req.body?.match_existing !== false;
+    const existingMatch = shouldMatchExisting
+      ? await findExistingBlogByOrderedProductSet(selectionContext.productIds)
+      : null;
+    const existing = existingMatch?.id
+      ? await db.query(
+          `
+            SELECT
+              id,
+              product_id,
+              category,
+              title,
+              slug,
+              excerpt,
+              author_name,
+              author_user_id,
+              content_template,
+              content_rendered,
+              status,
+              blog_eligible,
+              meta_title,
+              meta_description,
+              hero_image_source,
+              hero_image_alt,
+              hero_image_caption,
+              tags,
+              featured,
+              trending,
+              pinned,
+              CASE
+                WHEN hero_image_source = 'none' THEN NULL
+                ELSE COALESCE(
+                  hero_image,
+                  (
+                    SELECT pi.image_url
+                    FROM product_images pi
+                    WHERE pi.product_id = blogs.product_id
+                    ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+                    LIMIT 1
+                  )
+                )
+              END AS hero_image,
+              published_at,
+              created_at,
+              updated_at
+            FROM blogs
+            WHERE id = $1
+            LIMIT 1
+          `,
+          [existingMatch.id],
+        )
+      : { rows: [] };
+
+    return res.json({
+      primary_product_id: selectionContext.productIds[0] || null,
+      primary_product_type:
+        selectionContext.primarySnapshot?.product_type || null,
+      product_ids: selectionContext.productIds,
+      products: selectionContext.products,
+      token_map: selectionContext.tokenMap,
+      token_keys: selectionContext.tokenKeys,
+      suggestions,
+      existing_blog: existing.rows[0] || null,
+    });
+  } catch (err) {
+    console.error("POST /api/admin/blogs/context error:", err);
+    return res.status(500).json({ message: "Failed to load blog context" });
+  }
+});
+
 app.delete("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
   try {
     if (req.user?.role !== "admin") {
@@ -18864,6 +19488,23 @@ app.post("/api/public/compare/scores", async (req, res) => {
         COALESCE(s.display, l.display, t.display_json, '{}'::jsonb) AS display,
         COALESCE(s.camera, '{}'::jsonb) AS camera,
         COALESCE(s.battery, l.battery, t.power_json, '{}'::jsonb) AS battery,
+        COALESCE(s.connectivity, l.connectivity, n.connectivity, t.connectivity_json, '{}'::jsonb) AS connectivity,
+        COALESCE(s.network, '{}'::jsonb) AS network,
+        COALESCE(s.build_design, '{}'::jsonb) AS build_design,
+        COALESCE(s.audio, t.audio_json, '{}'::jsonb) AS audio,
+        COALESCE(s.multimedia, '{}'::jsonb) AS multimedia,
+        COALESCE(s.sensors, '{}'::jsonb) AS sensors,
+        COALESCE(l.memory, '{}'::jsonb) AS memory,
+        COALESCE(l.storage, '{}'::jsonb) AS storage,
+        COALESCE(l.physical, t.physical_json, n.physical_details, '{}'::jsonb) AS physical,
+        COALESCE(l.software, '{}'::jsonb) AS software,
+        COALESCE(l.features, '{}'::jsonb) AS features,
+        COALESCE(t.smart_tv_json, '{}'::jsonb) AS smart_features,
+        COALESCE(t.gaming_json, '{}'::jsonb) AS gaming,
+        COALESCE(t.ports_json, '{}'::jsonb) AS ports,
+        COALESCE(n.specifications, '{}'::jsonb) AS specifications,
+        COALESCE(n.features, '{}'::jsonb) AS networking_features,
+        COALESCE(n.performance, '{}'::jsonb) AS networking_performance,
         (
           SELECT MIN(v.base_price)
           FROM product_variants v
@@ -18877,7 +19518,10 @@ app.post("/api/public/compare/scores", async (req, res) => {
                 'id', v.id,
                 'base_price', v.base_price,
                 'price', v.base_price,
-                'attributes', v.attributes
+                'attributes', v.attributes,
+                'ram', v.attributes->>'ram',
+                'storage', v.attributes->>'storage',
+                'storage_type', v.attributes->>'storage_type'
               )
               ORDER BY v.id ASC
             )
@@ -18907,20 +19551,53 @@ app.post("/api/public/compare/scores", async (req, res) => {
       return res.status(404).json({ message: "Products not found" });
     }
 
+    const productTypes = [
+      ...new Set(
+        (productResult.rows || [])
+          .map((row) => String(row?.product_type || "").trim().toLowerCase())
+          .filter(Boolean),
+      ),
+    ];
+
+    if (productTypes.length > 1) {
+      return res.status(400).json({
+        message:
+          "Comparison scoring is available only for devices from the same product type.",
+      });
+    }
+
     const compareConfig = await readCompareScoringConfig();
     const variantSelection = Object.fromEntries(
       normalizedDevices.map((entry) => [String(entry.product_id), entry]),
     );
-    const ranking = buildCompareRanking(
+    const analysis = buildCompareRanking(
       productResult.rows,
       variantSelection,
       compareConfig,
     );
 
+    if (!analysis.ranking.length && analysis.warnings?.length) {
+      return res.status(400).json({
+        message: analysis.warnings[0],
+        warnings: analysis.warnings,
+      });
+    }
+
     return res.json({
-      scores: ranking.map((row) => ({
+      score_version: "compare_v2",
+      product_type: analysis.productType,
+      overall_winner: analysis.overallWinner,
+      category_winners: analysis.categoryWinners,
+      warnings: analysis.warnings || [],
+      scores: analysis.ranking.map((row) => ({
         product_id: Number(row.productId),
         overall_score: row.overallScore,
+        rank: row.rank,
+        confidence: row.confidence,
+        price: row.price,
+        reasons: row.reasons || [],
+        breakdown: row.breakdown || {},
+        details: row.details || {},
       })),
     });
   } catch (err) {
