@@ -4316,6 +4316,470 @@ const formatBlogPrice = (value) => {
   return `₹${Math.round(n).toLocaleString("en-IN")}`;
 };
 
+const AFFILIATE_PLACEMENT_STATUSES = new Set([
+  "draft",
+  "published",
+  "unpublished",
+]);
+const AFFILIATE_PLACEMENT_SCOPE_TYPES = new Set([
+  "global",
+  "product",
+  "blog",
+  "brand",
+  "category",
+]);
+const AFFILIATE_PAGE_TYPES = new Set([
+  "product_list",
+  "product_detail",
+  "news",
+]);
+const AFFILIATE_LIST_SLOTS = new Set(["listing_featured", "product_card"]);
+const AFFILIATE_DETAIL_SLOTS = new Set(["detail_highlight", "store_panel"]);
+const AFFILIATE_NEWS_SLOTS = new Set(["inline_after_intro", "article_end"]);
+
+const toNullableTrimmedText = (value, maxLength = 5000) => {
+  if (value === null || value === undefined) return null;
+  const cleaned = cleanText(value, maxLength);
+  return cleaned ? String(cleaned).trim() : null;
+};
+
+const parseAffiliateBooleanInput = (value, fallback = false) => {
+  if (value === true || value === false) return value;
+  if (value === 1 || value === 0) return Boolean(value);
+  if (value === null || value === undefined || value === "") return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
+  return fallback;
+};
+
+const normalizeAffiliateStatus = (value, fallback = "draft") => {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  return AFFILIATE_PLACEMENT_STATUSES.has(normalized) ? normalized : fallback;
+};
+
+const normalizeAffiliateScopeType = (value, fallback = "global") => {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  return AFFILIATE_PLACEMENT_SCOPE_TYPES.has(normalized)
+    ? normalized
+    : fallback;
+};
+
+const normalizeAffiliatePageType = (value) => {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  return AFFILIATE_PAGE_TYPES.has(normalized) ? normalized : "";
+};
+
+const normalizeAffiliateSlot = (pageType, value) => {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  if (pageType === "product_list") {
+    return AFFILIATE_LIST_SLOTS.has(normalized)
+      ? normalized
+      : "product_card";
+  }
+  if (pageType === "product_detail") {
+    return AFFILIATE_DETAIL_SLOTS.has(normalized)
+      ? normalized
+      : "detail_highlight";
+  }
+  if (pageType === "news") {
+    return AFFILIATE_NEWS_SLOTS.has(normalized)
+      ? normalized
+      : "inline_after_intro";
+  }
+  return normalized;
+};
+
+const normalizeAffiliateIdList = (value) => {
+  const source = Array.isArray(value)
+    ? value
+    : value === null || value === undefined
+      ? []
+      : String(value)
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean);
+
+  return Array.from(
+    new Set(
+      source
+        .map((item) => Number(item))
+        .filter((item) => Number.isInteger(item) && item > 0),
+    ),
+  );
+};
+
+const normalizeAffiliateSlug = (value, fallback = "affiliate-link") =>
+  toBlogSlug(value, fallback).slice(0, 120);
+
+const parseAffiliateDateValue = (value) => {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "__invalid__";
+  return parsed.toISOString();
+};
+
+const addDaysToIsoDate = (isoValue, days) => {
+  const start = new Date(isoValue);
+  if (Number.isNaN(start.getTime())) return null;
+  const next = new Date(start.getTime());
+  next.setUTCDate(next.getUTCDate() + Math.max(0, Math.floor(days)));
+  return next.toISOString();
+};
+
+const resolveAffiliateEffectiveUnpublishAt = (placement) => {
+  if (!placement) return null;
+  const explicitValue = placement.unpublish_at || placement.unpublishAt || null;
+  if (explicitValue) return explicitValue;
+
+  const durationDays = Number(placement.duration_days ?? placement.durationDays);
+  if (!Number.isFinite(durationDays) || durationDays <= 0) return null;
+
+  const startValue =
+    placement.publish_at ||
+    placement.publishAt ||
+    placement.created_at ||
+    placement.createdAt ||
+    null;
+  if (!startValue) return null;
+
+  return addDaysToIsoDate(startValue, durationDays);
+};
+
+const getAffiliatePlacementLifecycleState = (placement, now = new Date()) => {
+  const status = normalizeAffiliateStatus(placement?.status, "draft");
+  if (status === "draft") return "draft";
+  if (status === "unpublished") return "unpublished";
+
+  const publishAtValue = placement?.publish_at || placement?.publishAt || null;
+  if (publishAtValue) {
+    const publishAt = new Date(publishAtValue);
+    if (!Number.isNaN(publishAt.getTime()) && publishAt > now) {
+      return "scheduled";
+    }
+  }
+
+  const effectiveEndValue = resolveAffiliateEffectiveUnpublishAt(placement);
+  if (effectiveEndValue) {
+    const effectiveEnd = new Date(effectiveEndValue);
+    if (!Number.isNaN(effectiveEnd.getTime()) && effectiveEnd < now) {
+      return "expired";
+    }
+  }
+
+  return status === "published" ? "active" : status;
+};
+
+const isAffiliatePlacementLive = (placement, now = new Date()) =>
+  getAffiliatePlacementLifecycleState(placement, now) === "active";
+
+const isAffiliatePageAllowed = (placement, pageType) => {
+  if (!placement || !pageType) return false;
+  if (pageType === "product_list")
+    return parseAffiliateBooleanInput(
+      placement.allow_product_list ?? placement.allowProductList,
+      false,
+    );
+  if (pageType === "product_detail")
+    return parseAffiliateBooleanInput(
+      placement.allow_product_detail ?? placement.allowProductDetail,
+      false,
+    );
+  if (pageType === "news")
+    return parseAffiliateBooleanInput(
+      placement.allow_news ?? placement.allowNews,
+      false,
+    );
+  return false;
+};
+
+const resolveAffiliateCurrentSlot = (placement, pageType) => {
+  if (pageType === "product_list") {
+    return normalizeAffiliateSlot(
+      pageType,
+      placement?.list_slot ?? placement?.listSlot,
+    );
+  }
+  if (pageType === "product_detail") {
+    return normalizeAffiliateSlot(
+      pageType,
+      placement?.detail_slot ?? placement?.detailSlot,
+    );
+  }
+  if (pageType === "news") {
+    return normalizeAffiliateSlot(
+      pageType,
+      placement?.news_slot ?? placement?.newsSlot,
+    );
+  }
+  return "";
+};
+
+const normalizeAffiliateDeviceType = (value, userAgent = "") => {
+  const explicit = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (["mobile", "tablet", "desktop"].includes(explicit)) return explicit;
+
+  const ua = String(userAgent || "").toLowerCase();
+  if (/ipad|tablet|playbook|silk/i.test(ua)) return "tablet";
+  if (/mobi|android|iphone|ipod/i.test(ua)) return "mobile";
+  return "desktop";
+};
+
+const getAffiliateScopeSpecificityWeight = (matchType) => {
+  switch (matchType) {
+    case "blog":
+      return 520;
+    case "product":
+      return 500;
+    case "brand":
+      return 360;
+    case "category":
+      return 320;
+    case "global":
+      return 180;
+    default:
+      return 0;
+  }
+};
+
+const getAffiliateFreshnessWeight = (placement, now = new Date()) => {
+  const publishedValue =
+    placement?.publish_at ||
+    placement?.publishAt ||
+    placement?.created_at ||
+    placement?.createdAt ||
+    null;
+  if (!publishedValue) return 0;
+
+  const publishedAt = new Date(publishedValue);
+  if (Number.isNaN(publishedAt.getTime())) return 0;
+
+  const ageDays = Math.max(
+    0,
+    Math.floor((now.getTime() - publishedAt.getTime()) / 86400000),
+  );
+
+  if (ageDays <= 7) return 45;
+  if (ageDays <= 30) return 30;
+  if (ageDays <= 90) return 15;
+  return 5;
+};
+
+const getAffiliateClickWeight = (placement) => {
+  const totalClicks = Number(placement?.total_clicks ?? placement?.totalClicks);
+  if (!Number.isFinite(totalClicks) || totalClicks <= 0) return 0;
+  return Math.min(60, Math.round(Math.log10(totalClicks + 1) * 25));
+};
+
+const buildAffiliatePlacementScore = (placement, matchType, now = new Date()) => {
+  const priority = Number(placement?.priority) || 0;
+  return (
+    priority * 100 +
+    getAffiliateScopeSpecificityWeight(matchType) +
+    getAffiliateFreshnessWeight(placement, now) +
+    getAffiliateClickWeight(placement) +
+    (placement?.price ? 10 : 0)
+  );
+};
+
+const normalizeAffiliatePlacementInput = (body = {}, { existing = null } = {}) => {
+  const nowIso = new Date().toISOString();
+  let publishAt = parseAffiliateDateValue(
+    body.publish_at ?? body.publishAt ?? existing?.publish_at,
+  );
+  const unpublishAt = parseAffiliateDateValue(
+    body.unpublish_at ?? body.unpublishAt ?? existing?.unpublish_at,
+  );
+
+  const status = normalizeAffiliateStatus(body.status ?? existing?.status, "draft");
+  const scopeType = normalizeAffiliateScopeType(
+    body.scope_type ?? body.scopeType ?? existing?.scope_type,
+    "global",
+  );
+  const durationRaw =
+    body.duration_days ?? body.durationDays ?? existing?.duration_days ?? null;
+  const durationValue = Number(durationRaw);
+  const durationDays =
+    Number.isFinite(durationValue) && durationValue > 0
+      ? Math.floor(durationValue)
+      : null;
+
+  if (status === "published" && (publishAt === undefined || publishAt === null)) {
+    publishAt = existing?.publish_at || nowIso;
+  }
+
+  const priceRaw = body.price ?? existing?.price ?? null;
+  const priceValue = Number(priceRaw);
+  const price =
+    Number.isFinite(priceValue) && priceValue > 0 ? priceValue : null;
+
+  const payload = {
+    name: toNullableTrimmedText(
+      body.name ?? existing?.name ?? body.title ?? existing?.title,
+      180,
+    ),
+    slug:
+      body.slug === undefined
+        ? existing?.slug ?? null
+        : toNullableTrimmedText(body.slug, 160),
+    title: toNullableTrimmedText(body.title ?? existing?.title, 220),
+    description: toNullableTrimmedText(
+      body.description ?? existing?.description,
+      4000,
+    ),
+    cta_text: toNullableTrimmedText(
+      body.cta_text ?? body.ctaText ?? existing?.cta_text,
+      80,
+    ),
+    cta_subtext: toNullableTrimmedText(
+      body.cta_subtext ?? body.ctaSubtext ?? existing?.cta_subtext,
+      180,
+    ),
+    badge_text: toNullableTrimmedText(
+      body.badge_text ?? body.badgeText ?? existing?.badge_text,
+      40,
+    ),
+    disclosure_text: toNullableTrimmedText(
+      body.disclosure_text ?? body.disclosureText ?? existing?.disclosure_text,
+      180,
+    ),
+    store_name: toNullableTrimmedText(
+      body.store_name ?? body.storeName ?? existing?.store_name,
+      120,
+    ),
+    store_logo_url: toNullableTrimmedText(
+      body.store_logo_url ?? body.storeLogoUrl ?? existing?.store_logo_url,
+      2000,
+    ),
+    image_url: toNullableTrimmedText(
+      body.image_url ?? body.imageUrl ?? existing?.image_url,
+      2000,
+    ),
+    destination_url: toNullableTrimmedText(
+      body.destination_url ?? body.destinationUrl ?? existing?.destination_url,
+      2000,
+    ),
+    affiliate_url: toNullableTrimmedText(
+      body.affiliate_url ?? body.affiliateUrl ?? existing?.affiliate_url,
+      2000,
+    ),
+    price,
+    currency_code:
+      toNullableTrimmedText(
+        body.currency_code ?? body.currencyCode ?? existing?.currency_code,
+        12,
+      ) || "INR",
+    priority: Math.max(
+      0,
+      Math.floor(Number(body.priority ?? existing?.priority ?? 0) || 0),
+    ),
+    status,
+    publish_at: publishAt === undefined ? existing?.publish_at ?? null : publishAt,
+    unpublish_at:
+      unpublishAt === undefined ? existing?.unpublish_at ?? null : unpublishAt,
+    duration_days: durationDays,
+    allow_product_list: parseAffiliateBooleanInput(
+      body.allow_product_list ??
+        body.allowProductList ??
+        existing?.allow_product_list,
+      false,
+    ),
+    allow_product_detail: parseAffiliateBooleanInput(
+      body.allow_product_detail ??
+        body.allowProductDetail ??
+        existing?.allow_product_detail,
+      false,
+    ),
+    allow_news: parseAffiliateBooleanInput(
+      body.allow_news ?? body.allowNews ?? existing?.allow_news,
+      false,
+    ),
+    scope_type: scopeType,
+    product_id: toPositiveInt(
+      body.product_id ?? body.productId ?? existing?.product_id,
+      null,
+    ),
+    blog_id: toPositiveInt(body.blog_id ?? body.blogId ?? existing?.blog_id, null),
+    brand_id: toPositiveInt(
+      body.brand_id ?? body.brandId ?? existing?.brand_id,
+      null,
+    ),
+    category_name: toNullableTrimmedText(
+      body.category_name ?? body.categoryName ?? existing?.category_name,
+      120,
+    ),
+    list_slot: normalizeAffiliateSlot(
+      "product_list",
+      body.list_slot ?? body.listSlot ?? existing?.list_slot,
+    ),
+    detail_slot: normalizeAffiliateSlot(
+      "product_detail",
+      body.detail_slot ?? body.detailSlot ?? existing?.detail_slot,
+    ),
+    news_slot: normalizeAffiliateSlot(
+      "news",
+      body.news_slot ?? body.newsSlot ?? existing?.news_slot,
+    ),
+  };
+
+  const errors = [];
+  if (!payload.name) errors.push("Name is required.");
+  if (!payload.destination_url && !payload.affiliate_url) {
+    errors.push("Add an affiliate URL or destination URL.");
+  }
+  if (
+    !payload.allow_product_list &&
+    !payload.allow_product_detail &&
+    !payload.allow_news
+  ) {
+    errors.push("Select at least one page permission.");
+  }
+  if (payload.publish_at === "__invalid__") {
+    errors.push("Publish date is invalid.");
+  }
+  if (payload.unpublish_at === "__invalid__") {
+    errors.push("Unpublish date is invalid.");
+  }
+  if (scopeType === "product" && !payload.product_id) {
+    errors.push("A product must be selected for product scope.");
+  }
+  if (scopeType === "blog" && !payload.blog_id) {
+    errors.push("A news article must be selected for blog scope.");
+  }
+  if (scopeType === "brand" && !payload.brand_id) {
+    errors.push("A brand must be selected for brand scope.");
+  }
+  if (scopeType === "category" && !payload.category_name) {
+    errors.push("A category is required for category scope.");
+  }
+
+  if (payload.publish_at && payload.unpublish_at) {
+    const publishDate = new Date(payload.publish_at);
+    const unpublishDate = new Date(payload.unpublish_at);
+    if (
+      !Number.isNaN(publishDate.getTime()) &&
+      !Number.isNaN(unpublishDate.getTime()) &&
+      unpublishDate < publishDate
+    ) {
+      errors.push("Unpublish date must be after the publish date.");
+    }
+  }
+
+  return { payload, errors };
+};
+
 const extractLowestVariantPrice = (variants = []) => {
   const numeric = [];
   for (const variant of Array.isArray(variants) ? variants : []) {
@@ -6496,6 +6960,91 @@ async function runMigrations() {
         END IF;
       END
       $$;
+    `);
+
+    // Affiliate placements with manual page permissions and schedule windows
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS affiliate_placements (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT NOT NULL UNIQUE,
+        title TEXT,
+        description TEXT,
+        cta_text TEXT,
+        cta_subtext TEXT,
+        badge_text TEXT,
+        disclosure_text TEXT,
+        store_name TEXT,
+        store_logo_url TEXT,
+        image_url TEXT,
+        destination_url TEXT,
+        affiliate_url TEXT,
+        price NUMERIC,
+        currency_code TEXT NOT NULL DEFAULT 'INR',
+        priority INT NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'draft',
+        publish_at TIMESTAMPTZ,
+        unpublish_at TIMESTAMPTZ,
+        duration_days INT,
+        allow_product_list BOOLEAN NOT NULL DEFAULT false,
+        allow_product_detail BOOLEAN NOT NULL DEFAULT false,
+        allow_news BOOLEAN NOT NULL DEFAULT false,
+        scope_type TEXT NOT NULL DEFAULT 'global',
+        product_id INT REFERENCES products(id) ON DELETE CASCADE,
+        blog_id INT REFERENCES blogs(id) ON DELETE CASCADE,
+        brand_id INT REFERENCES brands(id) ON DELETE CASCADE,
+        category_name TEXT,
+        list_slot TEXT NOT NULL DEFAULT 'product_card',
+        detail_slot TEXT NOT NULL DEFAULT 'detail_highlight',
+        news_slot TEXT NOT NULL DEFAULT 'inline_after_intro',
+        created_by INT REFERENCES "user"(id) ON DELETE SET NULL,
+        updated_by INT REFERENCES "user"(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_affiliate_placements_status_priority
+      ON affiliate_placements (status, priority DESC, created_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_affiliate_placements_scope
+      ON affiliate_placements (scope_type, product_id, blog_id, brand_id);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_affiliate_placements_page_flags
+      ON affiliate_placements (allow_product_list, allow_product_detail, allow_news);
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS affiliate_clicks (
+        id BIGSERIAL PRIMARY KEY,
+        placement_id INT NOT NULL REFERENCES affiliate_placements(id) ON DELETE CASCADE,
+        page_type TEXT,
+        slot TEXT,
+        product_id INT REFERENCES products(id) ON DELETE SET NULL,
+        blog_id INT REFERENCES blogs(id) ON DELETE SET NULL,
+        device_type TEXT,
+        referer TEXT,
+        user_agent TEXT,
+        ip_address TEXT,
+        target_url TEXT,
+        was_live BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_affiliate_clicks_placement_created
+      ON affiliate_clicks (placement_id, created_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_affiliate_clicks_page_created
+      ON affiliate_clicks (page_type, created_at DESC);
     `);
 
     // Popular feature clicks (analytics) - aggregated per day
@@ -16010,6 +16559,797 @@ app.delete("/api/brands/:id", authenticate, async (req, res) => {
   } catch (err) {
     console.error("DELETE /api/brands/:id error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+const buildAffiliatePlacementAdminRow = (row) => ({
+  ...row,
+  total_clicks: Number(row?.total_clicks || 0),
+  price:
+    row?.price === null || row?.price === undefined ? null : Number(row.price),
+  lifecycle_state: getAffiliatePlacementLifecycleState(row),
+  effective_unpublish_at: resolveAffiliateEffectiveUnpublishAt(row),
+  is_live: isAffiliatePlacementLive(row),
+});
+
+const readAffiliatePlacementAdminRowById = async (placementId) => {
+  const result = await db.query(
+    `
+    SELECT
+      ap.*,
+      p.name AS product_name,
+      p.product_type,
+      bl.title AS blog_title,
+      bl.slug AS blog_slug,
+      br.name AS brand_name,
+      COALESCE(clicks.total_clicks, 0)::int AS total_clicks,
+      clicks.last_clicked_at
+    FROM affiliate_placements ap
+    LEFT JOIN products p
+      ON p.id = ap.product_id
+    LEFT JOIN blogs bl
+      ON bl.id = ap.blog_id
+    LEFT JOIN brands br
+      ON br.id = ap.brand_id
+    LEFT JOIN (
+      SELECT
+        placement_id,
+        COUNT(*)::int AS total_clicks,
+        MAX(created_at) AS last_clicked_at
+      FROM affiliate_clicks
+      GROUP BY placement_id
+    ) clicks
+      ON clicks.placement_id = ap.id
+    WHERE ap.id = $1
+    LIMIT 1
+  `,
+    [placementId],
+  );
+
+  return result.rows[0] ? buildAffiliatePlacementAdminRow(result.rows[0]) : null;
+};
+
+const ensureUniqueAffiliatePlacementSlug = async (seed, excludeId = null) => {
+  const base = normalizeAffiliateSlug(seed, "affiliate-link");
+  let candidate = base;
+  let suffix = 2;
+
+  while (true) {
+    const query = excludeId
+      ? `SELECT id FROM affiliate_placements WHERE slug = $1 AND id <> $2 LIMIT 1`
+      : `SELECT id FROM affiliate_placements WHERE slug = $1 LIMIT 1`;
+    const params = excludeId ? [candidate, excludeId] : [candidate];
+    const existing = await db.query(query, params);
+
+    if (!existing.rows.length) return candidate;
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+};
+
+const readAffiliateBlogProductIds = async (blogId) => {
+  if (!Number.isInteger(Number(blogId)) || Number(blogId) <= 0) return [];
+
+  const result = await db.query(
+    `
+    SELECT product_id
+    FROM (
+      SELECT bp.product_id AS product_id, bp.position AS position, bp.id AS source_id
+      FROM blog_products bp
+      WHERE bp.blog_id = $1
+
+      UNION ALL
+
+      SELECT bl.product_id AS product_id, 999999 AS position, bl.id AS source_id
+      FROM blogs bl
+      WHERE bl.id = $1 AND bl.product_id IS NOT NULL
+    ) source
+    WHERE product_id IS NOT NULL
+    ORDER BY position ASC, source_id ASC
+  `,
+    [Number(blogId)],
+  );
+
+  return Array.from(
+    new Set(
+      (result.rows || [])
+        .map((row) => Number(row.product_id))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  );
+};
+
+const readAffiliateProductContexts = async (productIds = []) => {
+  const normalizedIds = normalizeAffiliateIdList(productIds);
+  if (!normalizedIds.length) return new Map();
+
+  const result = await db.query(
+    `
+    SELECT
+      p.id AS product_id,
+      p.product_type,
+      p.brand_id,
+      p.name AS product_name,
+      b.name AS brand_name,
+      LOWER(TRIM(COALESCE(s.category, ''))) AS category_name
+    FROM products p
+    LEFT JOIN brands b
+      ON b.id = p.brand_id
+    LEFT JOIN smartphones s
+      ON s.product_id = p.id
+    WHERE p.id = ANY($1::int[])
+  `,
+    [normalizedIds],
+  );
+
+  return new Map(
+    (result.rows || []).map((row) => [
+      Number(row.product_id),
+      {
+        product_id: Number(row.product_id),
+        product_type: String(row.product_type || "").trim().toLowerCase(),
+        brand_id: Number(row.brand_id) || null,
+        product_name: row.product_name || "",
+        brand_name: row.brand_name || "",
+        category_name: String(row.category_name || "").trim().toLowerCase(),
+      },
+    ]),
+  );
+};
+
+const resolveAffiliatePlacementMatches = (placement, context = {}) => {
+  const scopeType = normalizeAffiliateScopeType(placement?.scope_type, "global");
+  const blogId = Number(context.blogId) || null;
+  const primaryProductId = Number(context.primaryProductId) || null;
+  const productIds = normalizeAffiliateIdList(context.productIds);
+  const productContextById = context.productContextById || new Map();
+  const productContexts = productIds
+    .map((productId) => productContextById.get(productId))
+    .filter(Boolean);
+
+  if (scopeType === "global") {
+    return [
+      {
+        match_type: "global",
+        matched_product_id:
+          context.pageType === "product_list" ? null : primaryProductId,
+        matched_blog_id: blogId,
+      },
+    ];
+  }
+
+  if (scopeType === "product") {
+    const placementProductId = Number(placement?.product_id);
+    if (!Number.isInteger(placementProductId) || placementProductId <= 0) {
+      return [];
+    }
+    if (!productIds.includes(placementProductId)) return [];
+
+    return [
+      {
+        match_type: "product",
+        matched_product_id: placementProductId,
+        matched_blog_id: blogId,
+      },
+    ];
+  }
+
+  if (scopeType === "blog") {
+    const placementBlogId = Number(placement?.blog_id);
+    if (!Number.isInteger(placementBlogId) || placementBlogId <= 0) return [];
+    if (!blogId || placementBlogId !== blogId) return [];
+
+    return [
+      {
+        match_type: "blog",
+        matched_product_id: primaryProductId,
+        matched_blog_id: blogId,
+      },
+    ];
+  }
+
+  if (scopeType === "brand") {
+    const brandId = Number(placement?.brand_id);
+    if (!Number.isInteger(brandId) || brandId <= 0) return [];
+
+    return productContexts
+      .filter((row) => Number(row.brand_id) === brandId)
+      .map((row) => ({
+        match_type: "brand",
+        matched_product_id: row.product_id,
+        matched_blog_id: blogId,
+      }));
+  }
+
+  if (scopeType === "category") {
+    const categoryName = String(placement?.category_name || "")
+      .trim()
+      .toLowerCase();
+    if (!categoryName) return [];
+
+    return productContexts
+      .filter((row) => row.category_name === categoryName)
+      .map((row) => ({
+        match_type: "category",
+        matched_product_id: row.product_id,
+        matched_blog_id: blogId,
+      }));
+  }
+
+  return [];
+};
+
+const serializeAffiliatePlacementForPublic = (
+  placement,
+  match,
+  pageType,
+  now = new Date(),
+) => ({
+  id: Number(placement.id),
+  name: placement.name || "",
+  slug: placement.slug || "",
+  title: placement.title || placement.name || "",
+  description: placement.description || "",
+  cta_text: placement.cta_text || "View offer",
+  cta_subtext: placement.cta_subtext || "",
+  badge_text: placement.badge_text || "",
+  disclosure_text: placement.disclosure_text || "Affiliate",
+  store_name: placement.store_name || "",
+  store_logo_url: placement.store_logo_url || "",
+  image_url: placement.image_url || "",
+  destination_url: placement.destination_url || "",
+  affiliate_url: placement.affiliate_url || "",
+  target_url: placement.affiliate_url || placement.destination_url || "",
+  price:
+    placement.price === null || placement.price === undefined
+      ? null
+      : Number(placement.price),
+  currency_code: placement.currency_code || "INR",
+  priority: Number(placement.priority || 0),
+  scope_type: placement.scope_type || "global",
+  slot: resolveAffiliateCurrentSlot(placement, pageType),
+  match_type: match.match_type || "global",
+  match_score: buildAffiliatePlacementScore(placement, match.match_type, now),
+  matched_product_id: match.matched_product_id || null,
+  matched_blog_id: match.matched_blog_id || null,
+  total_clicks: Number(placement.total_clicks || 0),
+  lifecycle_state: getAffiliatePlacementLifecycleState(placement, now),
+  effective_unpublish_at: resolveAffiliateEffectiveUnpublishAt(placement),
+  product_name: placement.product_name || "",
+  product_type: placement.product_type || "",
+  blog_title: placement.blog_title || "",
+  blog_slug: placement.blog_slug || "",
+  brand_name: placement.brand_name || "",
+});
+
+/* -----------------------
+  Affiliate placements
+------------------------*/
+app.get("/api/admin/affiliate-placements/options", authenticate, async (req, res) => {
+  try {
+    const [productsRes, blogsRes, brandsRes, categoriesRes] = await Promise.all([
+      db.query(`
+        SELECT
+          p.id,
+          p.name,
+          p.product_type,
+          b.name AS brand_name,
+          s.category,
+          COALESCE(pp.is_published, false) AS is_published
+        FROM products p
+        INNER JOIN smartphones s
+          ON s.product_id = p.id
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        LEFT JOIN product_publish pp
+          ON pp.product_id = p.id
+        ORDER BY COALESCE(pp.is_published, false) DESC, p.id DESC
+        LIMIT 250
+      `),
+      db.query(`
+        SELECT id, title, slug, status, updated_at
+        FROM blogs
+        WHERE status IN ('draft', 'published')
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 150
+      `),
+      db.query(`
+        SELECT id, name, logo
+        FROM brands
+        ORDER BY name ASC
+      `),
+      db.query(`
+        SELECT id, name, product_type
+        FROM categories
+        ORDER BY name ASC
+      `),
+    ]);
+
+    return res.json({
+      products: productsRes.rows || [],
+      blogs: blogsRes.rows || [],
+      brands: brandsRes.rows || [],
+      categories: categoriesRes.rows || [],
+    });
+  } catch (err) {
+    console.error("GET /api/admin/affiliate-placements/options error:", err);
+    return res.status(500).json({ message: "Failed to load affiliate options" });
+  }
+});
+
+app.get("/api/admin/affiliate-placements", authenticate, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        ap.*,
+        p.name AS product_name,
+        p.product_type,
+        bl.title AS blog_title,
+        bl.slug AS blog_slug,
+        br.name AS brand_name,
+        COALESCE(clicks.total_clicks, 0)::int AS total_clicks,
+        clicks.last_clicked_at
+      FROM affiliate_placements ap
+      LEFT JOIN products p
+        ON p.id = ap.product_id
+      LEFT JOIN blogs bl
+        ON bl.id = ap.blog_id
+      LEFT JOIN brands br
+        ON br.id = ap.brand_id
+      LEFT JOIN (
+        SELECT
+          placement_id,
+          COUNT(*)::int AS total_clicks,
+          MAX(created_at) AS last_clicked_at
+        FROM affiliate_clicks
+        GROUP BY placement_id
+      ) clicks
+        ON clicks.placement_id = ap.id
+      ORDER BY ap.updated_at DESC, ap.id DESC
+    `);
+
+    return res.json({
+      rows: (result.rows || []).map(buildAffiliatePlacementAdminRow),
+    });
+  } catch (err) {
+    console.error("GET /api/admin/affiliate-placements error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to fetch affiliate placements" });
+  }
+});
+
+app.post("/api/admin/affiliate-placements", authenticate, async (req, res) => {
+  try {
+    const { payload, errors } = normalizeAffiliatePlacementInput(req.body || {});
+    if (payload.scope_type !== "product") payload.product_id = null;
+    if (payload.scope_type !== "blog") payload.blog_id = null;
+    if (payload.scope_type !== "brand") payload.brand_id = null;
+    if (payload.scope_type !== "category") payload.category_name = null;
+
+    if (errors.length) {
+      return res.status(400).json({ message: errors[0], errors });
+    }
+
+    const slug = await ensureUniqueAffiliatePlacementSlug(
+      payload.slug || payload.name || payload.title || "affiliate-link",
+    );
+
+    const result = await db.query(
+      `
+      INSERT INTO affiliate_placements (
+        name,
+        slug,
+        title,
+        description,
+        cta_text,
+        cta_subtext,
+        badge_text,
+        disclosure_text,
+        store_name,
+        store_logo_url,
+        image_url,
+        destination_url,
+        affiliate_url,
+        price,
+        currency_code,
+        priority,
+        status,
+        publish_at,
+        unpublish_at,
+        duration_days,
+        allow_product_list,
+        allow_product_detail,
+        allow_news,
+        scope_type,
+        product_id,
+        blog_id,
+        brand_id,
+        category_name,
+        list_slot,
+        detail_slot,
+        news_slot,
+        created_by,
+        updated_by
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33
+      )
+      RETURNING *
+    `,
+      [
+        payload.name,
+        slug,
+        payload.title,
+        payload.description,
+        payload.cta_text,
+        payload.cta_subtext,
+        payload.badge_text,
+        payload.disclosure_text,
+        payload.store_name,
+        payload.store_logo_url,
+        payload.image_url,
+        payload.destination_url,
+        payload.affiliate_url,
+        payload.price,
+        payload.currency_code,
+        payload.priority,
+        payload.status,
+        payload.publish_at,
+        payload.unpublish_at,
+        payload.duration_days,
+        payload.allow_product_list,
+        payload.allow_product_detail,
+        payload.allow_news,
+        payload.scope_type,
+        payload.product_id,
+        payload.blog_id,
+        payload.brand_id,
+        payload.category_name,
+        payload.list_slot,
+        payload.detail_slot,
+        payload.news_slot,
+        req.user?.id ?? null,
+        req.user?.id ?? null,
+      ],
+    );
+
+    const adminRow = await readAffiliatePlacementAdminRowById(result.rows[0].id);
+
+    return res.status(201).json({
+      message: "Affiliate placement created",
+      data: adminRow || buildAffiliatePlacementAdminRow(result.rows[0]),
+    });
+  } catch (err) {
+    console.error("POST /api/admin/affiliate-placements error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to create affiliate placement" });
+  }
+});
+
+app.put("/api/admin/affiliate-placements/:id", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: "Invalid affiliate placement id" });
+    }
+
+    const existing = await db.query(
+      `SELECT * FROM affiliate_placements WHERE id = $1 LIMIT 1`,
+      [id],
+    );
+    if (!existing.rows.length) {
+      return res.status(404).json({ message: "Affiliate placement not found" });
+    }
+
+    const { payload, errors } = normalizeAffiliatePlacementInput(req.body || {}, {
+      existing: existing.rows[0],
+    });
+    if (payload.scope_type !== "product") payload.product_id = null;
+    if (payload.scope_type !== "blog") payload.blog_id = null;
+    if (payload.scope_type !== "brand") payload.brand_id = null;
+    if (payload.scope_type !== "category") payload.category_name = null;
+
+    if (errors.length) {
+      return res.status(400).json({ message: errors[0], errors });
+    }
+
+    const slug = await ensureUniqueAffiliatePlacementSlug(
+      payload.slug || payload.name || payload.title || existing.rows[0].slug,
+      id,
+    );
+
+    const result = await db.query(
+      `
+      UPDATE affiliate_placements
+      SET
+        name = $1,
+        slug = $2,
+        title = $3,
+        description = $4,
+        cta_text = $5,
+        cta_subtext = $6,
+        badge_text = $7,
+        disclosure_text = $8,
+        store_name = $9,
+        store_logo_url = $10,
+        image_url = $11,
+        destination_url = $12,
+        affiliate_url = $13,
+        price = $14,
+        currency_code = $15,
+        priority = $16,
+        status = $17,
+        publish_at = $18,
+        unpublish_at = $19,
+        duration_days = $20,
+        allow_product_list = $21,
+        allow_product_detail = $22,
+        allow_news = $23,
+        scope_type = $24,
+        product_id = $25,
+        blog_id = $26,
+        brand_id = $27,
+        category_name = $28,
+        list_slot = $29,
+        detail_slot = $30,
+        news_slot = $31,
+        updated_by = $32,
+        updated_at = NOW()
+      WHERE id = $33
+      RETURNING *
+    `,
+      [
+        payload.name,
+        slug,
+        payload.title,
+        payload.description,
+        payload.cta_text,
+        payload.cta_subtext,
+        payload.badge_text,
+        payload.disclosure_text,
+        payload.store_name,
+        payload.store_logo_url,
+        payload.image_url,
+        payload.destination_url,
+        payload.affiliate_url,
+        payload.price,
+        payload.currency_code,
+        payload.priority,
+        payload.status,
+        payload.publish_at,
+        payload.unpublish_at,
+        payload.duration_days,
+        payload.allow_product_list,
+        payload.allow_product_detail,
+        payload.allow_news,
+        payload.scope_type,
+        payload.product_id,
+        payload.blog_id,
+        payload.brand_id,
+        payload.category_name,
+        payload.list_slot,
+        payload.detail_slot,
+        payload.news_slot,
+        req.user?.id ?? null,
+        id,
+      ],
+    );
+
+    const adminRow = await readAffiliatePlacementAdminRowById(result.rows[0].id);
+
+    return res.json({
+      message: "Affiliate placement updated",
+      data: adminRow || buildAffiliatePlacementAdminRow(result.rows[0]),
+    });
+  } catch (err) {
+    console.error("PUT /api/admin/affiliate-placements/:id error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to update affiliate placement" });
+  }
+});
+
+app.delete("/api/admin/affiliate-placements/:id", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: "Invalid affiliate placement id" });
+    }
+
+    const result = await db.query(
+      `DELETE FROM affiliate_placements WHERE id = $1`,
+      [id],
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ message: "Affiliate placement not found" });
+    }
+
+    return res.json({ message: "Affiliate placement deleted" });
+  } catch (err) {
+    console.error("DELETE /api/admin/affiliate-placements/:id error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to delete affiliate placement" });
+  }
+});
+
+app.get("/api/public/affiliate-placements", async (req, res) => {
+  try {
+    const pageType = normalizeAffiliatePageType(
+      req.query.pageType ?? req.query.page_type,
+    );
+    if (!pageType) {
+      return res.status(400).json({ message: "pageType is required" });
+    }
+
+    const pageColumn =
+      pageType === "product_list"
+        ? "allow_product_list"
+        : pageType === "product_detail"
+          ? "allow_product_detail"
+          : "allow_news";
+    const primaryProductId = toPositiveInt(
+      req.query.productId ?? req.query.product_id,
+      null,
+    );
+    const blogId = toPositiveInt(req.query.blogId ?? req.query.blog_id, null);
+    const requestedProductIds = Array.from(
+      new Set([
+        ...normalizeAffiliateIdList(
+          req.query.productIds ?? req.query.product_ids ?? [],
+        ),
+        ...(primaryProductId ? [primaryProductId] : []),
+      ]),
+    );
+    const blogProductIds = blogId ? await readAffiliateBlogProductIds(blogId) : [];
+    const candidateProductIds = Array.from(
+      new Set([...requestedProductIds, ...blogProductIds]),
+    );
+    const productContextById = await readAffiliateProductContexts(
+      candidateProductIds,
+    );
+    const context = {
+      pageType,
+      blogId,
+      primaryProductId: primaryProductId || candidateProductIds[0] || null,
+      productIds: candidateProductIds,
+      productContextById,
+    };
+    const now = new Date();
+
+    const result = await db.query(
+      `
+      SELECT
+        ap.*,
+        p.name AS product_name,
+        p.product_type,
+        bl.title AS blog_title,
+        bl.slug AS blog_slug,
+        br.name AS brand_name,
+        COALESCE(clicks.total_clicks, 0)::int AS total_clicks
+      FROM affiliate_placements ap
+      LEFT JOIN products p
+        ON p.id = ap.product_id
+      LEFT JOIN blogs bl
+        ON bl.id = ap.blog_id
+      LEFT JOIN brands br
+        ON br.id = ap.brand_id
+      LEFT JOIN (
+        SELECT placement_id, COUNT(*)::int AS total_clicks
+        FROM affiliate_clicks
+        GROUP BY placement_id
+      ) clicks
+        ON clicks.placement_id = ap.id
+      WHERE ap.status = 'published'
+        AND ap.${pageColumn} = true
+      ORDER BY ap.priority DESC, ap.updated_at DESC, ap.id DESC
+    `,
+    );
+
+    const placements = [];
+    for (const row of result.rows || []) {
+      if (!isAffiliatePlacementLive(row, now)) continue;
+      const matches = resolveAffiliatePlacementMatches(row, context);
+      for (const match of matches) {
+        placements.push(
+          serializeAffiliatePlacementForPublic(row, match, pageType, now),
+        );
+      }
+    }
+
+    placements.sort((left, right) => {
+      if (right.match_score !== left.match_score) {
+        return right.match_score - left.match_score;
+      }
+      return Number(right.id || 0) - Number(left.id || 0);
+    });
+
+    return res.json({
+      pageType,
+      placements,
+    });
+  } catch (err) {
+    console.error("GET /api/public/affiliate-placements error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to fetch affiliate placements" });
+  }
+});
+
+app.get("/api/public/affiliate-redirect/:id", async (req, res) => {
+  try {
+    const placementId = Number(req.params.id);
+    if (!Number.isInteger(placementId) || placementId <= 0) {
+      return res.status(400).send("Invalid affiliate placement");
+    }
+
+    const result = await db.query(
+      `SELECT * FROM affiliate_placements WHERE id = $1 LIMIT 1`,
+      [placementId],
+    );
+    const placement = result.rows[0];
+    if (!placement) {
+      return res.status(404).send("Affiliate placement not found");
+    }
+
+    const targetUrl =
+      String(placement.affiliate_url || "").trim() ||
+      String(placement.destination_url || "").trim();
+    if (!targetUrl) {
+      return res.status(404).send("Affiliate destination not available");
+    }
+
+    const pageType =
+      normalizeAffiliatePageType(req.query.pageType ?? req.query.page_type) ||
+      null;
+    const slot = toNullableTrimmedText(req.query.slot, 80);
+    const productId = toPositiveInt(
+      req.query.productId ?? req.query.product_id,
+      null,
+    );
+    const blogId = toPositiveInt(req.query.blogId ?? req.query.blog_id, null);
+    const deviceType = normalizeAffiliateDeviceType(
+      req.query.deviceType ?? req.query.device_type,
+      req.get("user-agent") || "",
+    );
+
+    await db.query(
+      `
+      INSERT INTO affiliate_clicks (
+        placement_id,
+        page_type,
+        slot,
+        product_id,
+        blog_id,
+        device_type,
+        referer,
+        user_agent,
+        ip_address,
+        target_url,
+        was_live
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    `,
+      [
+        placementId,
+        pageType,
+        slot,
+        productId,
+        blogId,
+        deviceType,
+        req.get("referer") || null,
+        req.get("user-agent") || null,
+        req.ip || null,
+        targetUrl,
+        isAffiliatePlacementLive(placement),
+      ],
+    );
+
+    return res.redirect(302, targetUrl);
+  } catch (err) {
+    console.error("GET /api/public/affiliate-redirect/:id error:", err);
+    return res.status(500).send("Unable to open affiliate destination");
   }
 });
 
