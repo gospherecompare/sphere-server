@@ -4328,6 +4328,7 @@ const AFFILIATE_PLACEMENT_SCOPE_TYPES = new Set([
   "brand",
   "category",
 ]);
+const AFFILIATE_SOURCE_TYPES = new Set(["manual", "auto"]);
 const AFFILIATE_PAGE_TYPES = new Set([
   "product_list",
   "product_detail",
@@ -4369,6 +4370,13 @@ const normalizeAffiliateScopeType = (value, fallback = "global") => {
     : fallback;
 };
 
+const normalizeAffiliateSourceType = (value, fallback = "manual") => {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  return AFFILIATE_SOURCE_TYPES.has(normalized) ? normalized : fallback;
+};
+
 const normalizeAffiliatePageType = (value) => {
   const normalized = String(value || "")
     .trim()
@@ -4398,6 +4406,17 @@ const normalizeAffiliateSlot = (pageType, value) => {
   }
   return normalized;
 };
+
+const normalizeAffiliateComparisonText = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase();
+
+const normalizeAffiliateComparisonUrl = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\/+$/g, "");
 
 const normalizeAffiliateIdList = (value) => {
   const source = Array.isArray(value)
@@ -4583,10 +4602,16 @@ const getAffiliateClickWeight = (placement) => {
   return Math.min(60, Math.round(Math.log10(totalClicks + 1) * 25));
 };
 
+const getAffiliateSourceWeight = (placement) =>
+  normalizeAffiliateSourceType(placement?.source_type, "manual") === "manual"
+    ? 60
+    : 0;
+
 const buildAffiliatePlacementScore = (placement, matchType, now = new Date()) => {
   const priority = Number(placement?.priority) || 0;
   return (
     priority * 100 +
+    getAffiliateSourceWeight(placement) +
     getAffiliateScopeSpecificityWeight(matchType) +
     getAffiliateFreshnessWeight(placement, now) +
     getAffiliateClickWeight(placement) +
@@ -6968,6 +6993,10 @@ async function runMigrations() {
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
         slug TEXT NOT NULL UNIQUE,
+        source_type TEXT NOT NULL DEFAULT 'manual',
+        auto_key TEXT,
+        auto_variant_id INT REFERENCES product_variants(id) ON DELETE SET NULL,
+        auto_store_price_id INT REFERENCES variant_store_prices(id) ON DELETE SET NULL,
         title TEXT,
         description TEXT,
         cta_text TEXT,
@@ -7005,6 +7034,14 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
+      ALTER TABLE affiliate_placements
+      ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'manual',
+      ADD COLUMN IF NOT EXISTS auto_key TEXT,
+      ADD COLUMN IF NOT EXISTS auto_variant_id INT REFERENCES product_variants(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS auto_store_price_id INT REFERENCES variant_store_prices(id) ON DELETE SET NULL;
+    `);
+
+    await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_affiliate_placements_status_priority
       ON affiliate_placements (status, priority DESC, created_at DESC);
     `);
@@ -7017,6 +7054,17 @@ async function runMigrations() {
     await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_affiliate_placements_page_flags
       ON affiliate_placements (allow_product_list, allow_product_detail, allow_news);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_affiliate_placements_source_type
+      ON affiliate_placements (source_type, product_id, updated_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_affiliate_placements_auto_key_unique
+      ON affiliate_placements (auto_key)
+      WHERE auto_key IS NOT NULL;
     `);
 
     await safeQuery(`
@@ -16564,6 +16612,8 @@ app.delete("/api/brands/:id", authenticate, async (req, res) => {
 
 const buildAffiliatePlacementAdminRow = (row) => ({
   ...row,
+  source_type: normalizeAffiliateSourceType(row?.source_type, "manual"),
+  is_auto: normalizeAffiliateSourceType(row?.source_type, "manual") === "auto",
   total_clicks: Number(row?.total_clicks || 0),
   price:
     row?.price === null || row?.price === undefined ? null : Number(row.price),
@@ -16697,6 +16747,411 @@ const readAffiliateProductContexts = async (productIds = []) => {
   );
 };
 
+const readAutoAffiliateOfferSources = async ({
+  productIds = [],
+  latestLimit = 250,
+} = {}) => {
+  const normalizedIds = normalizeAffiliateIdList(productIds);
+  const params = [];
+  let whereSql = `
+    WHERE p.product_type = 'smartphone'
+      AND COALESCE(pp.is_published, false) = true
+      AND sp.url IS NOT NULL
+      AND BTRIM(sp.url) <> ''
+  `;
+
+  if (normalizedIds.length) {
+    params.push(normalizedIds);
+    whereSql += ` AND p.id = ANY($${params.length}::int[])`;
+  }
+
+  const limitSql =
+    normalizedIds.length || !Number.isFinite(Number(latestLimit))
+      ? ""
+      : ` LIMIT ${Math.max(1, Math.min(500, Math.floor(Number(latestLimit))))}`;
+
+  const result = await db.query(
+    `
+    WITH ranked_store_rows AS (
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        p.product_type,
+        p.brand_id,
+        p.created_at AS product_created_at,
+        b.name AS brand_name,
+        LOWER(TRIM(COALESCE(s.category, ''))) AS category_name,
+        s.launch_date,
+        v.id AS variant_id,
+        sp.id AS store_price_id,
+        sp.store_name,
+        sp.price,
+        sp.url,
+        sp.offer_text,
+        sp.sale_start_date,
+        os.logo AS store_logo_url,
+        (
+          SELECT pi.image_url
+          FROM product_images pi
+          WHERE pi.product_id = p.id
+          ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+          LIMIT 1
+        ) AS image_url,
+        ROW_NUMBER() OVER (
+          PARTITION BY p.id
+          ORDER BY
+            CASE
+              WHEN sp.price IS NOT NULL AND sp.price > 0 THEN 0
+              ELSE 1
+            END ASC,
+            sp.price ASC NULLS LAST,
+            CASE
+              WHEN sp.url IS NOT NULL AND BTRIM(sp.url) <> '' THEN 0
+              ELSE 1
+            END ASC,
+            sp.sale_start_date DESC NULLS LAST,
+            sp.id ASC
+        ) AS row_rank
+      FROM products p
+      INNER JOIN smartphones s
+        ON s.product_id = p.id
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      LEFT JOIN product_publish pp
+        ON pp.product_id = p.id
+      INNER JOIN product_variants v
+        ON v.product_id = p.id
+      INNER JOIN variant_store_prices sp
+        ON sp.variant_id = v.id
+      LEFT JOIN online_stores os
+        ON LOWER(TRIM(os.name)) = LOWER(TRIM(sp.store_name))
+      ${whereSql}
+    )
+    SELECT *
+    FROM ranked_store_rows
+    WHERE row_rank = 1
+    ORDER BY COALESCE(sale_start_date, launch_date, product_created_at) DESC NULLS LAST, product_id DESC
+    ${limitSql}
+  `,
+    params,
+  );
+
+  return result.rows || [];
+};
+
+const buildAutoAffiliatePlacementPayloadFromOffer = (offer = {}) => {
+  const productId = Number(offer.product_id);
+  const productName = String(offer.product_name || "").trim();
+  const storeName = String(offer.store_name || "").trim();
+  const targetUrl = String(offer.url || "").trim();
+  const autoKey = `auto:product:${productId}:best-offer`;
+  const publishAt =
+    offer.sale_start_date ||
+    offer.launch_date ||
+    offer.product_created_at ||
+    new Date().toISOString();
+  const priceValue = Number(offer.price);
+  const price =
+    Number.isFinite(priceValue) && priceValue > 0 ? priceValue : null;
+  const safeProductName = productName || `Product ${productId}`;
+  const safeStoreName = storeName || "Online Store";
+
+  return {
+    name: `${safeProductName} Auto Offer`,
+    slug: normalizeAffiliateSlug(`auto-product-${productId}-best-offer`),
+    source_type: "auto",
+    auto_key: autoKey,
+    auto_variant_id: Number(offer.variant_id) || null,
+    auto_store_price_id: Number(offer.store_price_id) || null,
+    title: `${safeProductName} latest price on ${safeStoreName}`,
+    description:
+      String(offer.offer_text || "").trim() ||
+      `Auto-generated from live store pricing data for ${safeProductName}.`,
+    cta_text: "Check price",
+    cta_subtext: "Auto-generated from store data",
+    badge_text: "Latest Offer",
+    disclosure_text: "Affiliate link",
+    store_name: safeStoreName,
+    store_logo_url: String(offer.store_logo_url || "").trim() || null,
+    image_url: String(offer.image_url || "").trim() || null,
+    destination_url: targetUrl || null,
+    affiliate_url: targetUrl || null,
+    price,
+    currency_code: "INR",
+    priority: 0,
+    status: "published",
+    publish_at: publishAt,
+    unpublish_at: null,
+    duration_days: null,
+    allow_product_list: true,
+    allow_product_detail: true,
+    allow_news: true,
+    scope_type: "product",
+    product_id: productId || null,
+    blog_id: null,
+    brand_id: Number(offer.brand_id) || null,
+    category_name: String(offer.category_name || "").trim() || null,
+    list_slot: "product_card",
+    detail_slot: "detail_highlight",
+    news_slot: "inline_after_intro",
+  };
+};
+
+const syncAutoAffiliatePlacementsForProducts = async ({
+  productIds = [],
+  includeLatest = false,
+  latestLimit = 250,
+} = {}) => {
+  const normalizedIds = normalizeAffiliateIdList(productIds);
+  if (!normalizedIds.length && !includeLatest) return [];
+
+  const sourceRows = await readAutoAffiliateOfferSources({
+    productIds: normalizedIds,
+    latestLimit,
+  });
+  const sourceProductIds = Array.from(
+    new Set(
+      sourceRows
+        .map((row) => Number(row.product_id))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  );
+
+  const staleProductIds = normalizedIds.filter(
+    (productId) => !sourceProductIds.includes(productId),
+  );
+  if (staleProductIds.length) {
+    await db.query(
+      `
+      DELETE FROM affiliate_placements
+      WHERE source_type = 'auto'
+        AND product_id = ANY($1::int[])
+    `,
+      [staleProductIds],
+    );
+  }
+
+  const syncedIds = [];
+  for (const row of sourceRows) {
+    const payload = buildAutoAffiliatePlacementPayloadFromOffer(row);
+    const upsertResult = await db.query(
+      `
+      INSERT INTO affiliate_placements (
+        name,
+        slug,
+        source_type,
+        auto_key,
+        auto_variant_id,
+        auto_store_price_id,
+        title,
+        description,
+        cta_text,
+        cta_subtext,
+        badge_text,
+        disclosure_text,
+        store_name,
+        store_logo_url,
+        image_url,
+        destination_url,
+        affiliate_url,
+        price,
+        currency_code,
+        priority,
+        status,
+        publish_at,
+        unpublish_at,
+        duration_days,
+        allow_product_list,
+        allow_product_detail,
+        allow_news,
+        scope_type,
+        product_id,
+        blog_id,
+        brand_id,
+        category_name,
+        list_slot,
+        detail_slot,
+        news_slot,
+        created_by,
+        updated_by
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38
+      )
+      ON CONFLICT (auto_key)
+      WHERE auto_key IS NOT NULL
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        slug = EXCLUDED.slug,
+        source_type = EXCLUDED.source_type,
+        auto_variant_id = EXCLUDED.auto_variant_id,
+        auto_store_price_id = EXCLUDED.auto_store_price_id,
+        title = EXCLUDED.title,
+        description = EXCLUDED.description,
+        cta_text = EXCLUDED.cta_text,
+        cta_subtext = EXCLUDED.cta_subtext,
+        badge_text = EXCLUDED.badge_text,
+        disclosure_text = EXCLUDED.disclosure_text,
+        store_name = EXCLUDED.store_name,
+        store_logo_url = EXCLUDED.store_logo_url,
+        image_url = EXCLUDED.image_url,
+        destination_url = EXCLUDED.destination_url,
+        affiliate_url = EXCLUDED.affiliate_url,
+        price = EXCLUDED.price,
+        currency_code = EXCLUDED.currency_code,
+        priority = EXCLUDED.priority,
+        status = EXCLUDED.status,
+        publish_at = EXCLUDED.publish_at,
+        unpublish_at = EXCLUDED.unpublish_at,
+        duration_days = EXCLUDED.duration_days,
+        allow_product_list = EXCLUDED.allow_product_list,
+        allow_product_detail = EXCLUDED.allow_product_detail,
+        allow_news = EXCLUDED.allow_news,
+        scope_type = EXCLUDED.scope_type,
+        product_id = EXCLUDED.product_id,
+        blog_id = EXCLUDED.blog_id,
+        brand_id = EXCLUDED.brand_id,
+        category_name = EXCLUDED.category_name,
+        list_slot = EXCLUDED.list_slot,
+        detail_slot = EXCLUDED.detail_slot,
+        news_slot = EXCLUDED.news_slot,
+        updated_by = NULL,
+        updated_at = NOW()
+      RETURNING id
+    `,
+      [
+        payload.name,
+        payload.slug,
+        payload.source_type,
+        payload.auto_key,
+        payload.auto_variant_id,
+        payload.auto_store_price_id,
+        payload.title,
+        payload.description,
+        payload.cta_text,
+        payload.cta_subtext,
+        payload.badge_text,
+        payload.disclosure_text,
+        payload.store_name,
+        payload.store_logo_url,
+        payload.image_url,
+        payload.destination_url,
+        payload.affiliate_url,
+        payload.price,
+        payload.currency_code,
+        payload.priority,
+        payload.status,
+        payload.publish_at,
+        payload.unpublish_at,
+        payload.duration_days,
+        payload.allow_product_list,
+        payload.allow_product_detail,
+        payload.allow_news,
+        payload.scope_type,
+        payload.product_id,
+        payload.blog_id,
+        payload.brand_id,
+        payload.category_name,
+        payload.list_slot,
+        payload.detail_slot,
+        payload.news_slot,
+        null,
+        null,
+      ],
+    );
+    if (upsertResult.rows[0]?.id) syncedIds.push(Number(upsertResult.rows[0].id));
+  }
+
+  return syncedIds;
+};
+
+const resolveAffiliateDuplicateTargetProductIds = async (payload = {}) => {
+  const scopeType = normalizeAffiliateScopeType(payload.scope_type, "global");
+  if (scopeType === "product") {
+    return normalizeAffiliateIdList(payload.product_id ? [payload.product_id] : []);
+  }
+  if (scopeType === "blog") {
+    return payload.blog_id ? readAffiliateBlogProductIds(payload.blog_id) : [];
+  }
+  return [];
+};
+
+const hasAffiliatePageOverlap = (left = {}, right = {}) =>
+  Boolean(
+    (Boolean(left.allow_product_list) && Boolean(right.allow_product_list)) ||
+      (Boolean(left.allow_product_detail) &&
+        Boolean(right.allow_product_detail)) ||
+      (Boolean(left.allow_news) && Boolean(right.allow_news)),
+  );
+
+const findAutomaticAffiliateDuplicate = async (
+  payload = {},
+  { excludeId = null } = {},
+) => {
+  const targetProductIds = await resolveAffiliateDuplicateTargetProductIds(payload);
+  if (!targetProductIds.length) return null;
+
+  await syncAutoAffiliatePlacementsForProducts({ productIds: targetProductIds });
+
+  const comparisonUrl =
+    normalizeAffiliateComparisonUrl(payload.affiliate_url) ||
+    normalizeAffiliateComparisonUrl(payload.destination_url);
+  const comparisonStore = normalizeAffiliateComparisonText(payload.store_name);
+
+  const params = [targetProductIds];
+  let excludeSql = "";
+  if (excludeId) {
+    params.push(excludeId);
+    excludeSql = ` AND ap.id <> $${params.length}`;
+  }
+
+  const result = await db.query(
+    `
+    SELECT
+      ap.*,
+      p.name AS product_name,
+      b.name AS brand_name
+    FROM affiliate_placements ap
+    LEFT JOIN products p
+      ON p.id = ap.product_id
+    LEFT JOIN brands b
+      ON b.id = ap.brand_id
+    WHERE ap.source_type = 'auto'
+      AND ap.product_id = ANY($1::int[])
+      ${excludeSql}
+    ORDER BY ap.updated_at DESC, ap.id DESC
+  `,
+    params,
+  );
+
+  for (const row of result.rows || []) {
+    if (!hasAffiliatePageOverlap(payload, row)) continue;
+
+    const rowUrl =
+      normalizeAffiliateComparisonUrl(row.affiliate_url) ||
+      normalizeAffiliateComparisonUrl(row.destination_url);
+    const rowStore = normalizeAffiliateComparisonText(row.store_name);
+    const urlMatches = comparisonUrl && rowUrl && comparisonUrl === rowUrl;
+    const storeMatches = comparisonStore && rowStore && comparisonStore === rowStore;
+
+    if (urlMatches || storeMatches) {
+      return {
+        id: Number(row.id),
+        source_type: row.source_type,
+        product_id: Number(row.product_id) || null,
+        product_name: row.product_name || "",
+        brand_name: row.brand_name || "",
+        store_name: row.store_name || "",
+        title: row.title || row.name || "",
+        affiliate_url: row.affiliate_url || "",
+        destination_url: row.destination_url || "",
+      };
+    }
+  }
+
+  return null;
+};
+
 const resolveAffiliatePlacementMatches = (placement, context = {}) => {
   const scopeType = normalizeAffiliateScopeType(placement?.scope_type, "global");
   const blogId = Number(context.blogId) || null;
@@ -16805,6 +17260,7 @@ const serializeAffiliatePlacementForPublic = (
       ? null
       : Number(placement.price),
   currency_code: placement.currency_code || "INR",
+  source_type: normalizeAffiliateSourceType(placement.source_type, "manual"),
   priority: Number(placement.priority || 0),
   scope_type: placement.scope_type || "global",
   slot: resolveAffiliateCurrentSlot(placement, pageType),
@@ -16879,6 +17335,11 @@ app.get("/api/admin/affiliate-placements/options", authenticate, async (req, res
 
 app.get("/api/admin/affiliate-placements", authenticate, async (req, res) => {
   try {
+    await syncAutoAffiliatePlacementsForProducts({
+      includeLatest: true,
+      latestLimit: 250,
+    });
+
     const result = await db.query(`
       SELECT
         ap.*,
@@ -16929,6 +17390,15 @@ app.post("/api/admin/affiliate-placements", authenticate, async (req, res) => {
 
     if (errors.length) {
       return res.status(400).json({ message: errors[0], errors });
+    }
+
+    const duplicateAuto = await findAutomaticAffiliateDuplicate(payload);
+    if (duplicateAuto) {
+      return res.status(409).json({
+        message:
+          "An automatic affiliate placement already exists for this product/store combination.",
+        duplicate: duplicateAuto,
+      });
     }
 
     const slug = await ensureUniqueAffiliatePlacementSlug(
@@ -17042,6 +17512,12 @@ app.put("/api/admin/affiliate-placements/:id", authenticate, async (req, res) =>
     if (!existing.rows.length) {
       return res.status(404).json({ message: "Affiliate placement not found" });
     }
+    if (normalizeAffiliateSourceType(existing.rows[0].source_type) === "auto") {
+      return res.status(403).json({
+        message:
+          "Automatic affiliate placements are generated from product store data and cannot be edited manually.",
+      });
+    }
 
     const { payload, errors } = normalizeAffiliatePlacementInput(req.body || {}, {
       existing: existing.rows[0],
@@ -17053,6 +17529,17 @@ app.put("/api/admin/affiliate-placements/:id", authenticate, async (req, res) =>
 
     if (errors.length) {
       return res.status(400).json({ message: errors[0], errors });
+    }
+
+    const duplicateAuto = await findAutomaticAffiliateDuplicate(payload, {
+      excludeId: id,
+    });
+    if (duplicateAuto) {
+      return res.status(409).json({
+        message:
+          "An automatic affiliate placement already exists for this product/store combination.",
+        duplicate: duplicateAuto,
+      });
     }
 
     const slug = await ensureUniqueAffiliatePlacementSlug(
@@ -17158,13 +17645,24 @@ app.delete("/api/admin/affiliate-placements/:id", authenticate, async (req, res)
       return res.status(400).json({ message: "Invalid affiliate placement id" });
     }
 
+    const existing = await db.query(
+      `SELECT id, source_type FROM affiliate_placements WHERE id = $1 LIMIT 1`,
+      [id],
+    );
+    if (!existing.rows.length) {
+      return res.status(404).json({ message: "Affiliate placement not found" });
+    }
+    if (normalizeAffiliateSourceType(existing.rows[0].source_type) === "auto") {
+      return res.status(403).json({
+        message:
+          "Automatic affiliate placements are generated from product store data and cannot be deleted manually.",
+      });
+    }
+
     const result = await db.query(
       `DELETE FROM affiliate_placements WHERE id = $1`,
       [id],
     );
-    if (!result.rowCount) {
-      return res.status(404).json({ message: "Affiliate placement not found" });
-    }
 
     return res.json({ message: "Affiliate placement deleted" });
   } catch (err) {
@@ -17218,6 +17716,12 @@ app.get("/api/public/affiliate-placements", async (req, res) => {
       productContextById,
     };
     const now = new Date();
+
+    if (candidateProductIds.length) {
+      await syncAutoAffiliatePlacementsForProducts({
+        productIds: candidateProductIds,
+      });
+    }
 
     const result = await db.query(
       `
