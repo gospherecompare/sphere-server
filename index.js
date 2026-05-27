@@ -16976,7 +16976,7 @@ const syncAutoAffiliatePlacementsForProducts = async ({
         updated_by
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38
+        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37
       )
       ON CONFLICT (auto_key)
       WHERE auto_key IS NOT NULL
@@ -17065,6 +17065,19 @@ const syncAutoAffiliatePlacementsForProducts = async ({
   return syncedIds;
 };
 
+const safeSyncAutoAffiliatePlacementsForProducts = async (
+  options = {},
+  label = "Affiliate auto-sync failed",
+) => {
+  try {
+    const ids = await syncAutoAffiliatePlacementsForProducts(options);
+    return { ok: true, ids };
+  } catch (err) {
+    console.error(label, err);
+    return { ok: false, ids: [], error: err };
+  }
+};
+
 const resolveAffiliateDuplicateTargetProductIds = async (payload = {}) => {
   const scopeType = normalizeAffiliateScopeType(payload.scope_type, "global");
   if (scopeType === "product") {
@@ -17091,7 +17104,10 @@ const findAutomaticAffiliateDuplicate = async (
   const targetProductIds = await resolveAffiliateDuplicateTargetProductIds(payload);
   if (!targetProductIds.length) return null;
 
-  await syncAutoAffiliatePlacementsForProducts({ productIds: targetProductIds });
+  await safeSyncAutoAffiliatePlacementsForProducts(
+    { productIds: targetProductIds },
+    "Automatic affiliate duplicate sync failed:",
+  );
 
   const comparisonUrl =
     normalizeAffiliateComparisonUrl(payload.affiliate_url) ||
@@ -17335,10 +17351,13 @@ app.get("/api/admin/affiliate-placements/options", authenticate, async (req, res
 
 app.get("/api/admin/affiliate-placements", authenticate, async (req, res) => {
   try {
-    await syncAutoAffiliatePlacementsForProducts({
-      includeLatest: true,
-      latestLimit: 250,
-    });
+    const syncState = await safeSyncAutoAffiliatePlacementsForProducts(
+      {
+        includeLatest: true,
+        latestLimit: 250,
+      },
+      "GET /api/admin/affiliate-placements auto-sync error:",
+    );
 
     const result = await db.query(`
       SELECT
@@ -17371,6 +17390,9 @@ app.get("/api/admin/affiliate-placements", authenticate, async (req, res) => {
 
     return res.json({
       rows: (result.rows || []).map(buildAffiliatePlacementAdminRow),
+      warnings: syncState.ok
+        ? []
+        : ["Automatic affiliate sync failed. Showing existing placements only."],
     });
   } catch (err) {
     console.error("GET /api/admin/affiliate-placements error:", err);
@@ -17718,9 +17740,12 @@ app.get("/api/public/affiliate-placements", async (req, res) => {
     const now = new Date();
 
     if (candidateProductIds.length) {
-      await syncAutoAffiliatePlacementsForProducts({
-        productIds: candidateProductIds,
-      });
+      await safeSyncAutoAffiliatePlacementsForProducts(
+        {
+          productIds: candidateProductIds,
+        },
+        "GET /api/public/affiliate-placements auto-sync error:",
+      );
     }
 
     const result = await db.query(
