@@ -41,6 +41,9 @@ const {
   computeTvRawSpecScoreV2,
 } = require("./utils/tvSpecScore");
 const {
+  computeLaptopRawSpecScoreV2,
+} = require("./utils/laptopSpecScore");
+const {
   recomputeSmartphoneCompetitorAnalysis,
 } = require("./utils/competitorAnalysis");
 const {
@@ -3565,6 +3568,12 @@ const buildSpecScoreSource = (type, row) => {
       battery: toPlainObject(item.battery),
       software: toPlainObject(item.software),
       physical: toPlainObject(item.physical),
+      connectivity: toPlainObject(item.connectivity || metadata.connectivity),
+      ports: toPlainObject(item.ports),
+      multimedia: toPlainObject(item.multimedia),
+      security: toPlainObject(item.security),
+      camera: toPlainObject(item.camera),
+      warranty: toPlainObject(item.warranty || metadata.warranty),
       variants,
       images,
     };
@@ -4128,6 +4137,25 @@ const applySpecScoreToRow = (type, row, profiles) => {
       : null;
     specScoreV2CategoryCoverage = v2.categoryCoverage || null;
     specScoreV2Version = v2.version || null;
+  } else if (normalizedType === "laptop") {
+    const v2 = computeLaptopRawSpecScoreV2(source);
+    specScoreV2 = toFiniteScore100(v2.rawScore);
+    specScoreV2Raw = specScoreV2;
+    specScoreV2Source = v2.source;
+    overallScoreV2 = specScoreV2;
+    overallScoreV2Source =
+      specScoreV2 != null ? v2.source : "laptop_spec_score_v1_unavailable";
+    specScorePrice = toFiniteNumberOrNull(v2.price);
+    specScorePriceBand = v2.priceBand || "unknown";
+    specFeatureCoverage = toFiniteNumberOrNull(v2.featureCoverage);
+    specScoreV2Display8098 = mapScoreToDisplayBand(specScoreV2);
+    overallScoreV2Display8098 = specScoreV2Display8098;
+    specScoreV2Breakdown = v2.breakdown || null;
+    specScoreV2MatchedFeatures = Array.isArray(v2.matchedFeatures)
+      ? v2.matchedFeatures
+      : null;
+    specScoreV2CategoryCoverage = v2.categoryCoverage || null;
+    specScoreV2Version = v2.version || null;
   }
 
   const cameraWithScore =
@@ -4144,27 +4172,29 @@ const applySpecScoreToRow = (type, row, profiles) => {
           score: cameraScoreV2Display8099,
         }
       : row.camera_json;
-  const outputSpecScore = normalizedType === "tv" ? specScoreV2 : specScore;
+  const usesDedicatedSpecScoreV2 =
+    normalizedType === "tv" || normalizedType === "laptop";
+  const outputSpecScore = usesDedicatedSpecScoreV2 ? specScoreV2 : specScore;
   const outputSpecScoreSource =
-    normalizedType === "tv" ? specScoreV2Source : specScoreSource;
+    usesDedicatedSpecScoreV2 ? specScoreV2Source : specScoreSource;
   const outputOverallScore =
-    normalizedType === "tv" ? overallScoreV2 : overallScore;
+    usesDedicatedSpecScoreV2 ? overallScoreV2 : overallScore;
   const outputOverallScoreSource =
-    normalizedType === "tv" ? overallScoreV2Source : overallScoreSource;
+    usesDedicatedSpecScoreV2 ? overallScoreV2Source : overallScoreSource;
   const outputSpecScoreDisplay =
-    normalizedType === "tv"
+    usesDedicatedSpecScoreV2
       ? specScoreV2
       : row.spec_score_display ?? row.specScoreDisplay;
   const outputOverallScoreDisplay =
-    normalizedType === "tv"
+    usesDedicatedSpecScoreV2
       ? specScoreV2
       : row.overall_score_display ?? row.overallScoreDisplay;
   const outputSpecScoreV2Display =
-    normalizedType === "tv"
+    usesDedicatedSpecScoreV2
       ? specScoreV2
       : row.spec_score_v2_display ?? row.specScoreV2Display;
   const outputOverallScoreV2Display =
-    normalizedType === "tv"
+    usesDedicatedSpecScoreV2
       ? specScoreV2
       : row.overall_score_v2_display ?? row.overallScoreV2Display;
 
@@ -4316,6 +4346,15 @@ const toPublicTvResponseRow = (row) =>
 
 const toPublicTvCatalogResponseRow = (row) =>
   omitResponseKeys(toPublicTvResponseRow(row), TV_CATALOG_INTERNAL_TREND_KEYS);
+
+const toPublicLaptopResponseRow = (row) =>
+  omitResponseKeys(row, TV_PUBLIC_SCORE_INTERNAL_KEYS);
+
+const toPublicLaptopCatalogResponseRow = (row) =>
+  omitResponseKeys(
+    toPublicLaptopResponseRow(row),
+    TV_CATALOG_INTERNAL_TREND_KEYS,
+  );
 
 const BLOG_ALLOWED_PRODUCT_TYPES = new Set(["smartphone", "laptop", "tv"]);
 const BLOG_ALLOWED_STATUSES = new Set(["draft", "published"]);
@@ -13526,7 +13565,7 @@ app.get("/api/laptops", async (req, res) => {
       "laptop",
       (result.rows || []).map(toCanonicalLaptopProductResponse),
       profileConfig.profiles,
-    );
+    ).map(toPublicLaptopCatalogResponseRow);
     res.json({ laptops });
   } catch (err) {
     console.error("GET /api/laptops error:", err);
@@ -20635,7 +20674,7 @@ app.get("/api/public/trending/laptops", async (req, res) => {
         };
       }),
       profileConfig.profiles,
-    );
+    ).map(toPublicLaptopResponseRow);
 
     return res.json({
       period: "7d",
@@ -21081,7 +21120,7 @@ app.get("/api/public/new/laptops", async (req, res) => {
         variants: [],
       })),
       profileConfig.profiles,
-    );
+    ).map(toPublicLaptopResponseRow);
 
     return res.json({ new: launches });
   } catch (err) {
