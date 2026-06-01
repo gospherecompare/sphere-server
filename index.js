@@ -4266,6 +4266,57 @@ const applySpecScoreToRows = (type, rows, profiles) => {
   });
 };
 
+const TV_PUBLIC_SCORE_INTERNAL_KEYS = new Set([
+  "field_profile",
+  "spec_score",
+  "spec_score_source",
+  "overall_score",
+  "overall_score_source",
+  "spec_score_display",
+  "overall_score_display",
+  "spec_score_v2_raw",
+  "spec_score_v2_source",
+  "overall_score_v2",
+  "overall_score_v2_source",
+  "spec_score_v2_display",
+  "overall_score_v2_display",
+  "spec_score_v2_display_80_98",
+  "overall_score_v2_display_80_98",
+  "spec_score_price",
+  "spec_score_price_band",
+  "spec_score_feature_coverage",
+  "spec_score_v2_breakdown",
+  "spec_score_v2_matched_features",
+  "spec_score_v2_category_coverage",
+  "spec_score_v2_version",
+  "camera_score_v2_raw",
+  "camera_score_v2_display_80_99",
+  "spec_tier_v2",
+]);
+
+const TV_CATALOG_INTERNAL_TREND_KEYS = new Set([
+  "hook_score",
+  "buyer_intent",
+  "trend_velocity",
+  "freshness",
+  "hook_calculated_at",
+]);
+
+const omitResponseKeys = (row, omittedKeys) => {
+  const cleaned = {};
+  for (const [key, value] of Object.entries(row || {})) {
+    if (omittedKeys.has(String(key).toLowerCase())) continue;
+    cleaned[key] = value;
+  }
+  return cleaned;
+};
+
+const toPublicTvResponseRow = (row) =>
+  omitResponseKeys(row, TV_PUBLIC_SCORE_INTERNAL_KEYS);
+
+const toPublicTvCatalogResponseRow = (row) =>
+  omitResponseKeys(toPublicTvResponseRow(row), TV_CATALOG_INTERNAL_TREND_KEYS);
+
 const BLOG_ALLOWED_PRODUCT_TYPES = new Set(["smartphone", "laptop", "tv"]);
 const BLOG_ALLOWED_STATUSES = new Set(["draft", "published"]);
 const BLOG_ALLOWED_CATEGORIES = new Set([
@@ -11787,6 +11838,14 @@ app.get("/api/public/blogs", async (req, res) => {
       ? rawCategory
       : null;
     const productId = toPositiveInt(req.query.productId, null);
+    const rawProductType = String(
+      req.query.productType || req.query.product_type || "",
+    )
+      .trim()
+      .toLowerCase();
+    const productType = BLOG_ALLOWED_PRODUCT_TYPES.has(rawProductType)
+      ? rawProductType
+      : null;
     const params = [limit];
     const whereClauses = [`bl.status = 'published'`];
 
@@ -11803,6 +11862,20 @@ app.get("/api/public/blogs", async (req, res) => {
           FROM blog_products bp
           WHERE bp.blog_id = bl.id
             AND bp.product_id = $${params.length}
+        )
+      `);
+    }
+
+    if (productType) {
+      params.push(productType);
+      whereClauses.push(`
+        EXISTS (
+          SELECT 1
+          FROM blog_products bp
+          INNER JOIN products related_product
+            ON related_product.id = bp.product_id
+          WHERE bp.blog_id = bl.id
+            AND related_product.product_type = $${params.length}
         )
       `);
     }
@@ -11886,6 +11959,7 @@ app.get("/api/public/blogs", async (req, res) => {
       limit,
       category,
       productId,
+      productType,
       blogs,
     });
   } catch (err) {
@@ -14243,11 +14317,6 @@ app.get("/api/tvs", async (req, res) => {
         t.category,
         t.model,
         COALESCE(pub.is_published, false) AS publish,
-        ds.hook_score,
-        ds.buyer_intent,
-        ds.trend_velocity,
-        ds.freshness,
-        ds.calculated_at AS hook_calculated_at,
 
         t.key_specs_json,
         t.basic_info_json,
@@ -14351,7 +14420,7 @@ app.get("/api/tvs", async (req, res) => {
       "tv",
       (result.rows || []).map((row) => stripScoreRecursively(row || {})),
       profileConfig.profiles,
-    );
+    ).map(toPublicTvCatalogResponseRow);
     return res.json({ tvs });
   } catch (err) {
     console.error("GET /api/tvs error:", err);
@@ -20796,7 +20865,7 @@ app.get("/api/public/trending/tvs", async (req, res) => {
         };
       }),
       profileConfig.profiles,
-    );
+    ).map(toPublicTvResponseRow);
 
     return res.json({
       period: "7d",
@@ -21130,7 +21199,7 @@ app.get("/api/public/new/tvs", async (req, res) => {
       "tv",
       result.rows || [],
       profileConfig.profiles,
-    );
+    ).map(toPublicTvResponseRow);
 
     return res.json({ new: launches });
   } catch (err) {
