@@ -38,6 +38,9 @@ const {
   weightsToPercent,
 } = require("./utils/compareScoring");
 const {
+  computeTvRawSpecScoreV2,
+} = require("./utils/tvSpecScore");
+const {
   recomputeSmartphoneCompetitorAnalysis,
 } = require("./utils/competitorAnalysis");
 const {
@@ -4082,6 +4085,10 @@ const applySpecScoreToRow = (type, row, profiles) => {
   let overallScoreV2Display8098 = null;
   let cameraScoreV2Raw = null;
   let cameraScoreV2Display8099 = null;
+  let specScoreV2Breakdown = null;
+  let specScoreV2MatchedFeatures = null;
+  let specScoreV2CategoryCoverage = null;
+  let specScoreV2Version = null;
 
   if (normalizedType === "smartphone") {
     const v2 = computeSmartphoneRawSpecScoreV2(source, fieldProfile);
@@ -4102,6 +4109,25 @@ const applySpecScoreToRow = (type, row, profiles) => {
       cameraScoreV2Raw != null
         ? mapScoreToDisplayBand(cameraScoreV2Raw, 80, 99)
         : null;
+  } else if (normalizedType === "tv") {
+    const v2 = computeTvRawSpecScoreV2(source);
+    specScoreV2 = toFiniteScore100(v2.rawScore);
+    specScoreV2Raw = specScoreV2;
+    specScoreV2Source = v2.source;
+    overallScoreV2 = specScoreV2;
+    overallScoreV2Source =
+      specScoreV2 != null ? v2.source : "tv_spec_score_v1_unavailable";
+    specScorePrice = toFiniteNumberOrNull(v2.price);
+    specScorePriceBand = v2.priceBand || "unknown";
+    specFeatureCoverage = toFiniteNumberOrNull(v2.featureCoverage);
+    specScoreV2Display8098 = mapScoreToDisplayBand(specScoreV2);
+    overallScoreV2Display8098 = specScoreV2Display8098;
+    specScoreV2Breakdown = v2.breakdown || null;
+    specScoreV2MatchedFeatures = Array.isArray(v2.matchedFeatures)
+      ? v2.matchedFeatures
+      : null;
+    specScoreV2CategoryCoverage = v2.categoryCoverage || null;
+    specScoreV2Version = v2.version || null;
   }
 
   const cameraWithScore =
@@ -4118,26 +4144,57 @@ const applySpecScoreToRow = (type, row, profiles) => {
           score: cameraScoreV2Display8099,
         }
       : row.camera_json;
+  const outputSpecScore = normalizedType === "tv" ? specScoreV2 : specScore;
+  const outputSpecScoreSource =
+    normalizedType === "tv" ? specScoreV2Source : specScoreSource;
+  const outputOverallScore =
+    normalizedType === "tv" ? overallScoreV2 : overallScore;
+  const outputOverallScoreSource =
+    normalizedType === "tv" ? overallScoreV2Source : overallScoreSource;
+  const outputSpecScoreDisplay =
+    normalizedType === "tv"
+      ? specScoreV2
+      : row.spec_score_display ?? row.specScoreDisplay;
+  const outputOverallScoreDisplay =
+    normalizedType === "tv"
+      ? specScoreV2
+      : row.overall_score_display ?? row.overallScoreDisplay;
+  const outputSpecScoreV2Display =
+    normalizedType === "tv"
+      ? specScoreV2
+      : row.spec_score_v2_display ?? row.specScoreV2Display;
+  const outputOverallScoreV2Display =
+    normalizedType === "tv"
+      ? specScoreV2
+      : row.overall_score_v2_display ?? row.overallScoreV2Display;
 
   return {
     ...row,
     camera: cameraWithScore,
     camera_json: cameraJsonWithScore,
     field_profile: fieldProfile,
-    spec_score: specScore,
-    spec_score_source: specScoreSource,
-    overall_score: overallScore,
-    overall_score_source: overallScoreSource,
+    spec_score: outputSpecScore,
+    spec_score_source: outputSpecScoreSource,
+    overall_score: outputOverallScore,
+    overall_score_source: outputOverallScoreSource,
+    spec_score_display: outputSpecScoreDisplay,
+    overall_score_display: outputOverallScoreDisplay,
     spec_score_v2_raw: specScoreV2Raw,
     spec_score_v2: specScoreV2,
     spec_score_v2_source: specScoreV2Source,
     overall_score_v2: overallScoreV2,
     overall_score_v2_source: overallScoreV2Source,
+    spec_score_v2_display: outputSpecScoreV2Display,
+    overall_score_v2_display: outputOverallScoreV2Display,
     spec_score_v2_display_80_98: specScoreV2Display8098,
     overall_score_v2_display_80_98: overallScoreV2Display8098,
     spec_score_price: specScorePrice,
     spec_score_price_band: specScorePriceBand,
     spec_score_feature_coverage: specFeatureCoverage,
+    spec_score_v2_breakdown: specScoreV2Breakdown,
+    spec_score_v2_matched_features: specScoreV2MatchedFeatures,
+    spec_score_v2_category_coverage: specScoreV2CategoryCoverage,
+    spec_score_v2_version: specScoreV2Version,
     camera_score_v2_raw: cameraScoreV2Raw,
     camera_score_v2_display_80_99: cameraScoreV2Display8099,
     spec_tier_v2: toSpecTier(specScoreV2),
