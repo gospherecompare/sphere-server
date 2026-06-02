@@ -53,7 +53,7 @@ app.set("trust proxy", 1);
 const ALLOWED_ORIGINS = new Set([
   "http://localhost:3000",
   "http://localhost:5173",
-  "https://main.d2jgd4xy0rohx4.amplifyapp.com",
+  "https://main.d8c9hzzm0g9ux.amplifyapp.com",
   "https://www.tryhook.shop",
   "https://tryhook.shop",
 ]);
@@ -3867,8 +3867,7 @@ const PENDING_LOGIN_TOKEN_TTL_SECONDS = 15 * 60;
 const PENDING_LOGIN_TOKEN_TTL = `${PENDING_LOGIN_TOKEN_TTL_SECONDS}s`;
 const WEBAUTHN_CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const WEBAUTHN_RP_NAME =
-  String(process.env.WEBAUTHN_RP_NAME || "Hooks Admin").trim() ||
-  "Hooks Admin";
+  String(process.env.WEBAUTHN_RP_NAME || "Hooks Admin").trim() || "Hooks Admin";
 
 const normalizeOrigin = (value) =>
   String(value || "")
@@ -3876,9 +3875,7 @@ const normalizeOrigin = (value) =>
     .replace(/\/$/, "");
 
 const WEBAUTHN_ALLOWED_ORIGINS = new Set([
-  ...Array.from(ALLOWED_ORIGINS)
-    .map(normalizeOrigin)
-    .filter(Boolean),
+  ...Array.from(ALLOWED_ORIGINS).map(normalizeOrigin).filter(Boolean),
   ...String(process.env.WEBAUTHN_ALLOWED_ORIGINS || "")
     .split(",")
     .map(normalizeOrigin)
@@ -4210,7 +4207,9 @@ async function storeWebAuthnChallenge({
   const loginTicketHash = hashLoginTicket(loginTicket);
   const expiresAt = new Date(Date.now() + WEBAUTHN_CHALLENGE_TTL_MS);
 
-  await db.query(`DELETE FROM ${WEBAUTHN_CHALLENGE_TABLE} WHERE expires_at <= now()`);
+  await db.query(
+    `DELETE FROM ${WEBAUTHN_CHALLENGE_TABLE} WHERE expires_at <= now()`,
+  );
   await db.query(
     `DELETE FROM ${WEBAUTHN_CHALLENGE_TABLE}
      WHERE login_ticket_hash = $1
@@ -4511,10 +4510,7 @@ app.post(
         const nextMaxAttempts = Number(
           updated.rows[0]?.max_attempts || maxAttempts,
         );
-        const attemptsRemaining = Math.max(
-          0,
-          nextMaxAttempts - nextAttempts,
-        );
+        const attemptsRemaining = Math.max(0, nextMaxAttempts - nextAttempts);
 
         if (attemptsRemaining <= 0) {
           await client.query(
@@ -4614,7 +4610,8 @@ app.post(
       const expectedOrigin = getAllowedWebAuthnOrigin(req);
       if (!expectedOrigin) {
         return res.status(400).json({
-          message: "This browser origin is not allowed for device verification.",
+          message:
+            "This browser origin is not allowed for device verification.",
         });
       }
 
@@ -4723,7 +4720,10 @@ app.post(
           requireUserVerification: true,
         });
       } catch (verificationError) {
-        console.warn("WebAuthn authentication verification failed:", verificationError);
+        console.warn(
+          "WebAuthn authentication verification failed:",
+          verificationError,
+        );
         return res.status(401).json({
           message: "Device verification failed. Please try again.",
         });
@@ -4788,7 +4788,8 @@ app.post(
       const expectedOrigin = getAllowedWebAuthnOrigin(req);
       if (!expectedOrigin) {
         return res.status(400).json({
-          message: "This browser origin is not allowed for device verification.",
+          message:
+            "This browser origin is not allowed for device verification.",
         });
       }
 
@@ -4891,7 +4892,10 @@ app.post(
           requireUserVerification: true,
         });
       } catch (verificationError) {
-        console.warn("WebAuthn registration verification failed:", verificationError);
+        console.warn(
+          "WebAuthn registration verification failed:",
+          verificationError,
+        );
         return res.status(401).json({
           message: "Device setup failed. Please try again.",
         });
@@ -4951,35 +4955,31 @@ app.post(
   },
 );
 
-app.post(
-  "/api/auth/login/finalize",
-  loginInitiateLimiter,
-  async (req, res) => {
-    try {
-      const loginTicket = String(req.body?.loginTicket || "").trim();
-      const pendingLogin = verifyPendingLoginTicket(loginTicket);
+app.post("/api/auth/login/finalize", loginInitiateLimiter, async (req, res) => {
+  try {
+    const loginTicket = String(req.body?.loginTicket || "").trim();
+    const pendingLogin = verifyPendingLoginTicket(loginTicket);
 
-      if (!pendingLogin || pendingLogin.nextAction !== "device_setup") {
-        return res.status(401).json({
-          message: "Login session expired. Please sign in again.",
-        });
-      }
-
-      const user = await getAdminUserById(pendingLogin.id);
-      if (!user) {
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      await clearWebAuthnChallenges(loginTicket);
-      return res.json(buildSuccessfulAdminLoginResponse(user));
-    } catch (err) {
-      console.error("Finalize login error:", err);
-      return res.status(500).json({
-        message: "Unable to finish login. Please try again.",
+    if (!pendingLogin || pendingLogin.nextAction !== "device_setup") {
+      return res.status(401).json({
+        message: "Login session expired. Please sign in again.",
       });
     }
-  },
-);
+
+    const user = await getAdminUserById(pendingLogin.id);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    await clearWebAuthnChallenges(loginTicket);
+    return res.json(buildSuccessfulAdminLoginResponse(user));
+  } catch (err) {
+    console.error("Finalize login error:", err);
+    return res.status(500).json({
+      message: "Unable to finish login. Please try again.",
+    });
+  }
+});
 
 app.post(
   "/api/auth/login/resend-otp",
@@ -5055,9 +5055,10 @@ app.post(
         });
       }
 
-      const userResult = await client.query('SELECT * FROM "user" WHERE id = $1', [
-        challenge.user_id,
-      ]);
+      const userResult = await client.query(
+        'SELECT * FROM "user" WHERE id = $1',
+        [challenge.user_id],
+      );
       if (!userResult.rows.length) {
         await client.query("ROLLBACK");
         return res.status(404).json({ message: "User not found" });
@@ -5133,16 +5134,18 @@ app.post(
         });
       }
 
-      await db.query(
-        `UPDATE ${OTP_CHALLENGE_TABLE}
+      await db
+        .query(
+          `UPDATE ${OTP_CHALLENGE_TABLE}
          SET channels = $2::jsonb,
              resend_count = resend_count + 1,
              last_sent_at = now()
          WHERE challenge_id = $1`,
-        [challengeId, JSON.stringify(deliveryChannels)],
-      ).catch((err) => {
-        console.warn("Failed to update OTP resend metadata:", err);
-      });
+          [challengeId, JSON.stringify(deliveryChannels)],
+        )
+        .catch((err) => {
+          console.warn("Failed to update OTP resend metadata:", err);
+        });
 
       return res.json({
         message: "OTP sent again",
