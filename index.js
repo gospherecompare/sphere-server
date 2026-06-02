@@ -21068,7 +21068,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
   }
 });
 
-// New Launches - Laptops
+// Latest Entries - Laptops
 app.get("/api/public/new/laptops", async (req, res) => {
   try {
     const profileConfig = await readDeviceFieldProfilesConfig();
@@ -21089,7 +21089,7 @@ app.get("/api/public/new/laptops", async (req, res) => {
         l.physical,
         l.meta,
         l.spec_sections,
-        l.created_at AS launch_date,
+        COALESCE(l.created_at, p.created_at) AS created_at,
         (
           SELECT pi.image_url
           FROM product_images pi
@@ -21108,7 +21108,7 @@ app.get("/api/public/new/laptops", async (req, res) => {
       LEFT JOIN laptop l ON l.product_id = p.id
       INNER JOIN product_publish pub ON pub.product_id = p.id AND pub.is_published = true
       WHERE p.product_type = 'laptop'
-      ORDER BY COALESCE(l.created_at, p.created_at) DESC
+      ORDER BY COALESCE(l.created_at, p.created_at) DESC, p.id DESC
       LIMIT 20;
     `);
 
