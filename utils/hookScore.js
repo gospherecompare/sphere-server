@@ -29,7 +29,22 @@ const PRODUCT_TYPE_CONFIG = {
   },
   laptop: {
     joinClause: "INNER JOIN laptop l ON l.product_id = p.id",
-    launchAtSql: "COALESCE(l.created_at, p.created_at)",
+    launchAtSql: `
+      COALESCE(
+        CASE
+          WHEN NULLIF(TRIM(l.meta->>'launch_date'), '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+            THEN (l.meta->>'launch_date')::timestamptz
+          ELSE NULL
+        END,
+        CASE
+          WHEN NULLIF(TRIM(l.spec_sections#>>'{basic_info_json,launch_date}'), '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+            THEN (l.spec_sections#>>'{basic_info_json,launch_date}')::timestamptz
+          ELSE NULL
+        END,
+        l.created_at,
+        p.created_at
+      )
+    `,
     lockOffset: 2,
   },
   tv: {

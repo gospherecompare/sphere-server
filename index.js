@@ -1,6 +1,5 @@
 // index _fixed.js
 require("dotenv").config();
-const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
@@ -18,7 +17,7 @@ const { client, db } = require("./db");
 const multer = require("multer");
 const {
   sendRegistrationMail,
-  sendAdminOrganizationPinOtpEmail,
+  sendLoginOtpEmail,
   sendCareerApplicationEmail,
   sendCareerAssignmentEmail,
   sendCareerInterviewEmail,
@@ -38,64 +37,11 @@ const {
   weightsToPercent,
 } = require("./utils/compareScoring");
 const {
-  computeTvRawSpecScoreV2,
-} = require("./utils/tvSpecScore");
-const {
-  computeLaptopRawSpecScoreV2,
-} = require("./utils/laptopSpecScore");
-const {
   recomputeSmartphoneCompetitorAnalysis,
 } = require("./utils/competitorAnalysis");
-const {
-  normalizeText: normalizeComparePageText,
-  toFiniteNumber: toComparePageFiniteNumber,
-  toSlug: toComparePageSlug,
-  joinNamesWithoutCommas,
-  resolveSmartphoneSegmentLabel,
-  buildComparePageSlug,
-  buildComparePageTitle,
-  buildComparePageDescription,
-  buildAutomaticComparePageTitle,
-  buildAutomaticComparePageDescription,
-} = require("./utils/comparePageSeo");
-const {
-  cleanText,
-  cleanToken,
-  getSearchPopularityDevices,
-  normalizeProductType,
-  normalizeSearchQuery,
-  resolveSearchInterestProduct,
-} = require("./utils/searchPopularity");
-const { ensureProperHtmlEncoding } = require("./utils/htmlDecoder");
-const {
-  normalizeRole,
-  RBAC_MODULES,
-  ROLE_PRESETS,
-  getPermissionMatrix,
-  getAllPermissionCodes,
-  getRolePreset,
-  getDefaultPermissionsForRole,
-  permissionMatches,
-  hasPermissionSet,
-  hasAnyPermissionSet,
-  hasAllPermissionsSet,
-  getModulePermissionCode,
-  getModuleLabel,
-  getModuleActions,
-  isActionSupported,
-  normalizePermissionToken,
-} = require("./utils/rbac");
-const {
-  NEWS_PUSH_TOPIC,
-  isFirebaseAdminConfigured,
-  sendPublishedNewsPush,
-  subscribeTokenToTopic,
-  unsubscribeTokenFromTopic,
-} = require("./utils/newsPush");
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
-const compression = require("compression");
 
 const SECRET = process.env.JWT_SECRET || "smartarena_secret_key_25";
 const PORT = process.env.PORT || 5000;
@@ -107,7 +53,7 @@ app.set("trust proxy", 1);
 const ALLOWED_ORIGINS = new Set([
   "http://localhost:3000",
   "http://localhost:5173",
-  "https://main.d8c9hzzm0g9ux.amplifyapp.com",
+  "https://main.d2jgd4xy0rohx4.amplifyapp.com",
   "https://www.tryhook.shop",
   "https://tryhook.shop",
 ]);
@@ -126,54 +72,13 @@ app.use(
   }),
 );
 
-// Security middlewares - Enhanced with explicit HSTS
+// Security middlewares
 app.disable("x-powered-by");
-
-// Enable gzip compression for all responses (reduces file size by 70-80%)
-
-app.use(
-  helmet({
-    hsts: {
-      maxAge: 31536000, // 1 year in seconds
-      includeSubDomains: true,
-      preload: true,
-    },
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        styleSrc: ["'self'", "'unsafe-inline'", "fonts.googleapis.com"],
-        scriptSrc: [
-          "'self'",
-          "www.googletagmanager.com",
-          "pagead2.googlesyndication.com",
-        ],
-        fontSrc: ["'self'", "fonts.gstatic.com"],
-        imgSrc: ["'self'", "data:", "https:"],
-        connectSrc: ["'self'", "https:"],
-      },
-    },
-  }),
-);
+app.use(helmet());
 // Limit JSON body size to mitigate large payload abuse
 app.use(express.json({ limit: "10kb" }));
 // Parse URL-encoded bodies (for form submissions)
 app.use(express.urlencoded({ extended: true }));
-
-// ===== URL CANONICALIZATION MIDDLEWARE =====
-// Enforce canonical URL structure: https://tryhook.shop (non-www)
-// Only do essential redirects to avoid redirect chains
-app.use((req, res, next) => {
-  // Only redirect www to non-www if explicitly requested
-  // Skip for API endpoints and direct https traffic
-  if (req.hostname === "www.tryhook.shop") {
-    const newUrl = `https://tryhook.shop${req.originalUrl}`;
-    return res.redirect(301, newUrl);
-  }
-
-  // Let React Router handle trailing slashes and path normalization
-  // Avoid redirect chains
-  next();
-});
 
 const API_ALIAS_REWRITE_RULES = [
   { alias: /^\/api\/gateway\/catalog\/handset$/i, target: "/api/smartphones" },
@@ -334,50 +239,6 @@ app.use(function xssSafe(req, res, next) {
   next();
 });
 
-// ===== STATIC FILE SERVING FOR REACT SPA =====
-// Serve built React app from client/dist directory
-const distPath = path.join(__dirname, "../client/dist");
-const HASHED_STATIC_ASSET_PATTERN = /-[A-Za-z0-9_-]{8,}\.[^./\\]+$/i;
-
-const applyNoCacheHtmlHeaders = (res) => {
-  res.set("Cache-Control", "no-cache, no-store, must-revalidate");
-  res.set("Pragma", "no-cache");
-  res.set("Expires", "0");
-};
-
-const isHtmlFilePath = (filePath = "") =>
-  path.extname(String(filePath || "")).toLowerCase() === ".html";
-
-const isHashedStaticAsset = (filePath = "") =>
-  HASHED_STATIC_ASSET_PATTERN.test(path.basename(String(filePath || "")));
-
-const isDirectFileRequest = (requestPath = "") =>
-  Boolean(path.extname(String(requestPath || "")));
-
-app.use(
-  express.static(distPath, {
-    // Set proper cache control headers for static assets
-    setHeaders: (res, filePath) => {
-      if (isHtmlFilePath(filePath)) {
-        // HTML must be revalidated so it does not point at stale hashed bundles.
-        applyNoCacheHtmlHeaders(res);
-      }
-      // Cache static assets with hashes for 1 year (they won't change)
-      else if (isHashedStaticAsset(filePath)) {
-        res.set("Cache-Control", "public, max-age=31536000, immutable");
-      }
-      // Cache other non-hashed static files for 1 hour to allow updates.
-      else {
-        res.set("Cache-Control", "public, max-age=3600, must-revalidate");
-      }
-      // Ensure proper MIME types for JavaScript modules
-      if (filePath.endsWith(".js") || filePath.endsWith(".mjs")) {
-        res.set("Content-Type", "application/javascript; charset=utf-8");
-      }
-    },
-  }),
-);
-
 // Global rate limiting is not enabled, but targeted auth limits are applied below.
 
 // important for preflight
@@ -427,12 +288,19 @@ const resolveSmartphoneLaunchStage = (
   todayIndia = getIndiaDateOnly(),
 ) => {
   if (!device) return null;
-  const explicitStatus = normalizeLaunchStatusOverride(
+  const override = normalizeLaunchStatusOverride(
     device.launch_status_override ||
       device.launchStatusOverride ||
       device.launch_status ||
       device.launchStatus,
   );
+  if (override) return override;
+
+  const statusHint = normalizeLaunchStatusOverride(
+    device.status || device.availability || device.badge || device.status_text,
+  );
+  if (statusHint) return statusHint;
+
   const saleStartDirect = normalizeDateOnlyInput(
     device.sale_start_date ??
       device.saleStartDate ??
@@ -443,65 +311,14 @@ const resolveSmartphoneLaunchStage = (
   const saleStart =
     saleStartDirect ||
     getEarliestSaleStartDateFromVariants(device.variants || []);
-  const launchDate = normalizeDateOnlyInput(
-    device.launch_date || device.launchDate || null,
-  );
-
-  if (explicitStatus === "rumored" || explicitStatus === "announced") {
-    return explicitStatus;
-  }
-
-  if (explicitStatus === "released") {
-    return "released";
-  }
-
-  if (explicitStatus === "available") {
-    if (saleStart) {
-      if (todayIndia && saleStart > todayIndia) return "upcoming";
-      return "available";
-    }
-    return "available";
-  }
-
-  if (explicitStatus === "upcoming") {
-    if (saleStart) {
-      return todayIndia && saleStart > todayIndia ? "upcoming" : "released";
-    }
-    if (launchDate) {
-      return todayIndia && launchDate > todayIndia ? "upcoming" : "released";
-    }
-    return "released";
-  }
-
-  const statusHint = normalizeLaunchStatusOverride(
-    device.status || device.availability || device.badge || device.status_text,
-  );
-  if (statusHint) {
-    if (statusHint === "released") return "released";
-    if (statusHint === "available") {
-      if (saleStart) {
-        if (todayIndia && saleStart > todayIndia) return "upcoming";
-        return "available";
-      }
-      return "available";
-    }
-    if (statusHint === "upcoming") {
-      if (saleStart) {
-        return todayIndia && saleStart > todayIndia ? "upcoming" : "released";
-      }
-      if (launchDate) {
-        return todayIndia && launchDate > todayIndia ? "upcoming" : "released";
-      }
-      return "released";
-    }
-    return statusHint;
-  }
-
   if (saleStart) {
     if (todayIndia && saleStart <= todayIndia) return "available";
     return "upcoming";
   }
 
+  const launchDate = normalizeDateOnlyInput(
+    device.launch_date || device.launchDate || null,
+  );
   if (launchDate) {
     if (todayIndia && launchDate > todayIndia) return "upcoming";
     return "released";
@@ -513,112 +330,8 @@ const resolveSmartphoneLaunchStage = (
 const SMARTPHONE_COMPARE_LIMIT_DEFAULT = 4;
 const SMARTPHONE_COMPETITOR_LIMIT_DEFAULT = 5;
 
-const parseMarketPriceValue = (value) => {
-  if (value == null || value === "") return null;
-  const normalized = Number(String(value).replace(/[^0-9.]/g, ""));
-  return Number.isFinite(normalized) && normalized > 0 ? normalized : null;
-};
-
-const readArrayValue = (value) => {
-  if (Array.isArray(value)) return value;
-  if (typeof value !== "string") return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-};
-
-const hasStoreMarketSignal = (store) => {
-  if (!store || typeof store !== "object") return false;
-  return Boolean(
-    parseMarketPriceValue(
-      store.price ??
-        store.current_price ??
-        store.sale_price ??
-        store.offer_price ??
-        store.mrp,
-    ) ||
-    store.url ||
-    store.store ||
-    store.store_name ||
-    store.storeName ||
-    store.display_store_name ||
-    store.sale_start_date ||
-    store.saleStartDate ||
-    store.sale_date ||
-    store.saleDate ||
-    store.available_from ||
-    store.availableFrom,
-  );
-};
-
-const hasSpecScoreMarketSignal = (item) => {
-  if (!item || typeof item !== "object") return false;
-
-  if (
-    normalizeDateOnlyInput(
-      item.sale_start_date ??
-        item.saleStartDate ??
-        item.sale_date ??
-        item.saleDate ??
-        null,
-    )
-  ) {
-    return true;
-  }
-
-  if (
-    parseMarketPriceValue(
-      item.price ??
-        item.current_price ??
-        item.launch_price ??
-        item.starting_price ??
-        item.price_in_india ??
-        item.expected_price,
-    )
-  ) {
-    return true;
-  }
-
-  const directStores = readArrayValue(item.store_prices ?? item.storePrices);
-  if (directStores.some(hasStoreMarketSignal)) return true;
-
-  const variants = readArrayValue(item.variants);
-  return variants.some((variant) => {
-    if (!variant || typeof variant !== "object") return false;
-    if (
-      normalizeDateOnlyInput(
-        variant.sale_start_date ??
-          variant.saleStartDate ??
-          variant.sale_date ??
-          variant.saleDate ??
-          null,
-      )
-    ) {
-      return true;
-    }
-    if (
-      parseMarketPriceValue(
-        variant.price ??
-          variant.current_price ??
-          variant.launch_price ??
-          variant.starting_price ??
-          variant.expected_price,
-      )
-    ) {
-      return true;
-    }
-    return readArrayValue(variant.store_prices ?? variant.storePrices).some(
-      hasStoreMarketSignal,
-    );
-  });
-};
-
-const resolveSmartphoneLaunchPolicy = (launchStage, item = null) => {
+const resolveSmartphoneLaunchPolicy = (launchStage) => {
   const stage = normalizeLaunchStatusOverride(launchStage) || "released";
-  const hasMarketSignal = hasSpecScoreMarketSignal(item);
   const base = {
     allow_compare: true,
     allow_competitors: true,
@@ -643,14 +356,14 @@ const resolveSmartphoneLaunchPolicy = (launchStage, item = null) => {
       ...base,
       compare_limit: 2,
       competitor_limit: 2,
-      allow_spec_score: hasMarketSignal,
+      allow_spec_score: false,
     };
   }
 
   if (stage === "upcoming") {
     return {
       ...base,
-      allow_spec_score: hasMarketSignal,
+      allow_spec_score: false,
     };
   }
 
@@ -659,7 +372,7 @@ const resolveSmartphoneLaunchPolicy = (launchStage, item = null) => {
 
 const applySmartphoneLaunchPolicy = (item, launchStage) => {
   if (!item) return item;
-  const policy = resolveSmartphoneLaunchPolicy(launchStage, item);
+  const policy = resolveSmartphoneLaunchPolicy(launchStage);
   item.allow_compare = policy.allow_compare;
   item.allowCompare = policy.allow_compare;
   item.allow_competitors = policy.allow_competitors;
@@ -813,23 +526,6 @@ const normalizeDateOnlyInput = (value) => {
 
   const parsed = parseDateForImport(value);
   return parsed ? String(parsed).slice(0, 10) : null;
-};
-
-const toDateOnlyUtcMillis = (value) => {
-  const normalized = normalizeDateOnlyInput(value);
-  if (!normalized) return null;
-
-  const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!match) return null;
-
-  return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
-};
-
-const diffDateOnlyDays = (fromValue, toValue) => {
-  const fromUtc = toDateOnlyUtcMillis(fromValue);
-  const toUtc = toDateOnlyUtcMillis(toValue);
-  if (!Number.isFinite(fromUtc) || !Number.isFinite(toUtc)) return null;
-  return Math.round((toUtc - fromUtc) / 86400000);
 };
 
 const toOfferPriceNumber = (value) => {
@@ -1944,1360 +1640,6 @@ async function readDeviceFieldProfilesConfig() {
   };
 }
 
-const normalizeComparePageSlugInput = (value) => {
-  const raw = String(value || "")
-    .replace(/^\/+compare\/+/i, "")
-    .replace(/^compare\/+/i, "")
-    .replace(/^\/+|\/+$/g, "")
-    .trim();
-  if (!raw) return "";
-  const base = raw.replace(/-comparison$/i, "");
-  const slugBase = toComparePageSlug(base);
-  return slugBase ? `${slugBase}-comparison` : "";
-};
-
-const normalizeComparePageLabel = (value, maxLength = 160) =>
-  normalizeComparePageText(value).slice(0, Math.max(0, maxLength));
-
-const normalizeComparePageStatus = (value) =>
-  String(value || "")
-    .trim()
-    .toLowerCase() === "draft"
-    ? "draft"
-    : "published";
-
-const MANUAL_COMPARE_PAGE_SOURCE = "manual";
-const AUTOMATIC_COMPARE_PAGE_SOURCE = "automatic";
-
-const normalizeComparePageSource = (value) =>
-  String(value || "").trim().toLowerCase() === AUTOMATIC_COMPARE_PAGE_SOURCE
-    ? AUTOMATIC_COMPARE_PAGE_SOURCE
-    : MANUAL_COMPARE_PAGE_SOURCE;
-
-const buildComparePageKey = (productIds = []) =>
-  Array.from(
-    new Set(
-      (Array.isArray(productIds) ? productIds : [])
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0),
-    ),
-  )
-    .sort((left, right) => left - right)
-    .join(":");
-
-const buildProductPairKey = (leftId, rightId) => {
-  const left = Number(leftId);
-  const right = Number(rightId);
-  if (
-    !Number.isInteger(left) ||
-    !Number.isInteger(right) ||
-    left <= 0 ||
-    right <= 0 ||
-    left === right
-  ) {
-    return "";
-  }
-  return left < right ? `${left}:${right}` : `${right}:${left}`;
-};
-
-const collectComparePageTextFragments = (value, bucket = []) => {
-  if (value == null) return bucket;
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (trimmed) bucket.push(trimmed);
-    return bucket;
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    bucket.push(String(value));
-    return bucket;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) collectComparePageTextFragments(item, bucket);
-    return bucket;
-  }
-  if (typeof value === "object") {
-    for (const nested of Object.values(value)) {
-      collectComparePageTextFragments(nested, bucket);
-    }
-  }
-  return bucket;
-};
-
-const collectComparePageNumbers = (value, bucket = []) => {
-  if (value == null) return bucket;
-  if (typeof value === "number" && Number.isFinite(value)) {
-    bucket.push(value);
-    return bucket;
-  }
-  if (typeof value === "string") {
-    const matches = value.match(/-?\d+(?:\.\d+)?/g);
-    if (matches) {
-      for (const item of matches) {
-        const parsed = Number(item);
-        if (Number.isFinite(parsed)) bucket.push(parsed);
-      }
-    }
-    return bucket;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) collectComparePageNumbers(item, bucket);
-    return bucket;
-  }
-  if (typeof value === "object") {
-    for (const nested of Object.values(value)) {
-      collectComparePageNumbers(nested, bucket);
-    }
-  }
-  return bucket;
-};
-
-const readLargestComparePageNumber = (value, { min = null, max = null } = {}) => {
-  const numbers = collectComparePageNumbers(value, []).filter((item) => {
-    if (!Number.isFinite(item)) return false;
-    if (min != null && item < min) return false;
-    if (max != null && item > max) return false;
-    return true;
-  });
-  if (!numbers.length) return null;
-  return Math.max(...numbers);
-};
-
-const getDaysSinceDateOnly = (value, today = getIndiaDateOnly()) => {
-  const date = normalizeDateOnlyInput(value);
-  const normalizedToday = normalizeDateOnlyInput(today);
-  if (!date || !normalizedToday) return null;
-  return diffDateOnlyDays(date, normalizedToday);
-};
-
-const deriveSmartphoneTypeLabelFromProduct = (product = {}) => {
-  if (!product || typeof product !== "object") return "";
-
-  const fullText = normalizeComparePageText(
-    collectComparePageTextFragments(
-      [
-        product.name,
-        product.category,
-        product.model,
-        product.brand_name,
-        product.display,
-        product.performance,
-        product.camera,
-        product.battery,
-        product.network,
-        product.connectivity,
-        product.build_design,
-      ],
-      [],
-    ).join(" "),
-  ).toLowerCase();
-
-  const bestPrice = toComparePageFiniteNumber(product.best_price);
-  const segmentLabel = resolveSmartphoneSegmentLabel(bestPrice);
-  const batteryMah = readLargestComparePageNumber(product.battery, {
-    min: 2500,
-    max: 10000,
-  });
-  const chargingWatt = readLargestComparePageNumber(product.battery, {
-    min: 18,
-    max: 200,
-  });
-  const displaySize = readLargestComparePageNumber(product.display, {
-    min: 4.5,
-    max: 8,
-  });
-  const refreshRate = readLargestComparePageNumber(product.display, {
-    min: 80,
-    max: 240,
-  });
-  const cameraMp = readLargestComparePageNumber(product.camera, {
-    min: 8,
-    max: 250,
-  });
-  const daysSinceLaunch = getDaysSinceDateOnly(
-    product.sale_start_date || product.launch_date || null,
-  );
-
-  if (/\bflip\b/.test(fullText)) return "Flip Foldable";
-  if (/\bfold|foldable\b/.test(fullText)) return "Book Foldable";
-  if (/\brugged|mil[-\s]?std|armor\b/.test(fullText)) return "Rugged";
-  if (
-    /\bgaming\b|\brog\b|black shark|legion/.test(fullText) ||
-    (refreshRate != null && refreshRate >= 144) ||
-    ((segmentLabel === "Flagship" || segmentLabel === "Ultra Flagship") &&
-      chargingWatt != null &&
-      chargingWatt >= 100)
-  ) {
-    return "Gaming";
-  }
-  if (/\bselfie\b/.test(fullText)) return "Selfie";
-  if (
-    /\bperiscope\b|\btelephoto\b|\bzoom\b/.test(fullText) &&
-    ["Premium", "Flagship", "Ultra Flagship"].includes(segmentLabel)
-  ) {
-    return "Camera Flagship";
-  }
-  if (batteryMah != null && batteryMah >= 6000) return "Battery Focused";
-  if (chargingWatt != null && chargingWatt >= 90) return "Fast Charging";
-  if (
-    displaySize != null &&
-    displaySize <= 6.2 &&
-    !/\bplus\b|\bmax\b|\bultra\b/.test(fullText)
-  ) {
-    return "Compact";
-  }
-  if (/\bclean android\b|\bstock android\b|\bandroid one\b/.test(fullText)) {
-    return "Clean Android";
-  }
-  if (/\bslim\b|\bthin\b|\bdesign\b/.test(fullText)) return "Slim Design";
-  if (/\bai\b/.test(fullText)) return "AI";
-  if (cameraMp != null && cameraMp >= 50) {
-    return ["Premium", "Flagship", "Ultra Flagship"].includes(segmentLabel)
-      ? "Camera Flagship"
-      : "Camera";
-  }
-  if (bestPrice != null && bestPrice <= 25000 && /\b5g\b/.test(fullText)) {
-    return "Value 5G";
-  }
-  if (daysSinceLaunch != null && daysSinceLaunch >= 0 && daysSinceLaunch <= 75) {
-    return "New Launch";
-  }
-  return "";
-};
-
-const getComparePageRoutePath = (slug = "") =>
-  `/compare/${String(slug || "").trim()}`;
-
-const normalizePublishedComparePageRow = (row) => {
-  const items = Array.isArray(row?.items)
-    ? row.items
-        .map((item) => ({
-          product_id: Number(item?.product_id) || null,
-          product_name: item?.product_name || item?.name || "",
-          product_type: item?.product_type || "smartphone",
-          brand_name: item?.brand_name || "",
-          position: Number(item?.position) || null,
-        }))
-        .filter(
-          (item) => Number.isInteger(item.product_id) && item.product_id > 0,
-        )
-        .sort(
-          (left, right) =>
-            Number(left.position || 0) - Number(right.position || 0),
-        )
-    : [];
-
-  return {
-    id: Number(row?.id) || null,
-    slug: row?.slug || "",
-    compare_key: row?.compare_key || "",
-    route_path: row?.slug ? getComparePageRoutePath(row.slug) : "/compare",
-    entity_type: row?.entity_type || "smartphone",
-    primary_product_id: Number(row?.primary_product_id) || null,
-    primary_product_name: row?.primary_product_name || "",
-    segment_label: row?.segment_label || "",
-    smartphone_type_label: row?.smartphone_type_label || "",
-    title: row?.title || "",
-    meta_description: row?.meta_description || "",
-    status: row?.status || "published",
-    source: normalizeComparePageSource(row?.source),
-    generation_reason: row?.generation_reason || "",
-    system_score: toComparePageFiniteNumber(row?.system_score) ?? 0,
-    manual_compare_count: Number(row?.manual_compare_count) || 0,
-    last_compared_at: row?.last_compared_at || null,
-    generated_at: row?.generated_at || null,
-    published_at: row?.published_at || null,
-    created_at: row?.created_at || null,
-    updated_at: row?.updated_at || null,
-    items,
-  };
-};
-
-async function readPublishedComparePages({
-  id = null,
-  slug = "",
-  publishedOnly = false,
-  limit = 100,
-} = {}) {
-  const params = [];
-  const where = [`cp.entity_type = 'smartphone'`];
-
-  if (publishedOnly) {
-    where.push(`cp.status = 'published'`);
-  }
-
-  const normalizedId = Number(id);
-  if (Number.isInteger(normalizedId) && normalizedId > 0) {
-    params.push(normalizedId);
-    where.push(`cp.id = $${params.length}`);
-  }
-
-  const normalizedSlug = normalizeComparePageSlugInput(slug);
-  if (normalizedSlug) {
-    params.push(normalizedSlug);
-    where.push(`cp.slug = $${params.length}`);
-  }
-
-  params.push(Math.min(200, Math.max(1, Number(limit) || 100)));
-
-  const result = await db.query(
-    `
-    SELECT
-      cp.id,
-      cp.slug,
-      cp.compare_key,
-      cp.entity_type,
-      cp.primary_product_id,
-      cp.segment_label,
-      cp.smartphone_type_label,
-      cp.title,
-      cp.meta_description,
-      cp.status,
-      cp.source,
-      cp.generation_reason,
-      cp.system_score,
-      cp.manual_compare_count,
-      cp.last_compared_at,
-      cp.generated_at,
-      cp.published_at,
-      cp.created_at,
-      cp.updated_at,
-      primary_product.name AS primary_product_name,
-      COALESCE(
-        json_agg(
-          jsonb_build_object(
-            'product_id', item_product.id,
-            'product_name', item_product.name,
-            'product_type', item_product.product_type,
-            'brand_name', item_brand.name,
-            'position', cpi.position
-          )
-          ORDER BY cpi.position
-        ) FILTER (WHERE cpi.id IS NOT NULL),
-        '[]'::json
-      ) AS items
-    FROM published_compare_pages cp
-    INNER JOIN products primary_product
-      ON primary_product.id = cp.primary_product_id
-    LEFT JOIN published_compare_page_items cpi
-      ON cpi.compare_page_id = cp.id
-    LEFT JOIN products item_product
-      ON item_product.id = cpi.product_id
-    LEFT JOIN brands item_brand
-      ON item_brand.id = item_product.brand_id
-    WHERE ${where.join(" AND ")}
-    GROUP BY cp.id, primary_product.name
-    ORDER BY cp.updated_at DESC, cp.id DESC
-    LIMIT $${params.length}
-    `,
-    params,
-  );
-
-  return (result.rows || []).map(normalizePublishedComparePageRow);
-}
-
-async function readSmartphoneComparePageProductSummaries(productIds = []) {
-  const ids = Array.from(
-    new Set(
-      (Array.isArray(productIds) ? productIds : [])
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0),
-    ),
-  );
-
-  if (!ids.length) return [];
-
-  const result = await db.query(
-    `
-    SELECT
-      p.id AS product_id,
-      p.name,
-      p.product_type,
-      b.name AS brand_name,
-      COALESCE(
-        (
-          SELECT MIN(vsp.price)::numeric
-          FROM product_variants pv
-          INNER JOIN variant_store_prices vsp
-            ON vsp.variant_id = pv.id
-          WHERE pv.product_id = p.id
-            AND vsp.price IS NOT NULL
-        ),
-        (
-          SELECT MIN(pv.base_price)::numeric
-          FROM product_variants pv
-          WHERE pv.product_id = p.id
-            AND pv.base_price IS NOT NULL
-        )
-      ) AS best_price
-    FROM products p
-    INNER JOIN product_publish pub
-      ON pub.product_id = p.id
-     AND pub.is_published = true
-    LEFT JOIN brands b
-      ON b.id = p.brand_id
-    WHERE p.product_type = 'smartphone'
-      AND p.id = ANY($1::int[])
-    `,
-    [ids],
-  );
-
-  return (result.rows || []).map((row) => ({
-    product_id: Number(row?.product_id) || null,
-    name: row?.name || "",
-    product_type: row?.product_type || "smartphone",
-    brand_name: row?.brand_name || "",
-    best_price: toComparePageFiniteNumber(row?.best_price),
-  }));
-}
-
-async function readSmartphoneCompareGenerationRows(productIds = []) {
-  const ids = Array.from(
-    new Set(
-      (Array.isArray(productIds) ? productIds : [])
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0),
-    ),
-  );
-
-  const params = [];
-  let where = `
-      p.product_type = 'smartphone'
-      AND pub.is_published = true
-    `;
-
-  if (ids.length) {
-    params.push(ids);
-    where += ` AND p.id = ANY($${params.length}::int[])`;
-  }
-
-  const result = await db.query(
-    `
-    SELECT
-      p.id AS product_id,
-      p.name,
-      p.product_type,
-      COALESCE(b.name, NULLIF(TRIM(s.brand), ''), '') AS brand_name,
-      NULLIF(TRIM(s.category), '') AS category,
-      NULLIF(TRIM(s.model), '') AS model,
-      s.launch_date,
-      s.launch_status_override,
-      s.display,
-      s.performance,
-      s.camera,
-      s.battery,
-      s.network,
-      s.connectivity,
-      s.build_design,
-      store_stats.sale_start_date,
-      COALESCE(store_stats.min_store_price, base_stats.min_base_price) AS best_price,
-      COALESCE(compare_stats.compare_count_30d, 0) AS manual_compare_count,
-      compare_stats.last_compared_at
-    FROM products p
-    INNER JOIN product_publish pub
-      ON pub.product_id = p.id
-    INNER JOIN smartphones s
-      ON s.product_id = p.id
-    LEFT JOIN brands b
-      ON b.id = p.brand_id
-    LEFT JOIN LATERAL (
-      SELECT
-        MIN(vsp.price)::numeric AS min_store_price,
-        MIN(vsp.sale_start_date) AS sale_start_date
-      FROM product_variants pv
-      INNER JOIN variant_store_prices vsp
-        ON vsp.variant_id = pv.id
-      WHERE pv.product_id = p.id
-        AND vsp.price IS NOT NULL
-    ) store_stats ON true
-    LEFT JOIN LATERAL (
-      SELECT MIN(pv.base_price)::numeric AS min_base_price
-      FROM product_variants pv
-      WHERE pv.product_id = p.id
-        AND pv.base_price IS NOT NULL
-    ) base_stats ON true
-    LEFT JOIN LATERAL (
-      SELECT
-        COUNT(*)::int AS compare_count_30d,
-        MAX(compared_at) AS last_compared_at
-      FROM (
-        SELECT compared_at
-        FROM product_comparisons
-        WHERE product_id = p.id
-          AND compared_at >= now() - INTERVAL '30 days'
-        UNION ALL
-        SELECT compared_at
-        FROM product_comparisons
-        WHERE compared_with = p.id
-          AND compared_at >= now() - INTERVAL '30 days'
-      ) comparisons
-    ) compare_stats ON true
-    WHERE ${where}
-    ORDER BY COALESCE(s.launch_date, p.created_at::date) DESC, p.id DESC
-    `,
-    params,
-  );
-
-  return (result.rows || []).map((row) => ({
-    product_id: Number(row?.product_id) || null,
-    name: row?.name || "",
-    product_type: row?.product_type || "smartphone",
-    brand_name: row?.brand_name || "",
-    category: row?.category || "",
-    model: row?.model || "",
-    launch_date: row?.launch_date || null,
-    launch_status_override: row?.launch_status_override || null,
-    display: row?.display || {},
-    performance: row?.performance || {},
-    camera: row?.camera || {},
-    battery: row?.battery || {},
-    network: row?.network || {},
-    connectivity: row?.connectivity || {},
-    build_design: row?.build_design || {},
-    sale_start_date: row?.sale_start_date || null,
-    best_price: toComparePageFiniteNumber(row?.best_price),
-    manual_compare_count: Number(row?.manual_compare_count) || 0,
-    last_compared_at: row?.last_compared_at || null,
-  }));
-}
-
-async function readSmartphonePairCompareSignals() {
-  const result = await db.query(
-    `
-    SELECT
-      LEAST(pc.product_id, pc.compared_with) AS left_id,
-      GREATEST(pc.product_id, pc.compared_with) AS right_id,
-      COUNT(pc.id)::int AS compare_count,
-      MAX(pc.compared_at) AS last_compared_at
-    FROM product_comparisons pc
-    INNER JOIN products p1
-      ON p1.id = pc.product_id
-     AND p1.product_type = 'smartphone'
-    INNER JOIN products p2
-      ON p2.id = pc.compared_with
-     AND p2.product_type = 'smartphone'
-    INNER JOIN product_publish pub1
-      ON pub1.product_id = p1.id
-     AND pub1.is_published = true
-    INNER JOIN product_publish pub2
-      ON pub2.product_id = p2.id
-     AND pub2.is_published = true
-    WHERE pc.compared_at >= now() - INTERVAL '30 days'
-    GROUP BY 1, 2
-    `,
-  );
-
-  const signalMap = new Map();
-  for (const row of result.rows || []) {
-    const key = buildProductPairKey(row?.left_id, row?.right_id);
-    if (!key) continue;
-    signalMap.set(key, {
-      compare_count: Number(row?.compare_count) || 0,
-      last_compared_at: row?.last_compared_at || null,
-    });
-  }
-  return signalMap;
-}
-
-async function readSmartphoneCompetitorSuggestionsMap(
-  productIds = [],
-  limitPerProduct = 4,
-) {
-  const ids = Array.from(
-    new Set(
-      (Array.isArray(productIds) ? productIds : [])
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0),
-    ),
-  );
-  if (!ids.length) return new Map();
-
-  const result = await db.query(
-    `
-    SELECT
-      ca.product_id,
-      ca.competitor_id,
-      ca.competition_score,
-      ca.reason
-    FROM competitor_analysis ca
-    INNER JOIN products p
-      ON p.id = ca.competitor_id
-     AND p.product_type = 'smartphone'
-    INNER JOIN product_publish pub
-      ON pub.product_id = p.id
-     AND pub.is_published = true
-    WHERE ca.product_id = ANY($1::int[])
-    ORDER BY ca.product_id ASC, ca.competition_score DESC, ca.competitor_id ASC
-    `,
-    [ids],
-  );
-
-  const byProductId = new Map();
-  for (const row of result.rows || []) {
-    const productId = Number(row?.product_id);
-    const competitorId = Number(row?.competitor_id);
-    if (!Number.isInteger(productId) || !Number.isInteger(competitorId)) continue;
-    const bucket = byProductId.get(productId) || [];
-    if (bucket.length < Math.max(1, Number(limitPerProduct) || 4)) {
-      bucket.push({
-        product_id: competitorId,
-        competition_score: toComparePageFiniteNumber(row?.competition_score) ?? 0,
-        reason: normalizeComparePageLabel(row?.reason, 200),
-      });
-      byProductId.set(productId, bucket);
-    }
-  }
-
-  return byProductId;
-}
-
-async function findExistingComparePageByKey(compareKey, { excludePageId = null } = {}) {
-  const normalizedKey = String(compareKey || "").trim();
-  if (!normalizedKey) return null;
-
-  const params = [normalizedKey];
-  const excludeId = Number(excludePageId);
-  let where = `cp.compare_key = $1`;
-  if (Number.isInteger(excludeId) && excludeId > 0) {
-    params.push(excludeId);
-    where += ` AND cp.id <> $${params.length}`;
-  }
-
-  const result = await db.query(
-    `
-    SELECT cp.id
-    FROM published_compare_pages cp
-    WHERE ${where}
-    ORDER BY cp.updated_at DESC, cp.id DESC
-    LIMIT 1
-    `,
-    params,
-  );
-
-  const existingId = Number(result.rows[0]?.id);
-  if (!Number.isInteger(existingId) || existingId <= 0) return null;
-
-  const pages = await readPublishedComparePages({ id: existingId, limit: 1 });
-  return pages[0] || null;
-}
-
-async function readSmartphoneCompareSuggestions(productId, limit = 2) {
-  const normalizedId = Number(productId);
-  const normalizedLimit = Math.min(3, Math.max(1, Number(limit) || 2));
-  if (!Number.isInteger(normalizedId) || normalizedId <= 0) {
-    return { primary_product: null, suggestions: [] };
-  }
-
-  const primaryRows = await readSmartphoneComparePageProductSummaries([
-    normalizedId,
-  ]);
-  const primaryProduct = primaryRows[0] || null;
-  if (!primaryProduct) {
-    return { primary_product: null, suggestions: [] };
-  }
-
-  const fetchSuggestions = async () => {
-    const result = await db.query(
-      `
-      SELECT
-        ca.competitor_id AS product_id,
-        p.name,
-        p.product_type,
-        b.name AS brand_name,
-        ca.competition_score,
-        ca.reason,
-        COALESCE(
-          (
-            SELECT MIN(vsp.price)::numeric
-            FROM product_variants pv
-            INNER JOIN variant_store_prices vsp
-              ON vsp.variant_id = pv.id
-            WHERE pv.product_id = p.id
-              AND vsp.price IS NOT NULL
-          ),
-          (
-            SELECT MIN(pv.base_price)::numeric
-            FROM product_variants pv
-            WHERE pv.product_id = p.id
-              AND pv.base_price IS NOT NULL
-          )
-        ) AS best_price
-      FROM competitor_analysis ca
-      INNER JOIN products p
-        ON p.id = ca.competitor_id
-       AND p.product_type = 'smartphone'
-      INNER JOIN product_publish pub
-        ON pub.product_id = p.id
-       AND pub.is_published = true
-      LEFT JOIN brands b
-        ON b.id = p.brand_id
-      WHERE ca.product_id = $1
-      ORDER BY ca.competition_score DESC, ca.competitor_id ASC
-      LIMIT $2
-      `,
-      [normalizedId, normalizedLimit],
-    );
-
-    return (result.rows || []).map((row) => ({
-      product_id: Number(row?.product_id) || null,
-      name: row?.name || "",
-      product_type: row?.product_type || "smartphone",
-      brand_name: row?.brand_name || "",
-      best_price: toComparePageFiniteNumber(row?.best_price),
-      competition_score: toComparePageFiniteNumber(row?.competition_score),
-      reason: row?.reason || "",
-    }));
-  };
-
-  let suggestions = await fetchSuggestions();
-  if (suggestions.length === 0) {
-    try {
-      await recomputeSmartphoneCompetitorAnalysis(db, {
-        limit: normalizedLimit,
-        productIds: [normalizedId],
-      });
-    } catch (err) {
-      console.error("Compare page suggestion recompute failed:", err.message);
-    }
-    suggestions = await fetchSuggestions();
-  }
-
-  const suggestedProductIds = [
-    normalizedId,
-    ...suggestions
-      .map((item) => Number(item?.product_id))
-      .filter((value) => Number.isInteger(value) && value > 0),
-  ].slice(0, 1 + normalizedLimit);
-  const compareKey = buildComparePageKey(suggestedProductIds);
-  const existingPage = compareKey
-    ? await findExistingComparePageByKey(compareKey)
-    : null;
-
-  return {
-    primary_product: primaryProduct,
-    suggestions,
-    compare_key: compareKey,
-    existing_page: existingPage,
-  };
-}
-
-const buildAutomaticCompareGenerationReason = ({
-  stage = "",
-  compareCount = 0,
-  competitorReasons = [],
-} = {}) => {
-  const parts = [];
-  if (stage === "upcoming" || stage === "announced") {
-    parts.push("latest launch signal");
-  }
-  if (compareCount > 0) {
-    parts.push(`${compareCount} manual compare${compareCount === 1 ? "" : "s"} in the last 30 days`);
-  }
-  const cleanReasons = (Array.isArray(competitorReasons) ? competitorReasons : [])
-    .map((value) => normalizeComparePageLabel(value, 120))
-    .filter(Boolean)
-    .slice(0, 2);
-  if (cleanReasons.length) {
-    parts.push(cleanReasons.join(" | "));
-  }
-  if (!parts.length) {
-    return "Auto generated from smartphone competitor analysis";
-  }
-  return `Auto generated from smartphone competitor analysis and ${parts.join(" with ")}`;
-};
-
-async function syncAutomaticSmartphoneComparePages({
-  userId = null,
-  recomputeIfMissing = true,
-} = {}) {
-  const allProducts = await readSmartphoneCompareGenerationRows();
-  if (!allProducts.length) {
-    return {
-      ok: true,
-      total_products: 0,
-      created: 0,
-      updated: 0,
-      reused_manual: 0,
-      drafted_stale: 0,
-      generated: 0,
-    };
-  }
-
-  const eligibleProducts = allProducts.filter((product) => {
-    const stage = resolveSmartphoneLaunchStage(product);
-    const policy = resolveSmartphoneLaunchPolicy(stage, product);
-    return policy.allow_compare !== false;
-  });
-
-  if (!eligibleProducts.length) {
-    return {
-      ok: true,
-      total_products: allProducts.length,
-      created: 0,
-      updated: 0,
-      reused_manual: 0,
-      drafted_stale: 0,
-      generated: 0,
-    };
-  }
-
-  let suggestionsByProductId = await readSmartphoneCompetitorSuggestionsMap(
-    eligibleProducts.map((product) => product.product_id),
-    5,
-  );
-
-  if (recomputeIfMissing && suggestionsByProductId.size === 0) {
-    try {
-      await recomputeSmartphoneCompetitorAnalysis(db, { limit: 5 });
-      suggestionsByProductId = await readSmartphoneCompetitorSuggestionsMap(
-        eligibleProducts.map((product) => product.product_id),
-        5,
-      );
-    } catch (err) {
-      console.error("Automatic compare page recompute fallback failed:", err);
-    }
-  }
-
-  const productById = new Map(
-    allProducts.map((product) => [Number(product.product_id), product]),
-  );
-  const pairSignals = await readSmartphonePairCompareSignals();
-  const candidateByCompareKey = new Map();
-  const todayIndia = getIndiaDateOnly();
-
-  for (const primaryProduct of eligibleProducts) {
-    const primaryId = Number(primaryProduct.product_id);
-    if (!Number.isInteger(primaryId) || primaryId <= 0) continue;
-
-    const stage = resolveSmartphoneLaunchStage(primaryProduct, todayIndia);
-    const policy = resolveSmartphoneLaunchPolicy(stage, primaryProduct);
-    const additionalLimit = Math.max(
-      1,
-      Math.min(2, Math.max(1, Number(policy.compare_limit || 3) - 1)),
-    );
-
-    const rankedCompetitors = (suggestionsByProductId.get(primaryId) || [])
-      .map((candidate) => ({
-        ...candidate,
-        product: productById.get(Number(candidate.product_id)) || null,
-      }))
-      .filter((candidate) => candidate.product)
-      .slice(0, 5);
-
-    if (!rankedCompetitors.length) continue;
-
-    const selected = rankedCompetitors.slice(0, additionalLimit);
-    if (!selected.length) continue;
-
-    const orderedProducts = [primaryProduct, ...selected.map((entry) => entry.product)].slice(
-      0,
-      1 + additionalLimit,
-    );
-    const orderedProductIds = orderedProducts
-      .map((entry) => Number(entry?.product_id))
-      .filter((value) => Number.isInteger(value) && value > 0);
-    if (orderedProductIds.length < 2) continue;
-
-    const compareKey = buildComparePageKey(orderedProductIds);
-    if (!compareKey) continue;
-
-    const compareCount = orderedProductIds.reduce((sum, productId, index) => {
-      let running = sum;
-      for (let cursor = index + 1; cursor < orderedProductIds.length; cursor += 1) {
-        const signal = pairSignals.get(
-          buildProductPairKey(productId, orderedProductIds[cursor]),
-        );
-        running += Number(signal?.compare_count) || 0;
-      }
-      return running;
-    }, 0);
-
-    const lastComparedAt = orderedProductIds.reduce((latest, productId, index) => {
-      let nextLatest = latest;
-      for (let cursor = index + 1; cursor < orderedProductIds.length; cursor += 1) {
-        const signal = pairSignals.get(
-          buildProductPairKey(productId, orderedProductIds[cursor]),
-        );
-        const candidateTime = signal?.last_compared_at
-          ? new Date(signal.last_compared_at).getTime()
-          : 0;
-        const latestTime = nextLatest ? new Date(nextLatest).getTime() : 0;
-        if (candidateTime > latestTime) {
-          nextLatest = signal.last_compared_at;
-        }
-      }
-      return nextLatest;
-    }, null);
-
-    const averagePrice =
-      orderedProducts
-        .map((item) => toComparePageFiniteNumber(item?.best_price))
-        .filter((value) => value != null)
-        .reduce((sum, value, _index, array) => sum + value / array.length, 0) || null;
-    const segmentLabel =
-      resolveSmartphoneSegmentLabel(
-        toComparePageFiniteNumber(primaryProduct.best_price) ?? averagePrice,
-      ) || "";
-    const smartphoneTypeLabel = deriveSmartphoneTypeLabelFromProduct(primaryProduct);
-    const names = orderedProducts.map((item) => item?.name).filter(Boolean);
-    const systemScore = selected.reduce(
-      (sum, item) => sum + (toComparePageFiniteNumber(item?.competition_score) ?? 0),
-      0,
-    );
-    const daysSinceLaunch = getDaysSinceDateOnly(
-      primaryProduct.sale_start_date || primaryProduct.launch_date,
-      todayIndia,
-    );
-    const freshnessBoost =
-      daysSinceLaunch != null && daysSinceLaunch >= 0 && daysSinceLaunch <= 75 ? 40 : 0;
-    const priorityScore = systemScore * 100 + compareCount * 10 + freshnessBoost;
-
-    const candidate = {
-      compareKey,
-      productIds: orderedProductIds,
-      primaryProductId: primaryId,
-      segmentLabel,
-      smartphoneTypeLabel,
-      title: buildAutomaticComparePageTitle({
-        names,
-        segmentLabel,
-        smartphoneTypeLabel,
-        price:
-          toComparePageFiniteNumber(primaryProduct.best_price) ?? averagePrice,
-      }),
-      metaDescription: buildAutomaticComparePageDescription({
-        names,
-        segmentLabel,
-        smartphoneTypeLabel,
-        price:
-          toComparePageFiniteNumber(primaryProduct.best_price) ?? averagePrice,
-        updatedAt: new Date(),
-      }),
-      source: AUTOMATIC_COMPARE_PAGE_SOURCE,
-      systemScore,
-      manualCompareCount: compareCount,
-      lastComparedAt,
-      generatedAt: new Date(),
-      generationReason: buildAutomaticCompareGenerationReason({
-        stage,
-        compareCount,
-        competitorReasons: selected.map((item) => item.reason),
-      }),
-      priorityScore,
-    };
-
-    const existing = candidateByCompareKey.get(compareKey);
-    if (!existing || candidate.priorityScore > existing.priorityScore) {
-      candidateByCompareKey.set(compareKey, candidate);
-    }
-  }
-
-  let created = 0;
-  let updated = 0;
-  let reusedManual = 0;
-  const activeKeys = new Set(candidateByCompareKey.keys());
-
-  for (const candidate of candidateByCompareKey.values()) {
-    const existing = await findExistingComparePageByKey(candidate.compareKey);
-    if (existing?.source === MANUAL_COMPARE_PAGE_SOURCE) {
-      reusedManual += 1;
-      continue;
-    }
-
-    const saved = await savePublishedComparePage({
-      pageId: existing?.id ?? null,
-      payload: {
-        product_ids: candidate.productIds,
-        primary_product_id: candidate.primaryProductId,
-        segment_label: candidate.segmentLabel,
-        smartphone_type_label: candidate.smartphoneTypeLabel,
-        title: candidate.title,
-        meta_description: candidate.metaDescription,
-        status: existing?.status || "published",
-        source: AUTOMATIC_COMPARE_PAGE_SOURCE,
-        compare_key: candidate.compareKey,
-        generation_reason: candidate.generationReason,
-        system_score: candidate.systemScore,
-        manual_compare_count: candidate.manualCompareCount,
-        last_compared_at: candidate.lastComparedAt,
-        generated_at: candidate.generatedAt,
-      },
-      userId,
-      bypassDuplicateCheck: true,
-    });
-
-    if (saved?.id && existing?.id) {
-      updated += 1;
-    } else if (saved?.id) {
-      created += 1;
-    }
-  }
-
-  let draftedStale = 0;
-  if (activeKeys.size > 0) {
-    const automaticPages = await readPublishedComparePages({ limit: 400 });
-    const staleAutomaticIds = automaticPages
-      .filter(
-        (page) =>
-          page.source === AUTOMATIC_COMPARE_PAGE_SOURCE &&
-          page.compare_key &&
-          !activeKeys.has(page.compare_key),
-      )
-      .map((page) => Number(page.id))
-      .filter((value) => Number.isInteger(value) && value > 0);
-
-    if (staleAutomaticIds.length) {
-      const result = await db.query(
-        `
-        UPDATE published_compare_pages
-        SET
-          status = 'draft',
-          updated_by = $2,
-          updated_at = now()
-        WHERE id = ANY($1::int[])
-          AND status <> 'draft'
-        `,
-        [staleAutomaticIds, userId],
-      );
-      draftedStale = Number(result.rowCount) || 0;
-    }
-  }
-
-  return {
-    ok: true,
-    total_products: allProducts.length,
-    generated: candidateByCompareKey.size,
-    created,
-    updated,
-    reused_manual: reusedManual,
-    drafted_stale: draftedStale,
-  };
-}
-
-async function savePublishedComparePage({
-  pageId = null,
-  payload = {},
-  userId = null,
-  bypassDuplicateCheck = false,
-}) {
-  const rawProductIds = Array.isArray(payload.product_ids)
-    ? payload.product_ids
-    : Array.isArray(payload.productIds)
-      ? payload.productIds
-      : Array.isArray(payload.items)
-        ? payload.items.map(
-            (item) => item?.product_id ?? item?.productId ?? item?.id,
-          )
-        : [];
-
-  const requestedProductIds = Array.from(
-    new Set(
-      rawProductIds
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0),
-    ),
-  ).slice(0, 3);
-
-  if (requestedProductIds.length < 2) {
-    const error = new Error(
-      "Select at least 2 smartphones for a compare page.",
-    );
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const productRows =
-    await readSmartphoneComparePageProductSummaries(requestedProductIds);
-  if (productRows.length !== requestedProductIds.length) {
-    const error = new Error(
-      "All compare page products must be published smartphones.",
-    );
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const productMap = new Map(productRows.map((row) => [row.product_id, row]));
-  const requestedPrimaryProductId = Number(
-    payload.primary_product_id ??
-      payload.primaryProductId ??
-      requestedProductIds[0],
-  );
-  const primaryProductId = productMap.has(requestedPrimaryProductId)
-    ? requestedPrimaryProductId
-    : requestedProductIds[0];
-
-  const orderedProductIds = [
-    primaryProductId,
-    ...requestedProductIds.filter(
-      (productId) => productId !== primaryProductId,
-    ),
-  ].slice(0, 3);
-
-  const orderedProducts = orderedProductIds
-    .map((productId) => productMap.get(productId))
-    .filter(Boolean);
-  const compareKey =
-    String(payload.compare_key || "").trim() || buildComparePageKey(orderedProductIds);
-
-  const priceCandidates = orderedProducts
-    .map((item) => item?.best_price)
-    .filter((value) => value != null);
-  const averagePrice =
-    priceCandidates.length > 0
-      ? priceCandidates.reduce((sum, value) => sum + value, 0) /
-        priceCandidates.length
-      : null;
-
-  const segmentLabel =
-    normalizeComparePageLabel(
-      payload.segment_label ?? payload.segmentLabel,
-      80,
-    ) ||
-    resolveSmartphoneSegmentLabel(
-      productMap.get(primaryProductId)?.best_price ?? averagePrice,
-    );
-  const smartphoneTypeLabel = normalizeComparePageLabel(
-    payload.smartphone_type_label ?? payload.smartphoneTypeLabel,
-    80,
-  );
-  const names = orderedProducts.map((product) => product.name).filter(Boolean);
-
-  const slug =
-    normalizeComparePageSlugInput(payload.slug) || buildComparePageSlug(names);
-  if (!slug) {
-    const error = new Error("Unable to generate compare page slug.");
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const status = normalizeComparePageStatus(payload.status);
-  const source = normalizeComparePageSource(payload.source);
-  const title =
-    normalizeComparePageLabel(payload.title, 220) ||
-    buildComparePageTitle({
-      names,
-      segmentLabel,
-      smartphoneTypeLabel,
-    });
-  const metaDescription =
-    normalizeComparePageLabel(
-      payload.meta_description ?? payload.metaDescription,
-      320,
-    ) ||
-    buildComparePageDescription({
-      names,
-      segmentLabel,
-      smartphoneTypeLabel,
-      updatedAt: new Date(),
-    });
-  const generationReason = normalizeComparePageLabel(
-    payload.generation_reason ?? payload.generationReason,
-    320,
-  );
-  const systemScore = toComparePageFiniteNumber(
-    payload.system_score ?? payload.systemScore,
-  );
-  const manualCompareCount = Math.max(
-    0,
-    Number(payload.manual_compare_count ?? payload.manualCompareCount) || 0,
-  );
-  const generatedAt = payload.generated_at ?? payload.generatedAt ?? null;
-  const lastComparedAt =
-    payload.last_compared_at ?? payload.lastComparedAt ?? null;
-
-  const normalizedPageId = Number(pageId);
-  if (!bypassDuplicateCheck && compareKey) {
-    const existingPage = await findExistingComparePageByKey(compareKey, {
-      excludePageId: normalizedPageId,
-    });
-    if (existingPage) {
-      const error = new Error(
-        existingPage.source === AUTOMATIC_COMPARE_PAGE_SOURCE
-          ? "Automatic compare already exists for these smartphones."
-          : "Compare page already exists for these smartphones.",
-      );
-      error.statusCode = 409;
-      error.existingPage = existingPage;
-      throw error;
-    }
-  }
-
-  const client = await db.connect();
-  try {
-    await client.query("BEGIN");
-
-    let savedPageId = normalizedPageId;
-    if (Number.isInteger(savedPageId) && savedPageId > 0) {
-      const result = await client.query(
-        `
-        UPDATE published_compare_pages
-        SET
-          slug = $1,
-          compare_key = $2,
-          entity_type = 'smartphone',
-          primary_product_id = $3,
-          segment_label = $4,
-          smartphone_type_label = $5,
-          title = $6,
-          meta_description = $7,
-          status = $8,
-          source = $9,
-          generation_reason = $10,
-          system_score = $11,
-          manual_compare_count = $12,
-          last_compared_at = $13,
-          generated_at = COALESCE($14::timestamp, generated_at, now()),
-          updated_by = $15,
-          updated_at = now(),
-          published_at = CASE
-            WHEN $8 = 'published' AND published_at IS NULL THEN now()
-            WHEN $8 <> 'published' THEN NULL
-            ELSE published_at
-          END
-        WHERE id = $16
-        RETURNING id
-        `,
-        [
-          slug,
-          compareKey || null,
-          primaryProductId,
-          segmentLabel || null,
-          smartphoneTypeLabel || null,
-          title,
-          metaDescription,
-          status,
-          source,
-          generationReason || null,
-          systemScore ?? 0,
-          manualCompareCount,
-          lastComparedAt || null,
-          generatedAt || null,
-          userId,
-          savedPageId,
-        ],
-      );
-
-      if (!result.rows.length) {
-        const error = new Error("Compare page not found.");
-        error.statusCode = 404;
-        throw error;
-      }
-    } else {
-      const result = await client.query(
-        `
-        INSERT INTO published_compare_pages (
-          slug,
-          compare_key,
-          entity_type,
-          primary_product_id,
-          segment_label,
-          smartphone_type_label,
-          title,
-          meta_description,
-          status,
-          source,
-          generation_reason,
-          system_score,
-          manual_compare_count,
-          last_compared_at,
-          created_by,
-          updated_by,
-          generated_at,
-          published_at,
-          created_at,
-          updated_at
-        )
-        VALUES (
-          $1,
-          $2,
-          'smartphone',
-          $3,
-          $4,
-          $5,
-          $6,
-          $7,
-          $8,
-          $9,
-          $10,
-          $11,
-          $12,
-          $13,
-          $14,
-          $14,
-          COALESCE($15::timestamp, now()),
-          CASE WHEN $8 = 'published' THEN now() ELSE NULL END,
-          now(),
-          now()
-        )
-        RETURNING id
-        `,
-        [
-          slug,
-          compareKey || null,
-          primaryProductId,
-          segmentLabel || null,
-          smartphoneTypeLabel || null,
-          title,
-          metaDescription,
-          status,
-          source,
-          generationReason || null,
-          systemScore ?? 0,
-          manualCompareCount,
-          lastComparedAt || null,
-          userId,
-          generatedAt || null,
-        ],
-      );
-      savedPageId = Number(result.rows[0]?.id) || null;
-    }
-
-    await client.query(
-      `
-      UPDATE published_compare_pages
-      SET compare_key = COALESCE(compare_key, $2)
-      WHERE id = $1
-      `,
-      [savedPageId, compareKey || null],
-    );
-
-    await client.query(
-      `DELETE FROM published_compare_page_items WHERE compare_page_id = $1`,
-      [savedPageId],
-    );
-
-    for (let index = 0; index < orderedProductIds.length; index += 1) {
-      await client.query(
-        `
-        INSERT INTO published_compare_page_items (
-          compare_page_id,
-          product_id,
-          position,
-          created_at
-        )
-        VALUES ($1, $2, $3, now())
-        `,
-        [savedPageId, orderedProductIds[index], index + 1],
-      );
-    }
-
-    await client.query("COMMIT");
-    const pages = await readPublishedComparePages({
-      id: savedPageId,
-      limit: 1,
-    });
-    return pages[0] || null;
-  } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch (_rollbackErr) {
-      // ignore rollback errors
-    }
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
 const parseJsonLikeValue = (value) => {
   if (typeof value !== "string") return value;
   const text = value.trim();
@@ -3568,12 +1910,6 @@ const buildSpecScoreSource = (type, row) => {
       battery: toPlainObject(item.battery),
       software: toPlainObject(item.software),
       physical: toPlainObject(item.physical),
-      connectivity: toPlainObject(item.connectivity || metadata.connectivity),
-      ports: toPlainObject(item.ports),
-      multimedia: toPlainObject(item.multimedia),
-      security: toPlainObject(item.security),
-      camera: toPlainObject(item.camera),
-      warranty: toPlainObject(item.warranty || metadata.warranty),
       variants,
       images,
     };
@@ -4094,10 +2430,6 @@ const applySpecScoreToRow = (type, row, profiles) => {
   let overallScoreV2Display8098 = null;
   let cameraScoreV2Raw = null;
   let cameraScoreV2Display8099 = null;
-  let specScoreV2Breakdown = null;
-  let specScoreV2MatchedFeatures = null;
-  let specScoreV2CategoryCoverage = null;
-  let specScoreV2Version = null;
 
   if (normalizedType === "smartphone") {
     const v2 = computeSmartphoneRawSpecScoreV2(source, fieldProfile);
@@ -4118,44 +2450,6 @@ const applySpecScoreToRow = (type, row, profiles) => {
       cameraScoreV2Raw != null
         ? mapScoreToDisplayBand(cameraScoreV2Raw, 80, 99)
         : null;
-  } else if (normalizedType === "tv") {
-    const v2 = computeTvRawSpecScoreV2(source);
-    specScoreV2 = toFiniteScore100(v2.rawScore);
-    specScoreV2Raw = specScoreV2;
-    specScoreV2Source = v2.source;
-    overallScoreV2 = specScoreV2;
-    overallScoreV2Source =
-      specScoreV2 != null ? v2.source : "tv_spec_score_v1_unavailable";
-    specScorePrice = toFiniteNumberOrNull(v2.price);
-    specScorePriceBand = v2.priceBand || "unknown";
-    specFeatureCoverage = toFiniteNumberOrNull(v2.featureCoverage);
-    specScoreV2Display8098 = mapScoreToDisplayBand(specScoreV2);
-    overallScoreV2Display8098 = specScoreV2Display8098;
-    specScoreV2Breakdown = v2.breakdown || null;
-    specScoreV2MatchedFeatures = Array.isArray(v2.matchedFeatures)
-      ? v2.matchedFeatures
-      : null;
-    specScoreV2CategoryCoverage = v2.categoryCoverage || null;
-    specScoreV2Version = v2.version || null;
-  } else if (normalizedType === "laptop") {
-    const v2 = computeLaptopRawSpecScoreV2(source);
-    specScoreV2 = toFiniteScore100(v2.rawScore);
-    specScoreV2Raw = specScoreV2;
-    specScoreV2Source = v2.source;
-    overallScoreV2 = specScoreV2;
-    overallScoreV2Source =
-      specScoreV2 != null ? v2.source : "laptop_spec_score_v1_unavailable";
-    specScorePrice = toFiniteNumberOrNull(v2.price);
-    specScorePriceBand = v2.priceBand || "unknown";
-    specFeatureCoverage = toFiniteNumberOrNull(v2.featureCoverage);
-    specScoreV2Display8098 = mapScoreToDisplayBand(specScoreV2);
-    overallScoreV2Display8098 = specScoreV2Display8098;
-    specScoreV2Breakdown = v2.breakdown || null;
-    specScoreV2MatchedFeatures = Array.isArray(v2.matchedFeatures)
-      ? v2.matchedFeatures
-      : null;
-    specScoreV2CategoryCoverage = v2.categoryCoverage || null;
-    specScoreV2Version = v2.version || null;
   }
 
   const cameraWithScore =
@@ -4172,59 +2466,26 @@ const applySpecScoreToRow = (type, row, profiles) => {
           score: cameraScoreV2Display8099,
         }
       : row.camera_json;
-  const usesDedicatedSpecScoreV2 =
-    normalizedType === "tv" || normalizedType === "laptop";
-  const outputSpecScore = usesDedicatedSpecScoreV2 ? specScoreV2 : specScore;
-  const outputSpecScoreSource =
-    usesDedicatedSpecScoreV2 ? specScoreV2Source : specScoreSource;
-  const outputOverallScore =
-    usesDedicatedSpecScoreV2 ? overallScoreV2 : overallScore;
-  const outputOverallScoreSource =
-    usesDedicatedSpecScoreV2 ? overallScoreV2Source : overallScoreSource;
-  const outputSpecScoreDisplay =
-    usesDedicatedSpecScoreV2
-      ? specScoreV2
-      : row.spec_score_display ?? row.specScoreDisplay;
-  const outputOverallScoreDisplay =
-    usesDedicatedSpecScoreV2
-      ? specScoreV2
-      : row.overall_score_display ?? row.overallScoreDisplay;
-  const outputSpecScoreV2Display =
-    usesDedicatedSpecScoreV2
-      ? specScoreV2
-      : row.spec_score_v2_display ?? row.specScoreV2Display;
-  const outputOverallScoreV2Display =
-    usesDedicatedSpecScoreV2
-      ? specScoreV2
-      : row.overall_score_v2_display ?? row.overallScoreV2Display;
 
   return {
     ...row,
     camera: cameraWithScore,
     camera_json: cameraJsonWithScore,
     field_profile: fieldProfile,
-    spec_score: outputSpecScore,
-    spec_score_source: outputSpecScoreSource,
-    overall_score: outputOverallScore,
-    overall_score_source: outputOverallScoreSource,
-    spec_score_display: outputSpecScoreDisplay,
-    overall_score_display: outputOverallScoreDisplay,
+    spec_score: specScore,
+    spec_score_source: specScoreSource,
+    overall_score: overallScore,
+    overall_score_source: overallScoreSource,
     spec_score_v2_raw: specScoreV2Raw,
     spec_score_v2: specScoreV2,
     spec_score_v2_source: specScoreV2Source,
     overall_score_v2: overallScoreV2,
     overall_score_v2_source: overallScoreV2Source,
-    spec_score_v2_display: outputSpecScoreV2Display,
-    overall_score_v2_display: outputOverallScoreV2Display,
     spec_score_v2_display_80_98: specScoreV2Display8098,
     overall_score_v2_display_80_98: overallScoreV2Display8098,
     spec_score_price: specScorePrice,
     spec_score_price_band: specScorePriceBand,
     spec_score_feature_coverage: specFeatureCoverage,
-    spec_score_v2_breakdown: specScoreV2Breakdown,
-    spec_score_v2_matched_features: specScoreV2MatchedFeatures,
-    spec_score_v2_category_coverage: specScoreV2CategoryCoverage,
-    spec_score_v2_version: specScoreV2Version,
     camera_score_v2_raw: cameraScoreV2Raw,
     camera_score_v2_display_80_99: cameraScoreV2Display8099,
     spec_tier_v2: toSpecTier(specScoreV2),
@@ -4296,133 +2557,8 @@ const applySpecScoreToRows = (type, rows, profiles) => {
   });
 };
 
-const TV_PUBLIC_SCORE_INTERNAL_KEYS = new Set([
-  "field_profile",
-  "spec_score",
-  "spec_score_source",
-  "overall_score",
-  "overall_score_source",
-  "spec_score_display",
-  "overall_score_display",
-  "spec_score_v2_raw",
-  "spec_score_v2_source",
-  "overall_score_v2",
-  "overall_score_v2_source",
-  "spec_score_v2_display",
-  "overall_score_v2_display",
-  "spec_score_v2_display_80_98",
-  "overall_score_v2_display_80_98",
-  "spec_score_price",
-  "spec_score_price_band",
-  "spec_score_feature_coverage",
-  "spec_score_v2_breakdown",
-  "spec_score_v2_matched_features",
-  "spec_score_v2_category_coverage",
-  "spec_score_v2_version",
-  "camera_score_v2_raw",
-  "camera_score_v2_display_80_99",
-  "spec_tier_v2",
-]);
-
-const TV_CATALOG_INTERNAL_TREND_KEYS = new Set([
-  "hook_score",
-  "buyer_intent",
-  "trend_velocity",
-  "freshness",
-  "hook_calculated_at",
-]);
-
-const omitResponseKeys = (row, omittedKeys) => {
-  const cleaned = {};
-  for (const [key, value] of Object.entries(row || {})) {
-    if (omittedKeys.has(String(key).toLowerCase())) continue;
-    cleaned[key] = value;
-  }
-  return cleaned;
-};
-
-const toPublicTvResponseRow = (row) =>
-  omitResponseKeys(row, TV_PUBLIC_SCORE_INTERNAL_KEYS);
-
-const toPublicTvCatalogResponseRow = (row) =>
-  omitResponseKeys(toPublicTvResponseRow(row), TV_CATALOG_INTERNAL_TREND_KEYS);
-
-const toPublicLaptopResponseRow = (row) =>
-  omitResponseKeys(row, TV_PUBLIC_SCORE_INTERNAL_KEYS);
-
-const toPublicLaptopCatalogResponseRow = (row) =>
-  omitResponseKeys(
-    toPublicLaptopResponseRow(row),
-    TV_CATALOG_INTERNAL_TREND_KEYS,
-  );
-
 const BLOG_ALLOWED_PRODUCT_TYPES = new Set(["smartphone", "laptop", "tv"]);
 const BLOG_ALLOWED_STATUSES = new Set(["draft", "published"]);
-const BLOG_ALLOWED_CATEGORIES = new Set([
-  "news",
-  "mobiles",
-  "gadgets",
-  "guides",
-  "launches",
-]);
-
-const parseBlogTags = (value) => {
-  if (Array.isArray(value)) {
-    return Array.from(
-      new Set(value.map((item) => String(item || "").trim()).filter(Boolean)),
-    );
-  }
-
-  const raw = String(value || "").trim();
-  if (!raw) return [];
-
-  return Array.from(
-    new Set(
-      raw
-        .split(/[,;\n]+/)
-        .map((item) => String(item || "").trim())
-        .filter(Boolean),
-    ),
-  );
-};
-
-const parseBlogBoolean = (value) => {
-  if (typeof value === "boolean") return value;
-  const normalized = String(value ?? "")
-    .trim()
-    .toLowerCase();
-  return ["1", "true", "yes", "on"].includes(normalized);
-};
-
-const parseBlogDate = (value) => {
-  const raw = String(value || "").trim();
-  if (!raw) return null;
-
-  const date = new Date(raw);
-  if (Number.isNaN(date.getTime())) return null;
-  return date;
-};
-
-const normalizePushToken = (value) => {
-  const token = String(value || "").trim();
-  return token.length >= 20 ? token : "";
-};
-
-const normalizePushTopic = (value) => {
-  const topic = String(value || NEWS_PUSH_TOPIC)
-    .trim()
-    .toLowerCase();
-  return topic === NEWS_PUSH_TOPIC ? topic : "";
-};
-
-const normalizePushPermission = (value) => {
-  const permission = String(value || "")
-    .trim()
-    .toLowerCase();
-  return ["granted", "default", "denied"].includes(permission)
-    ? permission
-    : null;
-};
 
 const toSafeFiniteNumber = (value, fallback = 0) => {
   const parsed = Number(value);
@@ -4461,495 +2597,6 @@ const formatBlogPrice = (value) => {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return "";
   return `₹${Math.round(n).toLocaleString("en-IN")}`;
-};
-
-const AFFILIATE_PLACEMENT_STATUSES = new Set([
-  "draft",
-  "published",
-  "unpublished",
-]);
-const AFFILIATE_PLACEMENT_SCOPE_TYPES = new Set([
-  "global",
-  "product",
-  "blog",
-  "brand",
-  "category",
-]);
-const AFFILIATE_SOURCE_TYPES = new Set(["manual", "auto"]);
-const AFFILIATE_PAGE_TYPES = new Set([
-  "product_list",
-  "product_detail",
-  "news",
-]);
-const AFFILIATE_LIST_SLOTS = new Set(["listing_featured", "product_card"]);
-const AFFILIATE_DETAIL_SLOTS = new Set(["detail_highlight", "store_panel"]);
-const AFFILIATE_NEWS_SLOTS = new Set(["inline_after_intro", "article_end"]);
-
-const toNullableTrimmedText = (value, maxLength = 5000) => {
-  if (value === null || value === undefined) return null;
-  const cleaned = cleanText(value, maxLength);
-  return cleaned ? String(cleaned).trim() : null;
-};
-
-const parseAffiliateBooleanInput = (value, fallback = false) => {
-  if (value === true || value === false) return value;
-  if (value === 1 || value === 0) return Boolean(value);
-  if (value === null || value === undefined || value === "") return fallback;
-  const normalized = String(value).trim().toLowerCase();
-  if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
-  if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
-  return fallback;
-};
-
-const normalizeAffiliateStatus = (value, fallback = "draft") => {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase();
-  return AFFILIATE_PLACEMENT_STATUSES.has(normalized) ? normalized : fallback;
-};
-
-const normalizeAffiliateScopeType = (value, fallback = "global") => {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase();
-  return AFFILIATE_PLACEMENT_SCOPE_TYPES.has(normalized)
-    ? normalized
-    : fallback;
-};
-
-const normalizeAffiliateSourceType = (value, fallback = "manual") => {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase();
-  return AFFILIATE_SOURCE_TYPES.has(normalized) ? normalized : fallback;
-};
-
-const normalizeAffiliatePageType = (value) => {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase();
-  return AFFILIATE_PAGE_TYPES.has(normalized) ? normalized : "";
-};
-
-const normalizeAffiliateSlot = (pageType, value) => {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase();
-
-  if (pageType === "product_list") {
-    return AFFILIATE_LIST_SLOTS.has(normalized)
-      ? normalized
-      : "product_card";
-  }
-  if (pageType === "product_detail") {
-    return AFFILIATE_DETAIL_SLOTS.has(normalized)
-      ? normalized
-      : "detail_highlight";
-  }
-  if (pageType === "news") {
-    return AFFILIATE_NEWS_SLOTS.has(normalized)
-      ? normalized
-      : "inline_after_intro";
-  }
-  return normalized;
-};
-
-const normalizeAffiliateComparisonText = (value) =>
-  String(value || "")
-    .trim()
-    .toLowerCase();
-
-const normalizeAffiliateComparisonUrl = (value) =>
-  String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\/+$/g, "");
-
-const normalizeAffiliateIdList = (value) => {
-  const source = Array.isArray(value)
-    ? value
-    : value === null || value === undefined
-      ? []
-      : String(value)
-          .split(",")
-          .map((item) => item.trim())
-          .filter(Boolean);
-
-  return Array.from(
-    new Set(
-      source
-        .map((item) => Number(item))
-        .filter((item) => Number.isInteger(item) && item > 0),
-    ),
-  );
-};
-
-const normalizeAffiliateSlug = (value, fallback = "affiliate-link") =>
-  toBlogSlug(value, fallback).slice(0, 120);
-
-const parseAffiliateDateValue = (value) => {
-  if (value === undefined) return undefined;
-  if (value === null || value === "") return null;
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return "__invalid__";
-  return parsed.toISOString();
-};
-
-const addDaysToIsoDate = (isoValue, days) => {
-  const start = new Date(isoValue);
-  if (Number.isNaN(start.getTime())) return null;
-  const next = new Date(start.getTime());
-  next.setUTCDate(next.getUTCDate() + Math.max(0, Math.floor(days)));
-  return next.toISOString();
-};
-
-const resolveAffiliateEffectiveUnpublishAt = (placement) => {
-  if (!placement) return null;
-  const explicitValue = placement.unpublish_at || placement.unpublishAt || null;
-  if (explicitValue) return explicitValue;
-
-  const durationDays = Number(placement.duration_days ?? placement.durationDays);
-  if (!Number.isFinite(durationDays) || durationDays <= 0) return null;
-
-  const startValue =
-    placement.publish_at ||
-    placement.publishAt ||
-    placement.created_at ||
-    placement.createdAt ||
-    null;
-  if (!startValue) return null;
-
-  return addDaysToIsoDate(startValue, durationDays);
-};
-
-const getAffiliatePlacementLifecycleState = (placement, now = new Date()) => {
-  const status = normalizeAffiliateStatus(placement?.status, "draft");
-  if (status === "draft") return "draft";
-  if (status === "unpublished") return "unpublished";
-
-  const publishAtValue = placement?.publish_at || placement?.publishAt || null;
-  if (publishAtValue) {
-    const publishAt = new Date(publishAtValue);
-    if (!Number.isNaN(publishAt.getTime()) && publishAt > now) {
-      return "scheduled";
-    }
-  }
-
-  const effectiveEndValue = resolveAffiliateEffectiveUnpublishAt(placement);
-  if (effectiveEndValue) {
-    const effectiveEnd = new Date(effectiveEndValue);
-    if (!Number.isNaN(effectiveEnd.getTime()) && effectiveEnd < now) {
-      return "expired";
-    }
-  }
-
-  return status === "published" ? "active" : status;
-};
-
-const isAffiliatePlacementLive = (placement, now = new Date()) =>
-  getAffiliatePlacementLifecycleState(placement, now) === "active";
-
-const isAffiliatePageAllowed = (placement, pageType) => {
-  if (!placement || !pageType) return false;
-  if (pageType === "product_list")
-    return parseAffiliateBooleanInput(
-      placement.allow_product_list ?? placement.allowProductList,
-      false,
-    );
-  if (pageType === "product_detail")
-    return parseAffiliateBooleanInput(
-      placement.allow_product_detail ?? placement.allowProductDetail,
-      false,
-    );
-  if (pageType === "news")
-    return parseAffiliateBooleanInput(
-      placement.allow_news ?? placement.allowNews,
-      false,
-    );
-  return false;
-};
-
-const resolveAffiliateCurrentSlot = (placement, pageType) => {
-  if (pageType === "product_list") {
-    return normalizeAffiliateSlot(
-      pageType,
-      placement?.list_slot ?? placement?.listSlot,
-    );
-  }
-  if (pageType === "product_detail") {
-    return normalizeAffiliateSlot(
-      pageType,
-      placement?.detail_slot ?? placement?.detailSlot,
-    );
-  }
-  if (pageType === "news") {
-    return normalizeAffiliateSlot(
-      pageType,
-      placement?.news_slot ?? placement?.newsSlot,
-    );
-  }
-  return "";
-};
-
-const normalizeAffiliateDeviceType = (value, userAgent = "") => {
-  const explicit = String(value || "")
-    .trim()
-    .toLowerCase();
-  if (["mobile", "tablet", "desktop"].includes(explicit)) return explicit;
-
-  const ua = String(userAgent || "").toLowerCase();
-  if (/ipad|tablet|playbook|silk/i.test(ua)) return "tablet";
-  if (/mobi|android|iphone|ipod/i.test(ua)) return "mobile";
-  return "desktop";
-};
-
-const getAffiliateScopeSpecificityWeight = (matchType) => {
-  switch (matchType) {
-    case "blog":
-      return 520;
-    case "product":
-      return 500;
-    case "brand":
-      return 360;
-    case "category":
-      return 320;
-    case "global":
-      return 180;
-    default:
-      return 0;
-  }
-};
-
-const getAffiliateFreshnessWeight = (placement, now = new Date()) => {
-  const publishedValue =
-    placement?.publish_at ||
-    placement?.publishAt ||
-    placement?.created_at ||
-    placement?.createdAt ||
-    null;
-  if (!publishedValue) return 0;
-
-  const publishedAt = new Date(publishedValue);
-  if (Number.isNaN(publishedAt.getTime())) return 0;
-
-  const ageDays = Math.max(
-    0,
-    Math.floor((now.getTime() - publishedAt.getTime()) / 86400000),
-  );
-
-  if (ageDays <= 7) return 45;
-  if (ageDays <= 30) return 30;
-  if (ageDays <= 90) return 15;
-  return 5;
-};
-
-const getAffiliateClickWeight = (placement) => {
-  const totalClicks = Number(placement?.total_clicks ?? placement?.totalClicks);
-  if (!Number.isFinite(totalClicks) || totalClicks <= 0) return 0;
-  return Math.min(60, Math.round(Math.log10(totalClicks + 1) * 25));
-};
-
-const getAffiliateSourceWeight = (placement) =>
-  normalizeAffiliateSourceType(placement?.source_type, "manual") === "manual"
-    ? 60
-    : 0;
-
-const buildAffiliatePlacementScore = (placement, matchType, now = new Date()) => {
-  const priority = Number(placement?.priority) || 0;
-  return (
-    priority * 100 +
-    getAffiliateSourceWeight(placement) +
-    getAffiliateScopeSpecificityWeight(matchType) +
-    getAffiliateFreshnessWeight(placement, now) +
-    getAffiliateClickWeight(placement) +
-    (placement?.price ? 10 : 0)
-  );
-};
-
-const normalizeAffiliatePlacementInput = (body = {}, { existing = null } = {}) => {
-  const nowIso = new Date().toISOString();
-  let publishAt = parseAffiliateDateValue(
-    body.publish_at ?? body.publishAt ?? existing?.publish_at,
-  );
-  const unpublishAt = parseAffiliateDateValue(
-    body.unpublish_at ?? body.unpublishAt ?? existing?.unpublish_at,
-  );
-
-  const status = normalizeAffiliateStatus(body.status ?? existing?.status, "draft");
-  const scopeType = normalizeAffiliateScopeType(
-    body.scope_type ?? body.scopeType ?? existing?.scope_type,
-    "global",
-  );
-  const durationRaw =
-    body.duration_days ?? body.durationDays ?? existing?.duration_days ?? null;
-  const durationValue = Number(durationRaw);
-  const durationDays =
-    Number.isFinite(durationValue) && durationValue > 0
-      ? Math.floor(durationValue)
-      : null;
-
-  if (status === "published" && (publishAt === undefined || publishAt === null)) {
-    publishAt = existing?.publish_at || nowIso;
-  }
-
-  const priceRaw = body.price ?? existing?.price ?? null;
-  const priceValue = Number(priceRaw);
-  const price =
-    Number.isFinite(priceValue) && priceValue > 0 ? priceValue : null;
-
-  const payload = {
-    name: toNullableTrimmedText(
-      body.name ?? existing?.name ?? body.title ?? existing?.title,
-      180,
-    ),
-    slug:
-      body.slug === undefined
-        ? existing?.slug ?? null
-        : toNullableTrimmedText(body.slug, 160),
-    title: toNullableTrimmedText(body.title ?? existing?.title, 220),
-    description: toNullableTrimmedText(
-      body.description ?? existing?.description,
-      4000,
-    ),
-    cta_text: toNullableTrimmedText(
-      body.cta_text ?? body.ctaText ?? existing?.cta_text,
-      80,
-    ),
-    cta_subtext: toNullableTrimmedText(
-      body.cta_subtext ?? body.ctaSubtext ?? existing?.cta_subtext,
-      180,
-    ),
-    badge_text: toNullableTrimmedText(
-      body.badge_text ?? body.badgeText ?? existing?.badge_text,
-      40,
-    ),
-    disclosure_text: toNullableTrimmedText(
-      body.disclosure_text ?? body.disclosureText ?? existing?.disclosure_text,
-      180,
-    ),
-    store_name: toNullableTrimmedText(
-      body.store_name ?? body.storeName ?? existing?.store_name,
-      120,
-    ),
-    store_logo_url: toNullableTrimmedText(
-      body.store_logo_url ?? body.storeLogoUrl ?? existing?.store_logo_url,
-      2000,
-    ),
-    image_url: toNullableTrimmedText(
-      body.image_url ?? body.imageUrl ?? existing?.image_url,
-      2000,
-    ),
-    destination_url: toNullableTrimmedText(
-      body.destination_url ?? body.destinationUrl ?? existing?.destination_url,
-      2000,
-    ),
-    affiliate_url: toNullableTrimmedText(
-      body.affiliate_url ?? body.affiliateUrl ?? existing?.affiliate_url,
-      2000,
-    ),
-    price,
-    currency_code:
-      toNullableTrimmedText(
-        body.currency_code ?? body.currencyCode ?? existing?.currency_code,
-        12,
-      ) || "INR",
-    priority: Math.max(
-      0,
-      Math.floor(Number(body.priority ?? existing?.priority ?? 0) || 0),
-    ),
-    status,
-    publish_at: publishAt === undefined ? existing?.publish_at ?? null : publishAt,
-    unpublish_at:
-      unpublishAt === undefined ? existing?.unpublish_at ?? null : unpublishAt,
-    duration_days: durationDays,
-    allow_product_list: parseAffiliateBooleanInput(
-      body.allow_product_list ??
-        body.allowProductList ??
-        existing?.allow_product_list,
-      false,
-    ),
-    allow_product_detail: parseAffiliateBooleanInput(
-      body.allow_product_detail ??
-        body.allowProductDetail ??
-        existing?.allow_product_detail,
-      false,
-    ),
-    allow_news: parseAffiliateBooleanInput(
-      body.allow_news ?? body.allowNews ?? existing?.allow_news,
-      false,
-    ),
-    scope_type: scopeType,
-    product_id: toPositiveInt(
-      body.product_id ?? body.productId ?? existing?.product_id,
-      null,
-    ),
-    blog_id: toPositiveInt(body.blog_id ?? body.blogId ?? existing?.blog_id, null),
-    brand_id: toPositiveInt(
-      body.brand_id ?? body.brandId ?? existing?.brand_id,
-      null,
-    ),
-    category_name: toNullableTrimmedText(
-      body.category_name ?? body.categoryName ?? existing?.category_name,
-      120,
-    ),
-    list_slot: normalizeAffiliateSlot(
-      "product_list",
-      body.list_slot ?? body.listSlot ?? existing?.list_slot,
-    ),
-    detail_slot: normalizeAffiliateSlot(
-      "product_detail",
-      body.detail_slot ?? body.detailSlot ?? existing?.detail_slot,
-    ),
-    news_slot: normalizeAffiliateSlot(
-      "news",
-      body.news_slot ?? body.newsSlot ?? existing?.news_slot,
-    ),
-  };
-
-  const errors = [];
-  if (!payload.name) errors.push("Name is required.");
-  if (!payload.destination_url && !payload.affiliate_url) {
-    errors.push("Add an affiliate URL or destination URL.");
-  }
-  if (
-    !payload.allow_product_list &&
-    !payload.allow_product_detail &&
-    !payload.allow_news
-  ) {
-    errors.push("Select at least one page permission.");
-  }
-  if (payload.publish_at === "__invalid__") {
-    errors.push("Publish date is invalid.");
-  }
-  if (payload.unpublish_at === "__invalid__") {
-    errors.push("Unpublish date is invalid.");
-  }
-  if (scopeType === "product" && !payload.product_id) {
-    errors.push("A product must be selected for product scope.");
-  }
-  if (scopeType === "blog" && !payload.blog_id) {
-    errors.push("A news article must be selected for blog scope.");
-  }
-  if (scopeType === "brand" && !payload.brand_id) {
-    errors.push("A brand must be selected for brand scope.");
-  }
-  if (scopeType === "category" && !payload.category_name) {
-    errors.push("A category is required for category scope.");
-  }
-
-  if (payload.publish_at && payload.unpublish_at) {
-    const publishDate = new Date(payload.publish_at);
-    const unpublishDate = new Date(payload.unpublish_at);
-    if (
-      !Number.isNaN(publishDate.getTime()) &&
-      !Number.isNaN(unpublishDate.getTime()) &&
-      unpublishDate < publishDate
-    ) {
-      errors.push("Unpublish date must be after the publish date.");
-    }
-  }
-
-  return { payload, errors };
 };
 
 const extractLowestVariantPrice = (variants = []) => {
@@ -4998,19 +2645,12 @@ const renderBlogTemplateWithTokens = (
   });
 };
 
-const ensureBlogManagerAccess = async (req, res, action = "view") => {
-  const role = normalizeRole(req?.user?.role || "viewer");
-  const permissionMap = {
-    view: ["content.news.view"],
-    create: ["content.news.create"],
-    edit: ["content.news.edit"],
-    delete: ["content.news.delete"],
-    manage: ["content.news.manage", "content.news.edit", "content.news.create"],
-  };
-  const requested = permissionMap[action] || permissionMap.view;
-  const allowed = await hasRoleAnyPermissions(role, requested);
-  if (allowed) return true;
-  res.status(403).json({ message: "Content access required" });
+const ensureBlogManagerAccess = (req, res) => {
+  const role = String(req?.user?.role || "")
+    .trim()
+    .toLowerCase();
+  if (role === "admin" || role === "editor") return true;
+  res.status(403).json({ message: "Admin or editor access required" });
   return false;
 };
 
@@ -5100,40 +2740,6 @@ const readBlogProductImages = async (productId) => {
     .filter(Boolean);
 };
 
-const collectImageCandidates = (...values) => {
-  const candidates = [];
-  const seen = new Set();
-
-  const pushCandidate = (value) => {
-    const parsed = parseJsonLikeValue(value);
-    if (Array.isArray(parsed)) {
-      parsed.forEach(pushCandidate);
-      return;
-    }
-
-    if (parsed && typeof parsed === "object") {
-      [
-        parsed.image_url,
-        parsed.hero_image,
-        parsed.cover_image,
-        parsed.thumbnail,
-        parsed.url,
-        parsed.src,
-        parsed.image,
-      ].forEach(pushCandidate);
-      return;
-    }
-
-    const text = String(parsed || "").trim();
-    if (!text || seen.has(text)) return;
-    seen.add(text);
-    candidates.push(text);
-  };
-
-  values.forEach(pushCandidate);
-  return candidates;
-};
-
 const fetchBlogProductSnapshot = async (
   productId,
   profiles,
@@ -5187,16 +2793,6 @@ const fetchBlogProductSnapshot = async (
     readBlogProductVariants(normalizedId),
     readBlogProductImages(normalizedId),
   ]);
-  const heroImage =
-    collectImageCandidates(
-      detailRow?.hero_image,
-      detailRow?.image_url,
-      detailRow?.cover_image,
-      detailRow?.thumbnail,
-      detailRow?.image,
-      detailRow?.images,
-      images,
-    )[0] || null;
 
   const source = stripScoreRecursively({
     ...toPlainObject(detailRow),
@@ -5232,20 +2828,14 @@ const fetchBlogProductSnapshot = async (
     variants,
     images,
     lowest_price: lowestPrice,
-    hero_image: heroImage,
+    hero_image: images[0] || null,
   };
 };
 
 const buildBlogTokenMap = (snapshot) => {
   const scored = toPlainObject(snapshot?.scored);
-  const productType = normalizeProfileDeviceType(snapshot?.product_type);
   const display = toPlainObject(scored.field_profile?.display_display);
   const mandatory = toPlainObject(scored.field_profile?.mandatory_display);
-  const defaultProfile = toPlainObject(
-    DEFAULT_DEVICE_FIELD_PROFILES[productType],
-  );
-  const defaultDisplayPaths = toPlainObject(defaultProfile.display);
-  const defaultMandatoryPaths = toPlainObject(defaultProfile.mandatory);
   const tokenMap = {};
 
   const setToken = (key, value) => {
@@ -5254,26 +2844,6 @@ const buildBlogTokenMap = (snapshot) => {
     const formatted = formatBlogValue(value);
     if (!formatted) return;
     tokenMap[normalizedKey] = formatted;
-  };
-
-  const ensureToken = (key, ...candidates) => {
-    const normalizedKey = normalizeBlogTokenKey(key);
-    if (!normalizedKey || profileHasValue(tokenMap[normalizedKey])) return;
-
-    for (const candidate of candidates) {
-      if (!profileHasValue(candidate)) continue;
-      setToken(key, candidate);
-      if (profileHasValue(tokenMap[normalizedKey])) return;
-    }
-  };
-
-  const resolveTokenValueByPaths = (...pathGroups) => {
-    for (const paths of pathGroups) {
-      if (!Array.isArray(paths) || !paths.length) continue;
-      const resolved = resolveProfileValueByPaths(scored, paths);
-      if (profileHasValue(resolved)) return resolved;
-    }
-    return null;
   };
 
   setToken("product_name", scored.name || snapshot?.core?.name);
@@ -5320,46 +2890,6 @@ const buildBlogTokenMap = (snapshot) => {
     setToken(key, value);
   }
 
-  for (const [key, paths] of Object.entries(defaultDisplayPaths)) {
-    ensureToken(key, resolveTokenValueByPaths(paths));
-  }
-
-  for (const [key, paths] of Object.entries(defaultMandatoryPaths)) {
-    ensureToken(key, resolveTokenValueByPaths(paths));
-  }
-
-  ensureToken(
-    "display",
-    tokenMap.display_size,
-    tokenMap.screen_size,
-    resolveTokenValueByPaths(
-      defaultMandatoryPaths.display,
-      defaultDisplayPaths.display_size,
-    ),
-  );
-  ensureToken(
-    "main_camera",
-    tokenMap.camera,
-    resolveTokenValueByPaths(
-      defaultDisplayPaths.main_camera,
-      defaultMandatoryPaths.camera,
-    ),
-  );
-  ensureToken(
-    "processor",
-    resolveTokenValueByPaths(
-      defaultDisplayPaths.processor,
-      defaultMandatoryPaths.processor,
-    ),
-  );
-  ensureToken(
-    "battery",
-    resolveTokenValueByPaths(
-      defaultDisplayPaths.battery,
-      defaultMandatoryPaths.battery,
-    ),
-  );
-
   return tokenMap;
 };
 
@@ -5396,455 +2926,6 @@ const buildBlogSuggestions = (snapshot, tokenMap) => {
   }));
 };
 
-const normalizeBlogProductIds = (...sources) => {
-  const seen = new Set();
-  const ids = [];
-
-  const pushValue = (value) => {
-    const normalized = Number(
-      value && typeof value === "object"
-        ? value.product_id ?? value.productId ?? value.id
-        : value,
-    );
-    if (!Number.isInteger(normalized) || normalized <= 0 || seen.has(normalized)) {
-      return;
-    }
-    seen.add(normalized);
-    ids.push(normalized);
-  };
-
-  sources.forEach((source) => {
-    if (Array.isArray(source)) {
-      source.forEach(pushValue);
-      return;
-    }
-
-    if (source && typeof source === "object" && Array.isArray(source.product_ids)) {
-      source.product_ids.forEach(pushValue);
-      return;
-    }
-
-    pushValue(source);
-  });
-
-  return ids;
-};
-
-const orderBlogProductIds = (productIds = [], primaryProductId = null) => {
-  const ordered = normalizeBlogProductIds(productIds);
-  const primaryId = Number(primaryProductId);
-  if (!Number.isInteger(primaryId) || primaryId <= 0) return ordered;
-  if (!ordered.includes(primaryId)) return ordered;
-  return [primaryId, ...ordered.filter((value) => value !== primaryId)];
-};
-
-const fetchBlogSnapshotsByProductIds = async (productIds = [], profiles = []) => {
-  const normalizedIds = normalizeBlogProductIds(productIds);
-  const snapshots = [];
-  const missingIds = [];
-
-  for (const productId of normalizedIds) {
-    const snapshot = await fetchBlogProductSnapshot(productId, profiles);
-    if (!snapshot) {
-      missingIds.push(productId);
-      continue;
-    }
-    snapshots.push(snapshot);
-  }
-
-  return {
-    productIds: normalizedIds,
-    snapshots,
-    missingIds,
-  };
-};
-
-const buildBlogProductSummary = (snapshot) => ({
-  product_id: Number(snapshot?.product_id) || null,
-  product_type: normalizeProfileDeviceType(snapshot?.product_type),
-  name: String(snapshot?.core?.name || "").trim(),
-  brand_name: String(snapshot?.core?.brand_name || "").trim(),
-  spec_score: toSafeFiniteNumber(snapshot?.scored?.spec_score, 0),
-  price: formatBlogPrice(snapshot?.lowest_price) || null,
-  image: snapshot?.hero_image || null,
-  images: Array.isArray(snapshot?.images) ? snapshot.images : [],
-});
-
-const buildBlogSelectionContext = (
-  snapshots = [],
-  requestedTokenMap = {},
-) => {
-  const validSnapshots = Array.isArray(snapshots)
-    ? snapshots.filter((snapshot) => {
-        const productId = Number(snapshot?.product_id);
-        return Number.isInteger(productId) && productId > 0;
-      })
-    : [];
-  const primarySnapshot = validSnapshots[0] || null;
-  const mergedTokenMap = primarySnapshot ? buildBlogTokenMap(primarySnapshot) : {};
-  const productSummaries = [];
-
-  validSnapshots.forEach((snapshot, index) => {
-    const productIndex = index + 1;
-    const summary = buildBlogProductSummary(snapshot);
-    const scopedTokenMap = buildBlogTokenMap(snapshot);
-    const productName = summary.name || `Product ${productIndex}`;
-    const productBrand = summary.brand_name || "";
-
-    productSummaries.push(summary);
-
-    mergedTokenMap[`product_${productIndex}_id`] = String(summary.product_id || "");
-    mergedTokenMap[`product_${productIndex}_name`] = productName;
-    mergedTokenMap[`product_${productIndex}_brand`] = productBrand;
-    mergedTokenMap[`product_${productIndex}_type`] = summary.product_type || "";
-
-    Object.entries(scopedTokenMap).forEach(([key, value]) => {
-      if (!profileHasValue(value)) return;
-      mergedTokenMap[`product_${productIndex}_${key}`] = value;
-      if (productIndex === 1) {
-        mergedTokenMap[`primary_${key}`] = value;
-      }
-    });
-  });
-
-  const productNames = productSummaries
-    .map((product) => String(product?.name || "").trim())
-    .filter(Boolean);
-  const productBrands = productSummaries
-    .map((product) => String(product?.brand_name || "").trim())
-    .filter(Boolean);
-
-  if (primarySnapshot) {
-    mergedTokenMap.primary_product_id = String(primarySnapshot.product_id || "");
-    mergedTokenMap.primary_product_type = normalizeProfileDeviceType(
-      primarySnapshot.product_type,
-    );
-  }
-
-  if (productNames.length) {
-    mergedTokenMap.product_count = String(productNames.length);
-    mergedTokenMap.product_names = productNames.join(", ");
-    mergedTokenMap.primary_product_name = productNames[0];
-  }
-
-  if (productBrands.length) {
-    mergedTokenMap.product_brands = productBrands.join(", ");
-  }
-
-  if (productNames.length > 1) {
-    mergedTokenMap.secondary_product_names = productNames.slice(1).join(", ");
-  }
-
-  const tokenMap = {
-    ...mergedTokenMap,
-    ...toPlainObject(requestedTokenMap),
-  };
-  const tokenKeys = Object.keys(tokenMap).sort((left, right) =>
-    left.localeCompare(right),
-  );
-
-  return {
-    primarySnapshot,
-    productIds: productSummaries
-      .map((product) => Number(product?.product_id))
-      .filter((value) => Number.isInteger(value) && value > 0),
-    products: productSummaries,
-    tokenMap,
-    tokenKeys,
-  };
-};
-
-const buildBlogSuggestionsForSelection = (snapshots = [], tokenMap = {}) => {
-  const validSnapshots = Array.isArray(snapshots)
-    ? snapshots.filter((snapshot) => {
-        const productId = Number(snapshot?.product_id);
-        return Number.isInteger(productId) && productId > 0;
-      })
-    : [];
-  const primarySnapshot = validSnapshots[0] || null;
-  const multiProductTemplates = [];
-
-  if (validSnapshots.length > 1) {
-    multiProductTemplates.push(
-      "This roundup tracks {{product_names}} and highlights the biggest differences in pricing, positioning, and day-to-day value.",
-      "Among the selected launches, {{product_1_name}} leads the story while {{secondary_product_names}} add the broader market context.",
-    );
-
-    if (validSnapshots.length >= 2) {
-      multiProductTemplates.push(
-        "{{product_1_name}} starts around {{product_1_price}}, while {{product_2_name}} is listed near {{product_2_price}} for buyers comparing the two releases.",
-      );
-    }
-  }
-
-  const primarySuggestions = primarySnapshot
-    ? buildBlogSuggestions(primarySnapshot, tokenMap).map((entry) => entry.template)
-    : [];
-  const templates = [...multiProductTemplates, ...primarySuggestions];
-
-  return templates.map((template, index) => ({
-    id: index + 1,
-    template,
-    rendered: renderBlogTemplateWithTokens(template, tokenMap, {
-      preserveUnknown: true,
-    }),
-  }));
-};
-
-const findExistingBlogByOrderedProductSet = async (
-  productIds = [],
-  queryable = db,
-) => {
-  const normalizedIds = normalizeBlogProductIds(productIds);
-  if (!normalizedIds.length) return null;
-
-  const result = await queryable.query(
-    `
-      SELECT
-        bl.id,
-        bl.product_id,
-        bl.status,
-        bl.slug
-      FROM blogs bl
-      WHERE COALESCE(
-        (
-          SELECT array_agg(bp.product_id ORDER BY bp.position ASC, bp.id ASC)
-          FROM blog_products bp
-          WHERE bp.blog_id = bl.id
-        ),
-        CASE
-          WHEN bl.product_id IS NOT NULL THEN ARRAY[bl.product_id]::int[]
-          ELSE ARRAY[]::int[]
-        END
-      ) = $1::int[]
-      ORDER BY bl.updated_at DESC NULLS LAST, bl.id DESC
-      LIMIT 1
-    `,
-    [normalizedIds],
-  );
-
-  return result.rows[0] || null;
-};
-
-const attachBlogProductsToRows = async (rows = []) => {
-  if (!Array.isArray(rows) || rows.length === 0) return rows;
-
-  const blogIds = Array.from(
-    new Set(
-      rows
-        .map((row) => Number(row?.id))
-        .filter((value) => Number.isInteger(value) && value > 0),
-    ),
-  );
-  if (!blogIds.length) return rows;
-
-  const result = await db.query(
-    `
-      SELECT
-        bp.blog_id,
-        bp.product_id,
-        bp.position,
-        p.name,
-        p.product_type,
-        b.name AS brand_name,
-        (
-          SELECT pi.image_url
-          FROM product_images pi
-          WHERE pi.product_id = bp.product_id
-          ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-          LIMIT 1
-        ) AS image
-      FROM blog_products bp
-      JOIN products p
-        ON p.id = bp.product_id
-      LEFT JOIN brands b
-        ON b.id = p.brand_id
-      WHERE bp.blog_id = ANY($1::int[])
-      ORDER BY bp.blog_id ASC, bp.position ASC, bp.id ASC
-    `,
-    [blogIds],
-  );
-
-  const productsByBlogId = new Map();
-  (result.rows || []).forEach((row) => {
-    const blogId = Number(row?.blog_id);
-    if (!Number.isInteger(blogId) || blogId <= 0) return;
-    const current = productsByBlogId.get(blogId) || [];
-    current.push({
-      product_id: Number(row?.product_id) || null,
-      product_type: normalizeProfileDeviceType(row?.product_type),
-      name: String(row?.name || "").trim(),
-      brand_name: String(row?.brand_name || "").trim(),
-      image: row?.image || null,
-    });
-    productsByBlogId.set(blogId, current);
-  });
-
-  rows.forEach((row) => {
-    const blogId = Number(row?.id);
-    const existingProductMap = new Map(
-      (Array.isArray(row?.products) ? row.products : [])
-        .map((product) => [Number(product?.product_id), product])
-        .filter(([productId]) => Number.isInteger(productId) && productId > 0),
-    );
-    const linkedProducts = (productsByBlogId.get(blogId) || []).map((product) => ({
-      ...(existingProductMap.get(Number(product?.product_id)) || {}),
-      ...product,
-    }));
-    const fallbackProducts =
-      linkedProducts.length === 0 &&
-      Number.isInteger(Number(row?.product_id)) &&
-      Number(row?.product_id) > 0
-        ? [
-            {
-              product_id: Number(row.product_id),
-              product_type: normalizeProfileDeviceType(row?.product_type),
-              name: String(row?.product_name || "").trim(),
-              brand_name: String(row?.brand_name || "").trim(),
-              image: row?.hero_image || null,
-            },
-          ]
-        : [];
-    const products = linkedProducts.length ? linkedProducts : fallbackProducts;
-    const productIds = normalizeBlogProductIds(products);
-
-    row.product_ids = productIds;
-    row.products = products;
-    row.linked_product_count = productIds.length;
-    row.product_names = products
-      .map((product) => String(product?.name || "").trim())
-      .filter(Boolean)
-      .join(", ");
-
-    const primaryProduct = products[0] || null;
-    if (primaryProduct) {
-      row.primary_product_id = primaryProduct.product_id || null;
-      row.product_id = row.product_id || primaryProduct.product_id || null;
-      row.product_name = row.product_name || primaryProduct.name || "";
-      row.product_type = row.product_type || primaryProduct.product_type || null;
-      row.brand_name = row.brand_name || primaryProduct.brand_name || "";
-    }
-  });
-
-  return rows;
-};
-
-const syncBlogProducts = async (queryable, blogId, productIds = []) => {
-  const normalizedBlogId = Number(blogId);
-  if (!Number.isInteger(normalizedBlogId) || normalizedBlogId <= 0) return;
-
-  const orderedProductIds = normalizeBlogProductIds(productIds);
-  await queryable.query(`DELETE FROM blog_products WHERE blog_id = $1`, [
-    normalizedBlogId,
-  ]);
-
-  if (!orderedProductIds.length) return;
-
-  await queryable.query(
-    `
-      INSERT INTO blog_products (blog_id, product_id, position)
-      SELECT $1, linked_product_id, linked_position::int
-      FROM unnest($2::int[]) WITH ORDINALITY AS linked(linked_product_id, linked_position)
-    `,
-    [normalizedBlogId, orderedProductIds],
-  );
-};
-
-const resolvePublicBlogRow = async (
-  row,
-  profileConfig = null,
-  snapshotCache = null,
-) => {
-  const blog = { ...row };
-  if (!blog.author_name && blog.author_user_id) {
-    const author = await resolveRbacUserById(blog.author_user_id).catch(
-      () => null,
-    );
-    if (author?.display_name) {
-      blog.author_name = author.display_name;
-    }
-  }
-  const template = String(blog.content_template || "").trim();
-  const productIds = normalizeBlogProductIds(blog.product_ids, blog.product_id);
-
-  if (!template) return blog;
-
-  let tokenMap = { ...toPlainObject(blog.token_snapshot) };
-
-  if (productIds.length > 0) {
-    const config =
-      profileConfig ||
-      (await readDeviceFieldProfilesConfig().catch(() => ({ profiles: [] })));
-    const snapshots = [];
-
-    for (const productId of productIds) {
-      let snapshot =
-        snapshotCache instanceof Map ? snapshotCache.get(productId) : undefined;
-
-      if (typeof snapshot === "undefined") {
-        snapshot = await fetchBlogProductSnapshot(productId, config?.profiles || []);
-        if (snapshotCache instanceof Map) {
-          snapshotCache.set(productId, snapshot || null);
-        }
-      }
-
-      if (snapshot) {
-        snapshots.push(snapshot);
-      }
-    }
-
-    if (snapshots.length > 0) {
-      const selectionContext = buildBlogSelectionContext(snapshots, tokenMap);
-      const primarySnapshot = selectionContext.primarySnapshot;
-      tokenMap = selectionContext.tokenMap;
-      blog.product_ids = selectionContext.productIds;
-      blog.products = selectionContext.products;
-      blog.product_names = selectionContext.products
-        .map((product) => String(product?.name || "").trim())
-        .filter(Boolean)
-        .join(", ");
-
-      if (
-        blog.hero_image_source !== "none" &&
-        !blog.hero_image &&
-        primarySnapshot?.hero_image
-      ) {
-        blog.hero_image = primarySnapshot.hero_image;
-      }
-      if (!blog.hero_image_source && blog.hero_image) {
-        blog.hero_image_source =
-          primarySnapshot?.hero_image && blog.hero_image === primarySnapshot.hero_image
-            ? "asset"
-            : "url";
-      }
-      if (!blog.brand_logo && primarySnapshot?.core?.brand_logo) {
-        blog.brand_logo = primarySnapshot.core.brand_logo;
-      }
-      if (!blog.product_name && selectionContext.products[0]?.name) {
-        blog.product_name = selectionContext.products[0].name;
-      }
-      if (!blog.product_type && selectionContext.products[0]?.product_type) {
-        blog.product_type = selectionContext.products[0].product_type;
-      }
-      if (!blog.brand_name && selectionContext.products[0]?.brand_name) {
-        blog.brand_name = selectionContext.products[0].brand_name;
-      }
-    } else {
-      blog.product_ids = productIds;
-    }
-  }
-
-  blog.content_rendered = renderBlogTemplateWithTokens(template, tokenMap, {
-    preserveUnknown: false,
-  });
-
-  // Ensure proper HTML encoding for API responses
-  blog.content_template = ensureProperHtmlEncoding(blog.content_template);
-  blog.content_rendered = ensureProperHtmlEncoding(blog.content_rendered);
-
-  return blog;
-};
-
 const resolveUniqueBlogSlug = async (
   requestedSlug,
   productId,
@@ -5867,6 +2948,7 @@ const resolveUniqueBlogSlug = async (
     if (!existing.rows.length) return slug;
 
     const existingId = Number(existing.rows[0]?.id);
+    const existingProductId = Number(existing.rows[0]?.product_id);
     if (
       Number.isInteger(Number(blogId)) &&
       Number(blogId) > 0 &&
@@ -5874,6 +2956,7 @@ const resolveUniqueBlogSlug = async (
     ) {
       return slug;
     }
+    if (hasProductId && existingProductId === Number(productId)) return slug;
     slug = `${baseSlug}-${counter}`;
     counter += 1;
   }
@@ -5885,9 +2968,9 @@ const resolveUniqueBlogSlug = async (
 async function runMigrations() {
   try {
     // Helper to run migration queries but ignore duplicate pg_type errors
-    async function safeQuery(sql, params = []) {
+    async function safeQuery(sql) {
       try {
-        await db.query(sql, params);
+        await db.query(sql);
       } catch (err) {
         // Postgres may raise a unique violation on pg_type when a previous
         // failed attempt left a composite type with the same name.
@@ -6284,177 +3367,45 @@ async function runMigrations() {
         email TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
         role TEXT DEFAULT 'admin',
-        display_name TEXT,
-        bio TEXT,
-        department TEXT,
-        status TEXT NOT NULL DEFAULT 'active',
-        avatar TEXT,
-        permissions_override JSONB NOT NULL DEFAULT '[]'::jsonb,
-        last_login TIMESTAMPTZ,
-        updated_at TIMESTAMP DEFAULT now(),
         created_at TIMESTAMP DEFAULT now()
       );
     `);
 
     await safeQuery(`
       ALTER TABLE "user"
-      ADD COLUMN IF NOT EXISTS display_name TEXT,
-      ADD COLUMN IF NOT EXISTS bio TEXT,
-      ADD COLUMN IF NOT EXISTS department TEXT,
-      ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active',
-      ADD COLUMN IF NOT EXISTS avatar TEXT,
-      ADD COLUMN IF NOT EXISTS permissions_override JSONB NOT NULL DEFAULT '[]'::jsonb,
-      ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now();
+      ADD COLUMN IF NOT EXISTS last_otp_verified_at TIMESTAMPTZ;
     `);
 
     await safeQuery(`
-      CREATE TABLE IF NOT EXISTS admin_roles (
-        id SERIAL PRIMARY KEY,
-        name TEXT UNIQUE NOT NULL,
-        title TEXT NOT NULL,
-        description TEXT,
-        permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
-        built_in BOOLEAN NOT NULL DEFAULT false,
-        created_at TIMESTAMP DEFAULT now(),
-        updated_at TIMESTAMP DEFAULT now()
-      );
-    `);
-
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS admin_permissions (
-        id SERIAL PRIMARY KEY,
-        name TEXT UNIQUE NOT NULL,
-        description TEXT,
-        module_key TEXT,
-        action TEXT,
-        built_in BOOLEAN NOT NULL DEFAULT false,
-        created_at TIMESTAMP DEFAULT now(),
-        updated_at TIMESTAMP DEFAULT now()
-      );
-    `);
-
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS admin_activity_log (
-        id SERIAL PRIMARY KEY,
-        actor_user_id INT REFERENCES "user"(id) ON DELETE SET NULL,
-        actor_name TEXT,
-        actor_role TEXT,
-        module_key TEXT,
-        action TEXT NOT NULL,
-        target_type TEXT,
-        target_id TEXT,
-        target_label TEXT,
-        note TEXT,
-        meta JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at TIMESTAMP DEFAULT now()
-      );
-    `);
-
-    for (const module of getPermissionMatrix()) {
-      for (const permission of module.permissions || []) {
-        await safeQuery(
-          `
-          INSERT INTO admin_permissions (
-            name,
-            description,
-            module_key,
-            action,
-            built_in
-          )
-          VALUES ($1,$2,$3,$4,true)
-          ON CONFLICT (name) DO NOTHING
-        `,
-          [
-            permission.code,
-            `Allows ${permission.action} on ${module.label}`,
-            module.key,
-            permission.action,
-          ],
-        );
-      }
-    }
-
-    for (const [roleName, preset] of Object.entries(ROLE_PRESETS)) {
-      await safeQuery(
-        `
-        INSERT INTO admin_roles (
-          name,
-          title,
-          description,
-          permissions,
-          built_in
-        )
-        VALUES ($1,$2,$3,$4::jsonb,true)
-        ON CONFLICT (name) DO NOTHING
-      `,
-        [
-          roleName,
-          preset.label,
-          preset.description,
-          JSON.stringify(getDefaultPermissionsForRole(roleName)),
-        ],
-      );
-    }
-
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS admin_security_config (
-        id INT PRIMARY KEY CHECK (id = 1),
-        organization_pin_hash TEXT,
-        updated_by INT REFERENCES "user"(id) ON DELETE SET NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-    `);
-
-    await safeQuery(`
-      ALTER TABLE admin_security_config
-      ADD COLUMN IF NOT EXISTS organization_pin_hash TEXT,
-      ADD COLUMN IF NOT EXISTS updated_by INT REFERENCES "user"(id) ON DELETE SET NULL,
-      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
-    `);
-
-    await safeQuery(`
-      INSERT INTO admin_security_config (id)
-      VALUES (1)
-      ON CONFLICT (id) DO NOTHING;
-    `);
-
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS admin_email_otp_challenges (
-        id UUID PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS auth_login_challenges (
+        challenge_id TEXT PRIMARY KEY,
         user_id INT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
         email TEXT NOT NULL,
-        purpose TEXT NOT NULL,
-        code_hash TEXT NOT NULL,
-        login_ticket_hash TEXT,
-        attempts INT NOT NULL DEFAULT 0,
+        otp_hash TEXT NOT NULL,
         expires_at TIMESTAMPTZ NOT NULL,
-        consumed_at TIMESTAMPTZ,
+        attempts INT NOT NULL DEFAULT 0,
+        max_attempts INT NOT NULL DEFAULT 5,
+        resend_count INT NOT NULL DEFAULT 0,
+        last_sent_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        channels JSONB NOT NULL DEFAULT '[]'::jsonb,
+        verified_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
 
     await safeQuery(`
-      ALTER TABLE admin_email_otp_challenges
-      ADD COLUMN IF NOT EXISTS user_id INT REFERENCES "user"(id) ON DELETE CASCADE,
-      ADD COLUMN IF NOT EXISTS email TEXT,
-      ADD COLUMN IF NOT EXISTS purpose TEXT,
-      ADD COLUMN IF NOT EXISTS code_hash TEXT,
-      ADD COLUMN IF NOT EXISTS login_ticket_hash TEXT,
-      ADD COLUMN IF NOT EXISTS attempts INT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
+      CREATE INDEX IF NOT EXISTS idx_auth_login_challenges_user_id
+      ON auth_login_challenges (user_id);
     `);
 
     await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_admin_email_otp_user_purpose
-      ON admin_email_otp_challenges (user_id, purpose, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_auth_login_challenges_email
+      ON auth_login_challenges (email);
     `);
 
     await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_admin_email_otp_expires_at
-      ON admin_email_otp_challenges (expires_at);
+      CREATE INDEX IF NOT EXISTS idx_auth_login_challenges_expires_at
+      ON auth_login_challenges (expires_at);
     `);
 
     await safeQuery(`
@@ -6470,19 +3421,6 @@ async function runMigrations() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         last_used_at TIMESTAMPTZ
       );
-    `);
-
-    await safeQuery(`
-      ALTER TABLE auth_webauthn_credentials
-      ADD COLUMN IF NOT EXISTS user_id INT REFERENCES "user"(id) ON DELETE CASCADE,
-      ADD COLUMN IF NOT EXISTS credential_id TEXT,
-      ADD COLUMN IF NOT EXISTS public_key BYTEA,
-      ADD COLUMN IF NOT EXISTS counter BIGINT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS transports JSONB DEFAULT '[]'::jsonb,
-      ADD COLUMN IF NOT EXISTS credential_device_type TEXT,
-      ADD COLUMN IF NOT EXISTS credential_backed_up BOOLEAN DEFAULT FALSE,
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now(),
-      ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
     `);
 
     await safeQuery(`
@@ -6502,18 +3440,6 @@ async function runMigrations() {
         expires_at TIMESTAMPTZ NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
-    `);
-
-    await safeQuery(`
-      ALTER TABLE auth_webauthn_challenges
-      ADD COLUMN IF NOT EXISTS user_id INT REFERENCES "user"(id) ON DELETE CASCADE,
-      ADD COLUMN IF NOT EXISTS purpose TEXT,
-      ADD COLUMN IF NOT EXISTS login_ticket_hash TEXT,
-      ADD COLUMN IF NOT EXISTS challenge TEXT,
-      ADD COLUMN IF NOT EXISTS rp_id TEXT,
-      ADD COLUMN IF NOT EXISTS expected_origin TEXT,
-      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
     `);
 
     await safeQuery(`
@@ -6606,100 +3532,6 @@ async function runMigrations() {
     await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_competitor_analysis_product_score
       ON competitor_analysis (product_id, competition_score DESC);
-    `);
-
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS published_compare_pages (
-        id SERIAL PRIMARY KEY,
-        slug TEXT NOT NULL UNIQUE,
-        entity_type TEXT NOT NULL DEFAULT 'smartphone',
-        primary_product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-        segment_label TEXT,
-        smartphone_type_label TEXT,
-        title TEXT NOT NULL,
-        meta_description TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'published',
-        created_by INT REFERENCES "user"(id),
-        updated_by INT REFERENCES "user"(id),
-        published_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT now(),
-        updated_at TIMESTAMP DEFAULT now(),
-        CHECK (status IN ('draft', 'published'))
-      );
-    `);
-
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS published_compare_page_items (
-        id SERIAL PRIMARY KEY,
-        compare_page_id INT NOT NULL REFERENCES published_compare_pages(id) ON DELETE CASCADE,
-        product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-        position INT NOT NULL,
-        created_at TIMESTAMP DEFAULT now(),
-        UNIQUE (compare_page_id, product_id),
-        UNIQUE (compare_page_id, position),
-        CHECK (position BETWEEN 1 AND 3)
-      );
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_published_compare_pages_status_updated
-      ON published_compare_pages (status, updated_at DESC);
-    `);
-
-    await safeQuery(`
-      ALTER TABLE published_compare_pages
-      ALTER COLUMN status SET DEFAULT 'published';
-    `);
-
-    await safeQuery(`
-      ALTER TABLE published_compare_pages
-      ADD COLUMN IF NOT EXISTS compare_key TEXT,
-      ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual',
-      ADD COLUMN IF NOT EXISTS generation_reason TEXT,
-      ADD COLUMN IF NOT EXISTS system_score NUMERIC NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS manual_compare_count INT NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS last_compared_at TIMESTAMP,
-      ADD COLUMN IF NOT EXISTS generated_at TIMESTAMP DEFAULT now();
-    `);
-
-    await safeQuery(`
-      ALTER TABLE published_compare_pages
-      DROP CONSTRAINT IF EXISTS published_compare_pages_source_check;
-    `);
-
-    await safeQuery(`
-      ALTER TABLE published_compare_pages
-      ADD CONSTRAINT published_compare_pages_source_check
-      CHECK (source IN ('manual', 'automatic'));
-    `);
-
-    await safeQuery(`
-      UPDATE published_compare_pages cp
-      SET compare_key = src.compare_key
-      FROM (
-        SELECT
-          cpi.compare_page_id,
-          string_agg(cpi.product_id::text, ':' ORDER BY cpi.product_id) AS compare_key
-        FROM published_compare_page_items cpi
-        GROUP BY cpi.compare_page_id
-      ) src
-      WHERE cp.id = src.compare_page_id
-        AND (cp.compare_key IS NULL OR cp.compare_key = '');
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_published_compare_pages_compare_key
-      ON published_compare_pages (compare_key);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_published_compare_pages_source_status
-      ON published_compare_pages (source, status, updated_at DESC);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_published_compare_page_items_page_position
-      ON published_compare_page_items (compare_page_id, position ASC);
     `);
 
     // Hook Dynamic Score (precomputed ranking signals)
@@ -6894,11 +3726,9 @@ async function runMigrations() {
         product_id INT UNIQUE
           REFERENCES products(id)
           ON DELETE CASCADE,
-        category TEXT NOT NULL DEFAULT 'news',
         title TEXT NOT NULL,
         slug TEXT NOT NULL UNIQUE,
         excerpt TEXT,
-        author_name TEXT,
         content_template TEXT NOT NULL,
         content_rendered TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'draft',
@@ -6908,13 +3738,6 @@ async function runMigrations() {
         meta_title TEXT,
         meta_description TEXT,
         hero_image TEXT,
-        hero_image_source TEXT,
-        hero_image_alt TEXT,
-        hero_image_caption TEXT,
-        tags JSONB NOT NULL DEFAULT '[]'::jsonb,
-        featured BOOLEAN NOT NULL DEFAULT false,
-        trending BOOLEAN NOT NULL DEFAULT false,
-        pinned BOOLEAN NOT NULL DEFAULT false,
         created_by INT REFERENCES "user"(id),
         updated_by INT REFERENCES "user"(id),
         published_at TIMESTAMP,
@@ -6932,56 +3755,6 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
-      ALTER TABLE blogs
-      ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'news';
-    `);
-
-    await safeQuery(`
-      ALTER TABLE blogs
-      ADD COLUMN IF NOT EXISTS hero_image_source TEXT;
-    `);
-
-    await safeQuery(`
-      ALTER TABLE blogs
-      ADD COLUMN IF NOT EXISTS author_name TEXT;
-    `);
-
-    await safeQuery(`
-      ALTER TABLE blogs
-      ADD COLUMN IF NOT EXISTS author_user_id INT REFERENCES "user"(id) ON DELETE SET NULL;
-    `);
-
-    await safeQuery(`
-      ALTER TABLE blogs
-      ADD COLUMN IF NOT EXISTS hero_image_alt TEXT;
-    `);
-
-    await safeQuery(`
-      ALTER TABLE blogs
-      ADD COLUMN IF NOT EXISTS hero_image_caption TEXT;
-    `);
-
-    await safeQuery(`
-      ALTER TABLE blogs
-      ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb;
-    `);
-
-    await safeQuery(`
-      ALTER TABLE blogs
-      ADD COLUMN IF NOT EXISTS featured BOOLEAN NOT NULL DEFAULT false;
-    `);
-
-    await safeQuery(`
-      ALTER TABLE blogs
-      ADD COLUMN IF NOT EXISTS trending BOOLEAN NOT NULL DEFAULT false;
-    `);
-
-    await safeQuery(`
-      ALTER TABLE blogs
-      ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT false;
-    `);
-
-    await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_blogs_status_published_at
       ON blogs (status, published_at DESC, updated_at DESC);
     `);
@@ -6989,91 +3762,6 @@ async function runMigrations() {
     await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_blogs_product
       ON blogs (product_id);
-    `);
-
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS blog_products (
-        id SERIAL PRIMARY KEY,
-        blog_id INT NOT NULL REFERENCES blogs(id) ON DELETE CASCADE,
-        product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-        position INT NOT NULL DEFAULT 1,
-        created_at TIMESTAMP DEFAULT now(),
-        updated_at TIMESTAMP DEFAULT now(),
-        CONSTRAINT blog_products_blog_product_unique UNIQUE (blog_id, product_id)
-      );
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_blog_products_blog_position
-      ON blog_products (blog_id, position ASC, id ASC);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_blog_products_product
-      ON blog_products (product_id, blog_id);
-    `);
-
-    await safeQuery(`
-      INSERT INTO blog_products (blog_id, product_id, position)
-      SELECT
-        bl.id,
-        bl.product_id,
-        1
-      FROM blogs bl
-      WHERE bl.product_id IS NOT NULL
-        AND NOT EXISTS (
-          SELECT 1
-          FROM blog_products bp
-          WHERE bp.blog_id = bl.id
-            AND bp.product_id = bl.product_id
-        );
-    `);
-
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS push_subscriptions (
-        id SERIAL PRIMARY KEY,
-        token TEXT NOT NULL,
-        topic TEXT NOT NULL DEFAULT 'news-all',
-        platform TEXT NOT NULL DEFAULT 'web',
-        permission TEXT,
-        user_agent TEXT,
-        status TEXT NOT NULL DEFAULT 'active',
-        last_error TEXT,
-        last_registered_at TIMESTAMP DEFAULT now(),
-        created_at TIMESTAMP DEFAULT now(),
-        updated_at TIMESTAMP DEFAULT now(),
-        CONSTRAINT push_subscriptions_topic_token_unique UNIQUE (token, topic),
-        CONSTRAINT push_subscriptions_status_check
-          CHECK (status IN ('active', 'inactive', 'error'))
-      );
-    `);
-
-    await safeQuery(`
-      ALTER TABLE push_subscriptions
-      ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'web',
-      ADD COLUMN IF NOT EXISTS permission TEXT,
-      ADD COLUMN IF NOT EXISTS user_agent TEXT,
-      ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active',
-      ADD COLUMN IF NOT EXISTS last_error TEXT,
-      ADD COLUMN IF NOT EXISTS last_registered_at TIMESTAMP DEFAULT now(),
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT now(),
-      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT now();
-    `);
-
-    await safeQuery(`
-      ALTER TABLE push_subscriptions
-      DROP CONSTRAINT IF EXISTS push_subscriptions_status_check;
-    `);
-
-    await safeQuery(`
-      ALTER TABLE push_subscriptions
-      ADD CONSTRAINT push_subscriptions_status_check
-      CHECK (status IN ('active', 'inactive', 'error'));
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_push_subscriptions_topic_status
-      ON push_subscriptions (topic, status, updated_at DESC);
     `);
 
     // Marketing banners (campaigns / promotions)
@@ -7134,114 +3822,6 @@ async function runMigrations() {
       $$;
     `);
 
-    // Affiliate placements with manual page permissions and schedule windows
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS affiliate_placements (
-        id SERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        slug TEXT NOT NULL UNIQUE,
-        source_type TEXT NOT NULL DEFAULT 'manual',
-        auto_key TEXT,
-        auto_variant_id INT REFERENCES product_variants(id) ON DELETE SET NULL,
-        auto_store_price_id INT REFERENCES variant_store_prices(id) ON DELETE SET NULL,
-        title TEXT,
-        description TEXT,
-        cta_text TEXT,
-        cta_subtext TEXT,
-        badge_text TEXT,
-        disclosure_text TEXT,
-        store_name TEXT,
-        store_logo_url TEXT,
-        image_url TEXT,
-        destination_url TEXT,
-        affiliate_url TEXT,
-        price NUMERIC,
-        currency_code TEXT NOT NULL DEFAULT 'INR',
-        priority INT NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'draft',
-        publish_at TIMESTAMPTZ,
-        unpublish_at TIMESTAMPTZ,
-        duration_days INT,
-        allow_product_list BOOLEAN NOT NULL DEFAULT false,
-        allow_product_detail BOOLEAN NOT NULL DEFAULT false,
-        allow_news BOOLEAN NOT NULL DEFAULT false,
-        scope_type TEXT NOT NULL DEFAULT 'global',
-        product_id INT REFERENCES products(id) ON DELETE CASCADE,
-        blog_id INT REFERENCES blogs(id) ON DELETE CASCADE,
-        brand_id INT REFERENCES brands(id) ON DELETE CASCADE,
-        category_name TEXT,
-        list_slot TEXT NOT NULL DEFAULT 'product_card',
-        detail_slot TEXT NOT NULL DEFAULT 'detail_highlight',
-        news_slot TEXT NOT NULL DEFAULT 'inline_after_intro',
-        created_by INT REFERENCES "user"(id) ON DELETE SET NULL,
-        updated_by INT REFERENCES "user"(id) ON DELETE SET NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-    `);
-
-    await safeQuery(`
-      ALTER TABLE affiliate_placements
-      ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'manual',
-      ADD COLUMN IF NOT EXISTS auto_key TEXT,
-      ADD COLUMN IF NOT EXISTS auto_variant_id INT REFERENCES product_variants(id) ON DELETE SET NULL,
-      ADD COLUMN IF NOT EXISTS auto_store_price_id INT REFERENCES variant_store_prices(id) ON DELETE SET NULL;
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_affiliate_placements_status_priority
-      ON affiliate_placements (status, priority DESC, created_at DESC);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_affiliate_placements_scope
-      ON affiliate_placements (scope_type, product_id, blog_id, brand_id);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_affiliate_placements_page_flags
-      ON affiliate_placements (allow_product_list, allow_product_detail, allow_news);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_affiliate_placements_source_type
-      ON affiliate_placements (source_type, product_id, updated_at DESC);
-    `);
-
-    await safeQuery(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_affiliate_placements_auto_key_unique
-      ON affiliate_placements (auto_key)
-      WHERE auto_key IS NOT NULL;
-    `);
-
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS affiliate_clicks (
-        id BIGSERIAL PRIMARY KEY,
-        placement_id INT NOT NULL REFERENCES affiliate_placements(id) ON DELETE CASCADE,
-        page_type TEXT,
-        slot TEXT,
-        product_id INT REFERENCES products(id) ON DELETE SET NULL,
-        blog_id INT REFERENCES blogs(id) ON DELETE SET NULL,
-        device_type TEXT,
-        referer TEXT,
-        user_agent TEXT,
-        ip_address TEXT,
-        target_url TEXT,
-        was_live BOOLEAN NOT NULL DEFAULT true,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_affiliate_clicks_placement_created
-      ON affiliate_clicks (placement_id, created_at DESC);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_affiliate_clicks_page_created
-      ON affiliate_clicks (page_type, created_at DESC);
-    `);
-
     // Popular feature clicks (analytics) - aggregated per day
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS feature_click_stats (
@@ -7261,56 +3841,6 @@ async function runMigrations() {
       ON feature_click_stats (device_type, day);
     `);
 
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS search_interest_events (
-        id SERIAL PRIMARY KEY,
-        event_id TEXT UNIQUE,
-        query TEXT,
-        normalized_query TEXT,
-        product_id INT REFERENCES products(id) ON DELETE SET NULL,
-        product_type TEXT,
-        device_type TEXT,
-        source TEXT,
-        created_at TIMESTAMP DEFAULT now()
-      );
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_search_interest_events_product_created
-      ON search_interest_events (product_id, created_at DESC);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_search_interest_events_query_created
-      ON search_interest_events (normalized_query, created_at DESC);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_search_interest_events_created_at
-      ON search_interest_events (created_at DESC);
-    `);
-
-    await safeQuery(`
-      CREATE TABLE IF NOT EXISTS page_engagement_events (
-        id SERIAL PRIMARY KEY,
-        product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-        page_path TEXT,
-        source TEXT,
-        duration_ms INT NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
-        created_at TIMESTAMP DEFAULT now()
-      );
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_page_engagement_events_product_created
-      ON page_engagement_events (product_id, created_at DESC);
-    `);
-
-    await safeQuery(`
-      CREATE INDEX IF NOT EXISTS idx_page_engagement_events_created_at
-      ON page_engagement_events (created_at DESC);
-    `);
-
     console.log("✅ Migrations to   completed");
   } catch (err) {
     console.error("Migration error:", err);
@@ -7322,27 +3852,23 @@ async function runMigrations() {
   Auth Middleware + Role-Based Access Control (RBAC)
 ------------------------*/
 
+const OTP_CHALLENGE_TABLE = "auth_login_challenges";
 const WEBAUTHN_CREDENTIAL_TABLE = "auth_webauthn_credentials";
 const WEBAUTHN_CHALLENGE_TABLE = "auth_webauthn_challenges";
-const ADMIN_SECURITY_CONFIG_TABLE = "admin_security_config";
-const ADMIN_EMAIL_OTP_TABLE = "admin_email_otp_challenges";
+const OTP_CODE_LENGTH = 6;
+const OTP_TTL_MS = 5 * 60 * 1000;
+const OTP_RESEND_COOLDOWN_MS = 30 * 1000;
+const OTP_MAX_ATTEMPTS = 5;
+const OTP_HASH_ROUNDS = 10;
+const OTP_REVERIFY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const ACCESS_TOKEN_TTL = "1h";
 const PENDING_LOGIN_TOKEN_PURPOSE = "admin_pending_login";
 const PENDING_LOGIN_TOKEN_TTL_SECONDS = 15 * 60;
 const PENDING_LOGIN_TOKEN_TTL = `${PENDING_LOGIN_TOKEN_TTL_SECONDS}s`;
 const WEBAUTHN_CHALLENGE_TTL_MS = 5 * 60 * 1000;
-const ADMIN_PIN_SETUP_STEP = "pin_setup";
-const ADMIN_PIN_STEP = "pin";
-const ADMIN_PIN_MIN_LENGTH = 4;
-const ADMIN_PIN_MAX_LENGTH = 10;
-const ADMIN_EMAIL_OTP_LENGTH = 6;
-const ADMIN_EMAIL_OTP_TTL_MINUTES = 10;
-const ADMIN_EMAIL_OTP_TTL_MS = ADMIN_EMAIL_OTP_TTL_MINUTES * 60 * 1000;
-const ADMIN_EMAIL_OTP_MAX_ATTEMPTS = 5;
-const ADMIN_PIN_OTP_PURPOSE_SETUP = "organization_pin_setup";
-const ADMIN_PIN_OTP_PURPOSE_UPDATE = "organization_pin_update";
 const WEBAUTHN_RP_NAME =
-  String(process.env.WEBAUTHN_RP_NAME || "Hooks Admin").trim() || "Hooks Admin";
+  String(process.env.WEBAUTHN_RP_NAME || "Hooks Admin").trim() ||
+  "Hooks Admin";
 
 const normalizeOrigin = (value) =>
   String(value || "")
@@ -7350,7 +3876,9 @@ const normalizeOrigin = (value) =>
     .replace(/\/$/, "");
 
 const WEBAUTHN_ALLOWED_ORIGINS = new Set([
-  ...Array.from(ALLOWED_ORIGINS).map(normalizeOrigin).filter(Boolean),
+  ...Array.from(ALLOWED_ORIGINS)
+    .map(normalizeOrigin)
+    .filter(Boolean),
   ...String(process.env.WEBAUTHN_ALLOWED_ORIGINS || "")
     .split(",")
     .map(normalizeOrigin)
@@ -7367,34 +3895,23 @@ const loginInitiateLimiter = rateLimit({
   },
 });
 
-const webAuthnVerifyLimiter = rateLimit({
+const loginOtpVerifyLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: {
-    message: "Too many device verification attempts. Please try again later.",
+    message: "Too many OTP verification attempts. Please try again later.",
   },
 });
 
-const adminOtpSendLimiter = rateLimit({
+const loginOtpResendLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  max: 5,
   standardHeaders: true,
   legacyHeaders: false,
   message: {
-    message: "Too many verification code requests. Please try again later.",
-  },
-});
-
-const adminOtpVerifyLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    message:
-      "Too many verification attempts. Please request a new code and try again.",
+    message: "Too many OTP resend requests. Please try again later.",
   },
 });
 
@@ -7413,287 +3930,132 @@ const parseBooleanInput = (value) => {
   return false;
 };
 
-const normalizeAdminPin = (value) =>
-  String(value || "")
-    .replace(/\s+/g, "")
-    .trim();
+const normalizeOtpInput = (value) => {
+  const digits = String(value || "")
+    .trim()
+    .replace(/\D/g, "");
+  return digits.length === OTP_CODE_LENGTH ? digits : null;
+};
 
-const normalizeAdminOtp = (value) =>
-  String(value || "")
-    .replace(/\s+/g, "")
-    .trim();
-
-const isValidAdminPin = (value) =>
-  new RegExp(`^\\d{${ADMIN_PIN_MIN_LENGTH},${ADMIN_PIN_MAX_LENGTH}}$`).test(
-    normalizeAdminPin(value),
+const generateOtpCode = () =>
+  String(crypto.randomInt(0, 10 ** OTP_CODE_LENGTH)).padStart(
+    OTP_CODE_LENGTH,
+    "0",
   );
 
-const isValidAdminOtp = (value) =>
-  new RegExp(`^\\d{${ADMIN_EMAIL_OTP_LENGTH}}$`).test(normalizeAdminOtp(value));
+const normalizeSmsRecipient = (phone) => {
+  const raw = String(phone || "").trim();
+  if (!raw) return null;
+  const compact = raw.replace(/\s+/g, "");
+  if (/^\+\d{8,15}$/.test(compact)) return compact;
+
+  const defaultCountryCode = String(
+    process.env.OTP_SMS_DEFAULT_COUNTRY_CODE || "",
+  ).trim();
+  const digits = raw.replace(/\D/g, "");
+  if (defaultCountryCode && /^\+\d{1,4}$/.test(defaultCountryCode) && digits) {
+    return `${defaultCountryCode}${digits}`;
+  }
+
+  return null;
+};
+
+async function sendLoginOtpSms({ phone, otp, expiresInMinutes = 5, userName }) {
+  const recipient = normalizeSmsRecipient(phone);
+  if (!recipient) {
+    return { delivered: false, skipped: true, reason: "invalid_phone" };
+  }
+
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const fromNumber = process.env.TWILIO_FROM_NUMBER;
+  if (!accountSid || !authToken || !fromNumber) {
+    return { delivered: false, skipped: true, reason: "sms_not_configured" };
+  }
+
+  if (typeof fetch !== "function") {
+    return { delivered: false, skipped: true, reason: "fetch_not_available" };
+  }
+
+  const safeMinutes = Number.isFinite(expiresInMinutes)
+    ? Math.max(1, Math.floor(expiresInMinutes))
+    : 5;
+  const body = `Your Hook login code is ${otp}. It expires in ${safeMinutes} minutes.`;
+
+  const response = await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        From: fromNumber,
+        To: recipient,
+        Body: body,
+      }).toString(),
+    },
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(
+      `SMS delivery failed (${response.status})${errorText ? `: ${errorText}` : ""}`,
+    );
+  }
+
+  return { delivered: true, channel: "sms", recipient, userName };
+}
+
+async function deliverLoginOtpNotifications({ user, otp, expiresInMinutes }) {
+  const safeName = user.user_name || user.first_name || user.email || "there";
+  const deliveryTasks = [
+    sendLoginOtpEmail({
+      email: user.email,
+      otp,
+      userName: safeName,
+      expiresInMinutes,
+    })
+      .then(() => ({ delivered: true, channel: "email" }))
+      .catch((error) => {
+        console.error("Login OTP email failed:", error);
+        return { delivered: false, channel: "email", error };
+      }),
+  ];
+
+  if (user.phone) {
+    deliveryTasks.push(
+      sendLoginOtpSms({
+        phone: user.phone,
+        otp,
+        expiresInMinutes,
+        userName: safeName,
+      })
+        .then((result) => result)
+        .catch((error) => {
+          console.error("Login OTP SMS failed:", error);
+          return { delivered: false, channel: "sms", error };
+        }),
+    );
+  }
+
+  const results = await Promise.all(deliveryTasks);
+  return results
+    .filter((result) => result && result.delivered)
+    .map((result) => result.channel);
+}
 
 const normalizeTransportList = (value) =>
   (Array.isArray(value) ? value : []).filter(
     (transport) => typeof transport === "string" && transport.trim(),
   );
 
-const parseJsonArray = (value, fallback = []) => {
-  if (Array.isArray(value)) return value;
-  if (typeof value === "string" && value.trim()) {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : fallback;
-    } catch {
-      return fallback;
-    }
-  }
-  return fallback;
-};
-
-const normalizeUserStatus = (value = "") => {
-  const status = String(value || "")
-    .trim()
-    .toLowerCase();
-  return status === "inactive" ? "inactive" : "active";
-};
-
-const normalizeAdminUserRow = (user, roleRecord = null) => {
-  if (!user) return null;
-  const firstName = String(user.first_name || "").trim();
-  const lastName = String(user.last_name || "").trim();
-  const displayName =
-    String(user.display_name || "").trim() ||
-    [firstName, lastName].filter(Boolean).join(" ").trim() ||
-    String(user.user_name || "").trim() ||
-    String(user.email || "").trim() ||
-    "User";
-  const permissionsOverride = parseJsonArray(user.permissions_override, []);
-  const roleName = normalizeRole(user.role || roleRecord?.name || "viewer");
-  const rolePermissions = parseJsonArray(roleRecord?.permissions || [], []).map(
-    (permission) => normalizePermissionToken(permission),
-  );
-  const effectivePermissions = Array.from(
-    new Set(
-      [...rolePermissions, ...permissionsOverride]
-        .map((permission) => normalizePermissionToken(permission))
-        .filter(Boolean),
-    ),
-  );
-
-  return {
-    id: user.id,
-    user_name: user.user_name || "",
-    username: user.user_name || "",
-    first_name: firstName,
-    last_name: lastName,
-    display_name: displayName,
-    author_name: displayName,
-    bio: String(user.bio || "").trim(),
-    department: String(user.department || "").trim(),
-    email: String(user.email || "").trim(),
-    phone: String(user.phone || "").trim(),
-    gender: String(user.gender || "").trim(),
-    avatar: String(user.avatar || "").trim(),
-    role: roleName,
-    role_title: roleRecord?.title || getRolePreset(roleName).label,
-    role_description:
-      roleRecord?.description || getRolePreset(roleName).description,
-    status: normalizeUserStatus(user.status),
-    permissions_override: permissionsOverride,
-    effective_permissions: effectivePermissions,
-    permissions: effectivePermissions,
-    last_login: user.last_login || null,
-    created_at: user.created_at || null,
-    updated_at: user.updated_at || user.created_at || null,
-  };
-};
-
-const normalizeAdminRoleRow = (role) => {
-  if (!role) return null;
-  const roleName = normalizeRole(role.name || role.id || "viewer");
-  const preset = getRolePreset(roleName);
-  const permissions = Array.from(
-    new Set(
-      parseJsonArray(role.permissions, getDefaultPermissionsForRole(roleName))
-        .map((permission) => normalizePermissionToken(permission))
-        .filter(Boolean),
-    ),
-  );
-
-  return {
-    id: role.id || roleName,
-    name: role.name || roleName,
-    title: String(role.title || preset.label || roleName).trim(),
-    description: String(role.description || preset.description || "").trim(),
-    permissions,
-    built_in: Boolean(role.built_in),
-    created_at: role.created_at || null,
-    updated_at: role.updated_at || role.created_at || null,
-  };
-};
-
-const normalizeAdminPermissionRow = (permission) => {
-  if (!permission) return null;
-  return {
-    id: permission.id || permission.name,
-    name: permission.name || "",
-    description: String(permission.description || "").trim(),
-    module: String(permission.module_key || permission.module || "").trim(),
-    module_label: getModuleLabel(
-      permission.module_key || permission.module || "",
-    ),
-    action: String(permission.action || "").trim(),
-    built_in: Boolean(permission.built_in),
-    created_at: permission.created_at || null,
-    updated_at: permission.updated_at || permission.created_at || null,
-  };
-};
-
-const recordAdminActivity = async ({
-  actorUserId = null,
-  actorName = "",
-  actorRole = "",
-  moduleKey = "",
-  action = "updated",
-  targetType = "",
-  targetId = null,
-  targetLabel = "",
-  note = "",
-  meta = {},
-} = {}) => {
-  try {
-    await db.query(
-      `
-      INSERT INTO admin_activity_log (
-        actor_user_id,
-        actor_name,
-        actor_role,
-        module_key,
-        action,
-        target_type,
-        target_id,
-        target_label,
-        note,
-        meta
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
-    `,
-      [
-        actorUserId || null,
-        String(actorName || "").trim() || "System",
-        String(actorRole || "").trim() || "admin",
-        String(moduleKey || "").trim() || null,
-        String(action || "").trim() || "updated",
-        String(targetType || "").trim() || null,
-        targetId === null || typeof targetId === "undefined"
-          ? null
-          : String(targetId),
-        String(targetLabel || "").trim() || null,
-        String(note || "").trim() || null,
-        JSON.stringify(toPlainObject(meta)),
-      ],
-    );
-  } catch (err) {
-    console.error("Failed to record admin activity:", err.message);
-  }
-};
-
-const getRoleAccessRow = async (roleName = "") => {
-  const normalized = normalizeRole(roleName);
-  const result = await db.query(
-    `
-    SELECT id, name, title, description, permissions, built_in, created_at, updated_at
-    FROM admin_roles
-    WHERE LOWER(name) = $1
-    ORDER BY updated_at DESC, id DESC
-    LIMIT 1
-  `,
-    [normalized],
-  );
-  return (
-    normalizeAdminRoleRow(result.rows[0]) ||
-    normalizeAdminRoleRow({
-      name: normalized,
-      title: getRolePreset(normalized).label,
-      description: getRolePreset(normalized).description,
-      permissions: getDefaultPermissionsForRole(normalized),
-      built_in: true,
-    })
-  );
-};
-
-const getRolePermissions = async (roleName = "") => {
-  const role = await getRoleAccessRow(roleName);
-  return Array.from(
-    new Set(
-      (role?.permissions || [])
-        .map((permission) => normalizePermissionToken(permission))
-        .filter(Boolean),
-    ),
-  );
-};
-
-const hasRolePermission = async (roleName = "", requested = "") => {
-  const permissions = await getRolePermissions(roleName);
-  return hasPermissionSet(permissions, requested);
-};
-
-const hasRoleAnyPermissions = async (roleName = "", requested = []) => {
-  const permissions = await getRolePermissions(roleName);
-  return hasAnyPermissionSet(permissions, requested);
-};
-
-const hasRoleAllPermissions = async (roleName = "", requested = []) => {
-  const permissions = await getRolePermissions(roleName);
-  return hasAllPermissionsSet(permissions, requested);
-};
-
-const requireRolePermissions =
-  (requested = [], { any = false } = {}) =>
-  async (req, res, next) => {
-    try {
-      const roleName = normalizeRole(req.user?.role || "viewer");
-      const permitted = any
-        ? await hasRoleAnyPermissions(roleName, requested)
-        : await hasRoleAllPermissions(roleName, requested);
-      if (!permitted) {
-        return res.status(403).json({ message: "Insufficient permissions" });
-      }
-      return next();
-    } catch (err) {
-      console.error("Permission check failed:", err);
-      return res.status(500).json({ message: "Failed to verify permissions" });
-    }
-  };
-
 const serializeAdminUser = (user) => ({
   id: user.id,
   email: user.email,
   role: user.role,
   username: user.user_name,
-  user_name: user.user_name,
-  display_name:
-    user.display_name || user.author_name || user.user_name || user.email || "",
-  author_name:
-    user.author_name || user.display_name || user.user_name || user.email || "",
-  first_name: user.first_name || "",
-  last_name: user.last_name || "",
-  phone: user.phone || "",
-  gender: user.gender || "",
-  bio: user.bio || "",
-  department: user.department || "",
-  status: user.status || "active",
-  avatar: user.avatar || "",
-  permissions_override: Array.isArray(user.permissions_override)
-    ? user.permissions_override
-    : [],
-  effective_permissions: Array.isArray(user.effective_permissions)
-    ? user.effective_permissions
-    : [],
-  permissions: Array.isArray(user.effective_permissions)
-    ? user.effective_permissions
-    : [],
-  last_login: user.last_login || null,
-  created_at: user.created_at || null,
-  updated_at: user.updated_at || null,
 });
 
 const issueAdminAccessToken = (user) =>
@@ -7707,6 +4069,13 @@ const buildSuccessfulAdminLoginResponse = (
   token: issueAdminAccessToken(user),
   user: serializeAdminUser(user),
 });
+
+const hasFreshOtpVerification = (lastOtpVerifiedAt) => {
+  if (!lastOtpVerifiedAt) return false;
+  const verifiedAtMs = new Date(lastOtpVerifiedAt).getTime();
+  if (!Number.isFinite(verifiedAtMs)) return false;
+  return Date.now() - verifiedAtMs < OTP_REVERIFY_WINDOW_MS;
+};
 
 const issuePendingLoginTicket = (user, nextAction) =>
   jwt.sign(
@@ -7757,14 +4126,6 @@ const buildPendingLoginResponse = (user, nextAction, message) => {
     payload.deviceSetupRequired = true;
   }
 
-  if (nextAction === ADMIN_PIN_SETUP_STEP) {
-    payload.pinSetupRequired = true;
-  }
-
-  if (nextAction === ADMIN_PIN_STEP) {
-    payload.pinRequired = true;
-  }
-
   return payload;
 };
 
@@ -7810,260 +4171,7 @@ async function getAdminUserById(userId) {
   const result = await db.query('SELECT * FROM "user" WHERE id = $1 LIMIT 1', [
     userId,
   ]);
-  const user = result.rows[0] || null;
-  if (!user) return null;
-  const roleRecord = await getRoleAccessRow(user.role);
-  return normalizeAdminUserRow(user, roleRecord);
-}
-
-async function getAdminSecurityConfig() {
-  await db.query(
-    `INSERT INTO ${ADMIN_SECURITY_CONFIG_TABLE} (id)
-     VALUES (1)
-     ON CONFLICT (id) DO NOTHING`,
-  );
-
-  const result = await db.query(
-    `SELECT id, organization_pin_hash, updated_by, updated_at
-     FROM ${ADMIN_SECURITY_CONFIG_TABLE}
-     WHERE id = 1
-     LIMIT 1`,
-  );
-
-  return (
-    result.rows[0] || {
-      id: 1,
-      organization_pin_hash: null,
-      updated_by: null,
-      updated_at: null,
-    }
-  );
-}
-
-async function upsertAdminOrganizationPinHash(pinHash, updatedBy) {
-  const result = await db.query(
-    `INSERT INTO ${ADMIN_SECURITY_CONFIG_TABLE}
-      (id, organization_pin_hash, updated_by, updated_at)
-     VALUES (1, $1, $2, now())
-     ON CONFLICT (id)
-     DO UPDATE SET
-       organization_pin_hash = EXCLUDED.organization_pin_hash,
-       updated_by = EXCLUDED.updated_by,
-       updated_at = now()
-     RETURNING id, organization_pin_hash, updated_by, updated_at`,
-    [pinHash, updatedBy || null],
-  );
-
   return result.rows[0] || null;
-}
-
-const maskEmailAddress = (email) => {
-  const normalized = String(email || "").trim();
-  if (!normalized.includes("@")) return normalized;
-
-  const [local, domain] = normalized.split("@");
-  const maskedLocal =
-    local.length <= 2
-      ? `${local[0] || ""}*`
-      : `${local.slice(0, 2)}${"*".repeat(Math.max(1, local.length - 2))}`;
-
-  return `${maskedLocal}@${domain}`;
-};
-
-const hashAdminOtpCode = (code) =>
-  crypto
-    .createHash("sha256")
-    .update(String(code || ""))
-    .digest("hex");
-
-const generateAdminOtpCode = () =>
-  Array.from({ length: ADMIN_EMAIL_OTP_LENGTH }, () =>
-    crypto.randomInt(0, 10),
-  ).join("");
-
-async function cleanupAdminOtpChallenges() {
-  await db.query(
-    `DELETE FROM ${ADMIN_EMAIL_OTP_TABLE}
-     WHERE expires_at <= now()
-        OR consumed_at IS NOT NULL`,
-  );
-}
-
-async function createAdminOtpChallenge({ user, purpose, loginTicket }) {
-  const userId = Number(user?.id || 0);
-  const email = String(user?.email || "").trim();
-
-  if (!userId || !email) {
-    throw new Error("Unable to send verification code for this admin user.");
-  }
-
-  const challengeId = crypto.randomUUID();
-  const otpCode = generateAdminOtpCode();
-  const loginTicketHash = loginTicket ? hashLoginTicket(loginTicket) : null;
-  const expiresAt = new Date(Date.now() + ADMIN_EMAIL_OTP_TTL_MS);
-
-  await cleanupAdminOtpChallenges();
-  await db.query(
-    `DELETE FROM ${ADMIN_EMAIL_OTP_TABLE}
-     WHERE user_id = $1
-       AND purpose = $2
-       AND consumed_at IS NULL`,
-    [userId, purpose],
-  );
-
-  await db.query(
-    `INSERT INTO ${ADMIN_EMAIL_OTP_TABLE}
-      (id, user_id, email, purpose, code_hash, login_ticket_hash, attempts, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, 0, $7)`,
-    [
-      challengeId,
-      userId,
-      email,
-      purpose,
-      hashAdminOtpCode(otpCode),
-      loginTicketHash,
-      expiresAt,
-    ],
-  );
-
-  const purposeLabel =
-    purpose === ADMIN_PIN_OTP_PURPOSE_SETUP
-      ? "create or confirm the organization PIN"
-      : "change the organization PIN";
-
-  await sendAdminOrganizationPinOtpEmail({
-    email,
-    userName:
-      user.first_name ||
-      user.user_name ||
-      user.username ||
-      user.email ||
-      "Admin",
-    otpCode,
-    purposeLabel,
-    expiresInMinutes: ADMIN_EMAIL_OTP_TTL_MINUTES,
-  });
-
-  return {
-    challengeId,
-    expiresIn: ADMIN_EMAIL_OTP_TTL_MINUTES * 60,
-    maskedEmail: maskEmailAddress(email),
-  };
-}
-
-async function consumeAdminOtpChallenge({
-  challengeId,
-  userId,
-  purpose,
-  otp,
-  loginTicket,
-}) {
-  const normalizedChallengeId = String(challengeId || "").trim();
-  const normalizedOtp = normalizeAdminOtp(otp);
-
-  if (!normalizedChallengeId) {
-    return {
-      ok: false,
-      status: 400,
-      message: "Verification session is missing. Please request a new OTP.",
-    };
-  }
-
-  if (!isValidAdminOtp(normalizedOtp)) {
-    return {
-      ok: false,
-      status: 400,
-      message: `Enter the ${ADMIN_EMAIL_OTP_LENGTH}-digit verification OTP sent to your email.`,
-    };
-  }
-
-  await cleanupAdminOtpChallenges();
-
-  const result = await db.query(
-    `SELECT *
-     FROM ${ADMIN_EMAIL_OTP_TABLE}
-     WHERE id = $1
-       AND user_id = $2
-       AND purpose = $3
-     LIMIT 1`,
-    [normalizedChallengeId, userId, purpose],
-  );
-
-  const challenge = result.rows[0] || null;
-  if (!challenge) {
-    return {
-      ok: false,
-      status: 400,
-      message: "Verification session expired. Please request a new OTP.",
-    };
-  }
-
-  if (challenge.consumed_at) {
-    return {
-      ok: false,
-      status: 400,
-      message: "This verification OTP has already been used.",
-    };
-  }
-
-  const expiresAtMs = new Date(challenge.expires_at).getTime();
-  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
-    await db.query(`DELETE FROM ${ADMIN_EMAIL_OTP_TABLE} WHERE id = $1`, [
-      challenge.id,
-    ]);
-    return {
-      ok: false,
-      status: 400,
-      message: "Verification OTP expired. Please request a new OTP.",
-    };
-  }
-
-  if (loginTicket) {
-    const expectedLoginTicketHash = hashLoginTicket(loginTicket);
-    if (challenge.login_ticket_hash !== expectedLoginTicketHash) {
-      return {
-        ok: false,
-        status: 401,
-        message: "Login session expired. Please sign in again.",
-      };
-    }
-  }
-
-  const attempts = Number(challenge.attempts || 0);
-  if (attempts >= ADMIN_EMAIL_OTP_MAX_ATTEMPTS) {
-    await db.query(`DELETE FROM ${ADMIN_EMAIL_OTP_TABLE} WHERE id = $1`, [
-      challenge.id,
-    ]);
-    return {
-      ok: false,
-      status: 429,
-      message: "Too many invalid OTP attempts. Please request a new OTP.",
-    };
-  }
-
-  const matches = hashAdminOtpCode(normalizedOtp) === challenge.code_hash;
-  if (!matches) {
-    await db.query(
-      `UPDATE ${ADMIN_EMAIL_OTP_TABLE}
-       SET attempts = attempts + 1
-       WHERE id = $1`,
-      [challenge.id],
-    );
-    return {
-      ok: false,
-      status: 401,
-      message: "Invalid verification OTP",
-    };
-  }
-
-  await db.query(
-    `UPDATE ${ADMIN_EMAIL_OTP_TABLE}
-     SET consumed_at = now()
-     WHERE id = $1`,
-    [challenge.id],
-  );
-
-  return { ok: true };
 }
 
 async function listUserWebAuthnCredentials(userId) {
@@ -8102,9 +4210,7 @@ async function storeWebAuthnChallenge({
   const loginTicketHash = hashLoginTicket(loginTicket);
   const expiresAt = new Date(Date.now() + WEBAUTHN_CHALLENGE_TTL_MS);
 
-  await db.query(
-    `DELETE FROM ${WEBAUTHN_CHALLENGE_TABLE} WHERE expires_at <= now()`,
-  );
+  await db.query(`DELETE FROM ${WEBAUTHN_CHALLENGE_TABLE} WHERE expires_at <= now()`);
   await db.query(
     `DELETE FROM ${WEBAUTHN_CHALLENGE_TABLE}
      WHERE login_ticket_hash = $1
@@ -8164,41 +4270,82 @@ async function clearWebAuthnChallenges(loginTicket) {
   );
 }
 
+async function issueLoginOtpChallenge(user) {
+  const normalizedEmail = normalizeLoginEmail(user.email);
+  const challengeId = crypto.randomUUID();
+  const otpCode = generateOtpCode();
+  const otpHash = await bcrypt.hash(otpCode, OTP_HASH_ROUNDS);
+  const expiresAt = new Date(Date.now() + OTP_TTL_MS);
+
+  await db.query(
+    `DELETE FROM ${OTP_CHALLENGE_TABLE}
+     WHERE user_id = $1
+       AND verified_at IS NULL`,
+    [user.id],
+  );
+
+  await db.query(
+    `INSERT INTO ${OTP_CHALLENGE_TABLE}
+      (challenge_id, user_id, email, otp_hash, expires_at, attempts, max_attempts, resend_count, last_sent_at, channels)
+     VALUES ($1, $2, $3, $4, $5, 0, $6, 0, now(), '[]'::jsonb)`,
+    [
+      challengeId,
+      user.id,
+      normalizedEmail,
+      otpHash,
+      expiresAt,
+      OTP_MAX_ATTEMPTS,
+    ],
+  );
+
+  const deliveryChannels = await deliverLoginOtpNotifications({
+    user: { ...user, email: normalizedEmail },
+    otp: otpCode,
+    expiresInMinutes: OTP_TTL_MS / (60 * 1000),
+  });
+
+  if (!deliveryChannels.length) {
+    await db.query(
+      `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
+      [challengeId],
+    );
+    throw new Error("Unable to deliver OTP");
+  }
+
+  try {
+    await db.query(
+      `UPDATE ${OTP_CHALLENGE_TABLE}
+       SET channels = $2::jsonb
+       WHERE challenge_id = $1`,
+      [challengeId, JSON.stringify(deliveryChannels)],
+    );
+  } catch (err) {
+    console.warn("Failed to persist OTP delivery channels:", err);
+  }
+
+  return {
+    challengeId,
+    deliveryChannels,
+    expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
+    resendAfterMs: OTP_RESEND_COOLDOWN_MS,
+    maxAttempts: OTP_MAX_ATTEMPTS,
+  };
+}
+
 /* -----------------------
   AUTH Routes
 ------------------------*/
 app.post("/api/auth/register", async (req, res) => {
   try {
     const b = req.body || {};
-    const user_name = String(b.user_name || b.username || "").trim() || null;
-    const first_name = String(b.first_name || "").trim() || null;
-    const last_name = String(b.last_name || "").trim() || null;
-    const phone = String(b.phone || "").trim() || null;
-    const gender = String(b.gender || "").trim() || null;
-    const email = String(b.email || "")
-      .trim()
-      .toLowerCase();
-    const password = String(
-      b.password || `${Math.random()}${Date.now()}`,
-    ).trim();
-    const role = normalizeRole(b.role || "viewer");
-    const displayName =
-      String(b.display_name || "").trim() ||
-      [first_name, last_name].filter(Boolean).join(" ").trim() ||
-      user_name ||
-      email ||
-      "User";
-    const bio = String(b.bio || "").trim() || null;
-    const department = String(b.department || "").trim() || null;
-    const status = normalizeUserStatus(b.status);
-    const avatar = String(b.avatar || b.avatar_url || "").trim() || null;
-    const permissionsOverride = Array.from(
-      new Set(
-        parseJsonArray(b.permissions_override || b.permissions, [])
-          .map((permission) => normalizePermissionToken(permission))
-          .filter(Boolean),
-      ),
-    );
+    const user_name = b.user_name || null;
+    const first_name = b.first_name || null;
+    const last_name = b.last_name || null;
+    const phone = b.phone || null;
+    const gender = b.gender || null;
+    const email = b.email;
+    const password = b.password || `${Math.random()}${Date.now()}`;
+    const role = b.role || "admin";
 
     if (!email || !password) {
       return res.status(400).json({ message: "email and password required" });
@@ -8208,33 +4355,15 @@ app.post("/api/auth/register", async (req, res) => {
 
     const result = await db.query(
       `INSERT INTO "user"
-        (user_name, first_name, last_name, phone, gender, email, password, role, display_name, bio, department, status, avatar, permissions_override)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
-       RETURNING *`,
-      [
-        user_name,
-        first_name,
-        last_name,
-        phone,
-        gender,
-        email,
-        hashed,
-        role,
-        displayName,
-        bio,
-        department,
-        status,
-        avatar,
-        JSON.stringify(permissionsOverride),
-      ],
+        (user_name, first_name, last_name, phone, gender, email, password, role)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id, email, role`,
+      [user_name, first_name, last_name, phone, gender, email, hashed, role],
     );
-
-    const roleRecord = await getRoleAccessRow(role);
-    const user = normalizeAdminUserRow(result.rows[0], roleRecord);
 
     res.status(201).json({
       message: "User registered successfully. Email sent.",
-      user,
+      user: result.rows[0],
     });
   } catch (err) {
     if (err.code === "23505") {
@@ -8249,6 +4378,8 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
     const b = req.body || {};
     const email = normalizeLoginEmail(b.email);
     const password = String(b.password || "");
+    const deviceAuthSupported = parseBooleanInput(b.deviceAuthSupported);
+    const forceOtpFallback = parseBooleanInput(b.forceOtpFallback);
 
     if (!email || !password) {
       return res.status(400).json({ message: "email and password required" });
@@ -8263,173 +4394,205 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
     }
 
     const user = result.rows[0];
-    const roleRecord = await getRoleAccessRow(user.role);
-    const normalizedUser = normalizeAdminUserRow(user, roleRecord);
     const match = await bcrypt.compare(password, user.password);
     if (!match) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    const securityConfig = await getAdminSecurityConfig();
-    if (securityConfig?.organization_pin_hash) {
+    const credentials = await listUserWebAuthnCredentials(user.id);
+    const canUseRegisteredDevice =
+      credentials.length > 0 && deviceAuthSupported && !forceOtpFallback;
+    const otpStillFresh = hasFreshOtpVerification(user.last_otp_verified_at);
+
+    if (canUseRegisteredDevice && otpStillFresh) {
       return res.json(
         buildPendingLoginResponse(
           user,
-          ADMIN_PIN_STEP,
-          "Enter your organization PIN to finish signing in.",
+          "device_auth",
+          "Use your device verification to finish signing in.",
         ),
       );
     }
 
-    return res.json(
-      buildPendingLoginResponse(
-        user,
-        ADMIN_PIN_SETUP_STEP,
-        "Organization PIN is not configured yet. Create it to finish signing in.",
-      ),
-    );
+    const challenge = await issueLoginOtpChallenge(user);
+
+    return res.json({
+      message: "OTP sent",
+      nextStep: "otp",
+      otpRequired: true,
+      challengeId: challenge.challengeId,
+      expiresIn: challenge.expiresInSeconds,
+      resendAfterMs: challenge.resendAfterMs,
+      maxAttempts: challenge.maxAttempts,
+      deliveryChannels: challenge.deliveryChannels,
+    });
   } catch (err) {
-    console.error("Login initiation error:", err);
+    console.error("Login OTP initiation error:", err);
     res.status(500).json({
-      message: "Unable to start login. Please try again.",
-    });
-  }
-});
-
-app.post("/api/auth/login/pin", webAuthnVerifyLimiter, async (req, res) => {
-  try {
-    const loginTicket = String(req.body?.loginTicket || "").trim();
-    const pin = normalizeAdminPin(req.body?.pin);
-    const pendingLogin = verifyPendingLoginTicket(loginTicket);
-
-    if (!pendingLogin || pendingLogin.nextAction !== ADMIN_PIN_STEP) {
-      return res.status(401).json({
-        message: "Login session expired. Please sign in again.",
-      });
-    }
-
-    if (!isValidAdminPin(pin)) {
-      return res.status(400).json({
-        message: `Enter a valid ${ADMIN_PIN_MIN_LENGTH}-${ADMIN_PIN_MAX_LENGTH} digit organization PIN.`,
-      });
-    }
-
-    const securityConfig = await getAdminSecurityConfig();
-    if (!securityConfig?.organization_pin_hash) {
-      return res.status(400).json({
-        message:
-          "Organization PIN is not configured. Contact an administrator.",
-      });
-    }
-
-    const matches = await bcrypt.compare(
-      pin,
-      securityConfig.organization_pin_hash,
-    );
-    if (!matches) {
-      return res.status(401).json({ message: "Invalid organization PIN" });
-    }
-
-    const user = await getAdminUserById(pendingLogin.id);
-    if (!user) {
-      return res.status(401).json({ message: "User not found" });
-    }
-
-    return res.json(
-      buildSuccessfulAdminLoginResponse(user, "Login successful"),
-    );
-  } catch (err) {
-    console.error("Organization PIN login verify error:", err);
-    return res.status(500).json({
-      message: "Unable to verify organization PIN. Please try again.",
+      message: "Unable to start OTP login. Please try again.",
     });
   }
 });
 
 app.post(
-  "/api/auth/login/pin/setup/request-otp",
-  adminOtpSendLimiter,
+  "/api/auth/login/verify-otp",
+  loginOtpVerifyLimiter,
   async (req, res) => {
+    let client;
     try {
-      const loginTicket = String(req.body?.loginTicket || "").trim();
-      const pendingLogin = verifyPendingLoginTicket(loginTicket);
+      client = await db.connect();
+      const b = req.body || {};
+      const email = normalizeLoginEmail(b.email);
+      const challengeId = String(b.challengeId || "").trim();
+      const otp = normalizeOtpInput(b.otp);
+      const deviceAuthSupported = parseBooleanInput(b.deviceAuthSupported);
+      const forceOtpFallback = parseBooleanInput(b.forceOtpFallback);
 
-      if (!pendingLogin || pendingLogin.nextAction !== ADMIN_PIN_SETUP_STEP) {
+      if (!email || !challengeId || !otp) {
+        return res.status(400).json({
+          message: "challengeId, email and 6-digit otp are required",
+        });
+      }
+
+      await client.query("BEGIN");
+      const challengeResult = await client.query(
+        `SELECT *
+         FROM ${OTP_CHALLENGE_TABLE}
+         WHERE challenge_id = $1
+           AND email = $2
+         FOR UPDATE`,
+        [challengeId, email],
+      );
+
+      if (!challengeResult.rows.length) {
+        await client.query("ROLLBACK");
         return res.status(401).json({
-          message: "Login session expired. Please sign in again.",
+          message: "OTP expired or invalid. Please log in again.",
         });
       }
 
-      const securityConfig = await getAdminSecurityConfig();
-      if (securityConfig?.organization_pin_hash) {
-        return res.status(400).json({
-          message:
-            "Organization PIN is already configured. Sign in with the current PIN.",
+      const challenge = challengeResult.rows[0];
+      const expiresAtMs = new Date(challenge.expires_at).getTime();
+      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
+        await client.query(
+          `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
+          [challengeId],
+        );
+        await client.query("COMMIT");
+        return res.status(410).json({
+          message: "OTP expired. Please log in again.",
         });
       }
 
-      return res.json({
-        success: true,
-        message:
-          "OTP verification is disabled. You can continue with organization PIN setup directly.",
-      });
-    } catch (err) {
-      console.error("Organization PIN setup request error:", err);
-      return res.status(500).json({
-        message: "Unable to continue organization PIN setup. Please try again.",
-      });
-    }
-  },
-);
+      const maxAttempts = Number(challenge.max_attempts || OTP_MAX_ATTEMPTS);
+      const attempts = Number(challenge.attempts || 0);
+      if (attempts >= maxAttempts) {
+        await client.query(
+          `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
+          [challengeId],
+        );
+        await client.query("COMMIT");
+        return res.status(429).json({
+          message: "Too many invalid OTP attempts. Please log in again.",
+        });
+      }
 
-app.post(
-  "/api/auth/login/pin/setup/verify",
-  adminOtpVerifyLimiter,
-  async (req, res) => {
-    try {
-      const loginTicket = String(req.body?.loginTicket || "").trim();
-      const newPin = normalizeAdminPin(req.body?.newPin);
-      const pendingLogin = verifyPendingLoginTicket(loginTicket);
+      const isValid = await bcrypt.compare(otp, challenge.otp_hash);
+      if (!isValid) {
+        const updated = await client.query(
+          `UPDATE ${OTP_CHALLENGE_TABLE}
+           SET attempts = attempts + 1
+           WHERE challenge_id = $1
+           RETURNING attempts, max_attempts`,
+          [challengeId],
+        );
 
-      if (!pendingLogin || pendingLogin.nextAction !== ADMIN_PIN_SETUP_STEP) {
+        const nextAttempts = Number(updated.rows[0]?.attempts || attempts + 1);
+        const nextMaxAttempts = Number(
+          updated.rows[0]?.max_attempts || maxAttempts,
+        );
+        const attemptsRemaining = Math.max(
+          0,
+          nextMaxAttempts - nextAttempts,
+        );
+
+        if (attemptsRemaining <= 0) {
+          await client.query(
+            `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
+            [challengeId],
+          );
+          await client.query("COMMIT");
+          return res.status(429).json({
+            message: "Too many invalid OTP attempts. Please log in again.",
+          });
+        }
+
+        await client.query("COMMIT");
         return res.status(401).json({
-          message: "Login session expired. Please sign in again.",
+          message: "Invalid OTP",
+          attemptsRemaining,
         });
       }
 
-      if (!isValidAdminPin(newPin)) {
-        return res.status(400).json({
-          message: `Organization PIN must be ${ADMIN_PIN_MIN_LENGTH}-${ADMIN_PIN_MAX_LENGTH} digits.`,
-        });
-      }
+      await client.query(
+        `UPDATE "user"
+         SET last_otp_verified_at = now()
+         WHERE id = $1`,
+        [challenge.user_id],
+      );
+      await client.query(
+        `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
+        [challengeId],
+      );
+      await client.query("COMMIT");
 
-      const securityConfig = await getAdminSecurityConfig();
-      if (securityConfig?.organization_pin_hash) {
-        return res.status(400).json({
-          message:
-            "Organization PIN is already configured. Sign in with the current PIN.",
-        });
-      }
-
-      const user = await getAdminUserById(pendingLogin.id);
-      if (!user) {
+      const userResult = await db.query('SELECT * FROM "user" WHERE id = $1', [
+        challenge.user_id,
+      ]);
+      if (!userResult.rows.length) {
         return res.status(404).json({ message: "User not found" });
       }
 
-      const hashedPin = await bcrypt.hash(newPin, 10);
-      await upsertAdminOrganizationPinHash(hashedPin, user.id);
+      const user = userResult.rows[0];
+      const credentials = await listUserWebAuthnCredentials(user.id);
 
-      return res.json(
-        buildSuccessfulAdminLoginResponse(
-          user,
-          "Organization PIN created. Login successful.",
-        ),
-      );
+      if (credentials.length > 0 && deviceAuthSupported && !forceOtpFallback) {
+        return res.json(
+          buildPendingLoginResponse(
+            user,
+            "device_auth",
+            "OTP verified. Use your device verification to finish signing in.",
+          ),
+        );
+      }
+
+      if (!credentials.length && deviceAuthSupported && !forceOtpFallback) {
+        return res.json(
+          buildPendingLoginResponse(
+            user,
+            "device_setup",
+            "OTP verified. Set up device verification for faster future logins.",
+          ),
+        );
+      }
+
+      return res.json(buildSuccessfulAdminLoginResponse(user));
     } catch (err) {
-      console.error("Organization PIN setup verify error:", err);
+      if (client) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error("OTP verify rollback failed:", rollbackError);
+        }
+      }
+      console.error("Login OTP verification error:", err);
       return res.status(500).json({
-        message: "Unable to create the organization PIN.",
+        message: "Unable to verify OTP. Please try again.",
       });
+    } finally {
+      if (client) {
+        client.release();
+      }
     }
   },
 );
@@ -8451,8 +4614,7 @@ app.post(
       const expectedOrigin = getAllowedWebAuthnOrigin(req);
       if (!expectedOrigin) {
         return res.status(400).json({
-          message:
-            "This browser origin is not allowed for device verification.",
+          message: "This browser origin is not allowed for device verification.",
         });
       }
 
@@ -8504,7 +4666,7 @@ app.post(
 
 app.post(
   "/api/auth/login/webauthn/verify",
-  webAuthnVerifyLimiter,
+  loginOtpVerifyLimiter,
   async (req, res) => {
     try {
       const loginTicket = String(req.body?.loginTicket || "").trim();
@@ -8561,10 +4723,7 @@ app.post(
           requireUserVerification: true,
         });
       } catch (verificationError) {
-        console.warn(
-          "WebAuthn authentication verification failed:",
-          verificationError,
-        );
+        console.warn("WebAuthn authentication verification failed:", verificationError);
         return res.status(401).json({
           message: "Device verification failed. Please try again.",
         });
@@ -8629,8 +4788,7 @@ app.post(
       const expectedOrigin = getAllowedWebAuthnOrigin(req);
       if (!expectedOrigin) {
         return res.status(400).json({
-          message:
-            "This browser origin is not allowed for device verification.",
+          message: "This browser origin is not allowed for device verification.",
         });
       }
 
@@ -8692,7 +4850,7 @@ app.post(
 
 app.post(
   "/api/auth/login/webauthn/register/verify",
-  webAuthnVerifyLimiter,
+  loginOtpVerifyLimiter,
   async (req, res) => {
     try {
       const loginTicket = String(req.body?.loginTicket || "").trim();
@@ -8733,10 +4891,7 @@ app.post(
           requireUserVerification: true,
         });
       } catch (verificationError) {
-        console.warn(
-          "WebAuthn registration verification failed:",
-          verificationError,
-        );
+        console.warn("WebAuthn registration verification failed:", verificationError);
         return res.status(401).json({
           message: "Device setup failed. Please try again.",
         });
@@ -8796,11 +4951,225 @@ app.post(
   },
 );
 
-app.post("/api/auth/login/finalize", loginInitiateLimiter, async (_req, res) =>
-  res.status(400).json({
-    message:
-      "Device verification setup is required before you can finish signing in.",
-  }),
+app.post(
+  "/api/auth/login/finalize",
+  loginInitiateLimiter,
+  async (req, res) => {
+    try {
+      const loginTicket = String(req.body?.loginTicket || "").trim();
+      const pendingLogin = verifyPendingLoginTicket(loginTicket);
+
+      if (!pendingLogin || pendingLogin.nextAction !== "device_setup") {
+        return res.status(401).json({
+          message: "Login session expired. Please sign in again.",
+        });
+      }
+
+      const user = await getAdminUserById(pendingLogin.id);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      await clearWebAuthnChallenges(loginTicket);
+      return res.json(buildSuccessfulAdminLoginResponse(user));
+    } catch (err) {
+      console.error("Finalize login error:", err);
+      return res.status(500).json({
+        message: "Unable to finish login. Please try again.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/api/auth/login/resend-otp",
+  loginOtpResendLimiter,
+  async (req, res) => {
+    let client;
+    try {
+      client = await db.connect();
+      const b = req.body || {};
+      const email = normalizeLoginEmail(b.email);
+      const challengeId = String(b.challengeId || "").trim();
+
+      if (!email || !challengeId) {
+        await client.query("ROLLBACK").catch(() => {});
+        return res.status(400).json({
+          message: "challengeId and email are required",
+        });
+      }
+
+      await client.query("BEGIN");
+      const challengeResult = await client.query(
+        `SELECT *
+         FROM ${OTP_CHALLENGE_TABLE}
+         WHERE challenge_id = $1
+           AND email = $2
+         FOR UPDATE`,
+        [challengeId, email],
+      );
+
+      if (!challengeResult.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(410).json({
+          message: "OTP expired. Please log in again.",
+        });
+      }
+
+      const challenge = challengeResult.rows[0];
+      const expiresAtMs = new Date(challenge.expires_at).getTime();
+      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
+        await client.query(
+          `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
+          [challengeId],
+        );
+        await client.query("COMMIT");
+        return res.status(410).json({
+          message: "OTP expired. Please log in again.",
+        });
+      }
+
+      const maxAttempts = Number(challenge.max_attempts || OTP_MAX_ATTEMPTS);
+      const attempts = Number(challenge.attempts || 0);
+      if (attempts >= maxAttempts) {
+        await client.query(
+          `DELETE FROM ${OTP_CHALLENGE_TABLE} WHERE challenge_id = $1`,
+          [challengeId],
+        );
+        await client.query("COMMIT");
+        return res.status(429).json({
+          message: "Too many invalid OTP attempts. Please log in again.",
+        });
+      }
+
+      const lastSentAtMs = new Date(challenge.last_sent_at).getTime();
+      const cooldownRemainingMs = Math.max(
+        0,
+        OTP_RESEND_COOLDOWN_MS - (Date.now() - lastSentAtMs),
+      );
+      if (cooldownRemainingMs > 0) {
+        await client.query("ROLLBACK");
+        return res.status(429).json({
+          message: "Please wait before requesting another OTP.",
+          retryAfterMs: cooldownRemainingMs,
+        });
+      }
+
+      const userResult = await client.query('SELECT * FROM "user" WHERE id = $1', [
+        challenge.user_id,
+      ]);
+      if (!userResult.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const user = userResult.rows[0];
+      const otpCode = generateOtpCode();
+      const otpHash = await bcrypt.hash(otpCode, OTP_HASH_ROUNDS);
+      const nextExpiresAt = new Date(Date.now() + OTP_TTL_MS);
+      const previousState = {
+        otp_hash: challenge.otp_hash,
+        expires_at: challenge.expires_at,
+        attempts: challenge.attempts,
+        resend_count: challenge.resend_count,
+        last_sent_at: challenge.last_sent_at,
+        channels: challenge.channels || [],
+      };
+
+      await client.query(
+        `UPDATE ${OTP_CHALLENGE_TABLE}
+         SET otp_hash = $2,
+             expires_at = $3,
+             attempts = 0,
+             last_sent_at = now()
+         WHERE challenge_id = $1`,
+        [challengeId, otpHash, nextExpiresAt],
+      );
+      await client.query("COMMIT");
+
+      const deliveryChannels = await deliverLoginOtpNotifications({
+        user,
+        otp: otpCode,
+        expiresInMinutes: OTP_TTL_MS / (60 * 1000),
+      });
+
+      if (!deliveryChannels.length) {
+        const revertClient = await db.connect();
+        try {
+          await revertClient.query("BEGIN");
+          await revertClient.query(
+            `UPDATE ${OTP_CHALLENGE_TABLE}
+             SET otp_hash = $2,
+                 expires_at = $3,
+                 attempts = $4,
+                 resend_count = $5,
+                 last_sent_at = $6,
+                 channels = $7::jsonb
+             WHERE challenge_id = $1`,
+            [
+              challengeId,
+              previousState.otp_hash,
+              previousState.expires_at,
+              previousState.attempts,
+              previousState.resend_count,
+              previousState.last_sent_at,
+              JSON.stringify(previousState.channels || []),
+            ],
+          );
+          await revertClient.query("COMMIT");
+        } catch (revertError) {
+          try {
+            await revertClient.query("ROLLBACK");
+          } catch (rollbackError) {
+            console.error("OTP resend rollback failed:", rollbackError);
+          }
+          console.error("OTP resend revert failed:", revertError);
+        } finally {
+          revertClient.release();
+        }
+
+        return res.status(500).json({
+          message: "Unable to deliver OTP. Please try again.",
+        });
+      }
+
+      await db.query(
+        `UPDATE ${OTP_CHALLENGE_TABLE}
+         SET channels = $2::jsonb,
+             resend_count = resend_count + 1,
+             last_sent_at = now()
+         WHERE challenge_id = $1`,
+        [challengeId, JSON.stringify(deliveryChannels)],
+      ).catch((err) => {
+        console.warn("Failed to update OTP resend metadata:", err);
+      });
+
+      return res.json({
+        message: "OTP sent again",
+        challengeId,
+        expiresIn: Math.floor(OTP_TTL_MS / 1000),
+        resendAfterMs: OTP_RESEND_COOLDOWN_MS,
+        maxAttempts: OTP_MAX_ATTEMPTS,
+        deliveryChannels,
+      });
+    } catch (err) {
+      if (client) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error("OTP resend rollback failed:", rollbackError);
+        }
+      }
+      console.error("Login OTP resend error:", err);
+      return res.status(500).json({
+        message: "Unable to resend OTP. Please try again.",
+      });
+    } finally {
+      if (client) {
+        client.release();
+      }
+    }
+  },
 );
 
 /* ---- ADMIN Profile Endpoints ---- */
@@ -8830,21 +5199,6 @@ app.get("/api/auth/profile", authenticate, async (req, res) => {
         last_name: user.last_name || "",
         gender: user.gender || "",
         role: user.role || "",
-        display_name: user.display_name || "",
-        bio: user.bio || "",
-        department: user.department || "",
-        status: user.status || "active",
-        avatar: user.avatar || "",
-        permissions_override: Array.isArray(
-          normalizedUser?.permissions_override,
-        )
-          ? normalizedUser.permissions_override
-          : [],
-        effective_permissions: Array.isArray(
-          normalizedUser?.effective_permissions,
-        )
-          ? normalizedUser.effective_permissions
-          : [],
       },
     });
   } catch (err) {
@@ -8857,18 +5211,7 @@ app.get("/api/auth/profile", authenticate, async (req, res) => {
 app.put("/api/auth/profile", authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
-    const {
-      email,
-      phone,
-      first_name,
-      last_name,
-      gender,
-      display_name,
-      bio,
-      department,
-      status,
-      avatar,
-    } = req.body;
+    const { email, phone, first_name, last_name, gender } = req.body;
 
     // Validate required fields
     if (!email) {
@@ -8896,30 +5239,15 @@ app.put("/api/auth/profile", authenticate, async (req, res) => {
     // Update admin profile
     const result = await db.query(
       `UPDATE "user" 
-       SET email = $1,
-           phone = $2,
-           first_name = $3,
-           last_name = $4,
-           gender = $5,
-           display_name = $6,
-           bio = $7,
-           department = $8,
-           status = $9,
-           avatar = $10,
-           updated_at = now()
-       WHERE id = $11
-       RETURNING id, user_name, email, phone, first_name, last_name, gender, role, display_name, bio, department, status, avatar, permissions_override`,
+       SET email = $1, phone = $2, first_name = $3, last_name = $4, gender = $5
+       WHERE id = $6
+       RETURNING id, user_name, email, phone, first_name, last_name, gender, role`,
       [
         email,
         phone || null,
         first_name || null,
         last_name || null,
         gender || null,
-        display_name || null,
-        bio || null,
-        department || null,
-        status || "active",
-        avatar || null,
         userId,
       ],
     );
@@ -8929,8 +5257,6 @@ app.put("/api/auth/profile", authenticate, async (req, res) => {
     }
 
     const updatedUser = result.rows[0];
-    const roleRecord = await getRoleAccessRow(updatedUser.role);
-    const normalizedUser = normalizeAdminUserRow(updatedUser, roleRecord);
 
     res.json({
       success: true,
@@ -8944,21 +5270,6 @@ app.put("/api/auth/profile", authenticate, async (req, res) => {
         last_name: updatedUser.last_name || "",
         gender: updatedUser.gender || "",
         role: updatedUser.role || "",
-        display_name: updatedUser.display_name || "",
-        bio: updatedUser.bio || "",
-        department: updatedUser.department || "",
-        status: updatedUser.status || "active",
-        avatar: updatedUser.avatar || "",
-        permissions_override: Array.isArray(
-          normalizedUser?.permissions_override,
-        )
-          ? normalizedUser.permissions_override
-          : [],
-        effective_permissions: Array.isArray(
-          normalizedUser?.effective_permissions,
-        )
-          ? normalizedUser.effective_permissions
-          : [],
       },
     });
   } catch (err) {
@@ -9023,90 +5334,6 @@ app.post("/api/auth/change-password", authenticate, async (req, res) => {
   } catch (err) {
     console.error("Change admin password error:", err);
     res.status(500).json({ error: err.message });
-  }
-});
-
-app.post(
-  "/api/auth/organization-pin/request-otp",
-  authenticate,
-  adminOtpSendLimiter,
-  async (req, res) => {
-    return res.json({
-      success: true,
-      message:
-        "OTP verification is disabled. You can update the organization PIN directly.",
-    });
-  },
-);
-
-app.get("/api/auth/organization-pin/status", authenticate, async (req, res) => {
-  try {
-    const securityConfig = await getAdminSecurityConfig();
-
-    res.json({
-      success: true,
-      isConfigured: Boolean(securityConfig?.organization_pin_hash),
-      updated_at: securityConfig?.updated_at || null,
-      updated_by: securityConfig?.updated_by || null,
-    });
-  } catch (err) {
-    console.error("Get organization PIN status error:", err);
-    res.status(500).json({ message: "Failed to load organization PIN status" });
-  }
-});
-
-app.put("/api/auth/organization-pin", authenticate, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const currentPin = normalizeAdminPin(req.body?.currentPin);
-    const newPin = normalizeAdminPin(req.body?.newPin);
-
-    if (!isValidAdminPin(newPin)) {
-      return res.status(400).json({
-        message: `Organization PIN must be ${ADMIN_PIN_MIN_LENGTH}-${ADMIN_PIN_MAX_LENGTH} digits.`,
-      });
-    }
-
-    const securityConfig = await getAdminSecurityConfig();
-    const currentHash = securityConfig?.organization_pin_hash || null;
-
-    if (currentHash) {
-      if (!currentPin) {
-        return res.status(400).json({
-          message: "Current organization PIN is required",
-        });
-      }
-
-      const currentMatches = await bcrypt.compare(currentPin, currentHash);
-      if (!currentMatches) {
-        return res.status(401).json({
-          message: "Current organization PIN is incorrect",
-        });
-      }
-
-      const samePin = await bcrypt.compare(newPin, currentHash);
-      if (samePin) {
-        return res.status(400).json({
-          message: "New organization PIN must be different from current PIN",
-        });
-      }
-    }
-
-    const hashedPin = await bcrypt.hash(newPin, 10);
-    const updated = await upsertAdminOrganizationPinHash(hashedPin, userId);
-
-    res.json({
-      success: true,
-      message: currentHash
-        ? "Organization PIN updated successfully"
-        : "Organization PIN created successfully",
-      isConfigured: true,
-      updated_at: updated?.updated_at || null,
-      updated_by: updated?.updated_by || userId,
-    });
-  } catch (err) {
-    console.error("Update organization PIN error:", err);
-    res.status(500).json({ message: "Failed to update organization PIN" });
   }
 });
 
@@ -9257,172 +5484,6 @@ app.get("/api/auth/check-email", async (req, res) => {
     return res.status(500).json({ available: false });
   }
 });
-const listRbacPermissions = async () => {
-  const defaultRows = getPermissionMatrix().flatMap((module) =>
-    module.permissions.map((permission) => ({
-      id: permission.code,
-      name: permission.code,
-      description: `Allows ${permission.action} on ${module.label}`,
-      module: module.key,
-      module_label: module.label,
-      action: permission.action,
-      built_in: true,
-      created_at: null,
-      updated_at: null,
-    })),
-  );
-
-  const customRows = await db.query(
-    `
-    SELECT id, name, description, module_key, action, built_in, created_at, updated_at
-    FROM admin_permissions
-    ORDER BY built_in DESC, name ASC, id ASC
-  `,
-  );
-
-  const merged = new Map();
-  [...defaultRows, ...(customRows.rows || []).map(normalizeAdminPermissionRow)]
-    .filter(Boolean)
-    .forEach((permission) => {
-      const key = String(permission.name || permission.id || "")
-        .trim()
-        .toLowerCase();
-      if (!key) return;
-      merged.set(key, permission);
-    });
-
-  return Array.from(merged.values()).sort((a, b) =>
-    String(a.name || "").localeCompare(String(b.name || "")),
-  );
-};
-
-const listRbacRoles = async () => {
-  const defaultRows = Object.entries(ROLE_PRESETS).map(([name, preset]) => ({
-    id: name,
-    name,
-    title: preset.label,
-    description: preset.description,
-    permissions: getDefaultPermissionsForRole(name),
-    built_in: true,
-    created_at: null,
-    updated_at: null,
-  }));
-
-  const customRows = await db.query(
-    `
-    SELECT id, name, title, description, permissions, built_in, created_at, updated_at
-    FROM admin_roles
-    ORDER BY built_in DESC, title ASC, id ASC
-  `,
-  );
-
-  const merged = new Map();
-  [...defaultRows, ...(customRows.rows || []).map(normalizeAdminRoleRow)]
-    .filter(Boolean)
-    .forEach((role) => {
-      const key = String(role.name || role.id || "")
-        .trim()
-        .toLowerCase();
-      if (!key) return;
-      merged.set(key, role);
-    });
-
-  return Array.from(merged.values()).sort((a, b) =>
-    String(a.title || a.name || "").localeCompare(
-      String(b.title || b.name || ""),
-    ),
-  );
-};
-
-const listRbacUsers = async ({ includeInactive = true } = {}) => {
-  const [userRows, roleRows] = await Promise.all([
-    db.query(
-      `
-      SELECT
-        id,
-        user_name,
-        first_name,
-        last_name,
-        phone,
-        gender,
-        email,
-        role,
-        display_name,
-        bio,
-        department,
-        status,
-        avatar,
-        permissions_override,
-        last_login,
-        created_at,
-        updated_at
-      FROM "user"
-      ORDER BY created_at DESC, id DESC
-    `,
-    ),
-    listRbacRoles(),
-  ]);
-
-  const roleMap = new Map(
-    roleRows.map((role) => [normalizeRole(role.name || role.id), role]),
-  );
-
-  return userRows.rows
-    .map((user) =>
-      normalizeAdminUserRow(user, roleMap.get(normalizeRole(user.role))),
-    )
-    .filter(Boolean)
-    .filter((user) => (includeInactive ? true : user.status !== "inactive"))
-    .sort((a, b) =>
-      String(a.display_name || "").localeCompare(String(b.display_name || "")),
-    );
-};
-
-const listRbacActivities = async ({ limit = 200 } = {}) => {
-  const result = await db.query(
-    `
-    SELECT
-      id,
-      actor_user_id,
-      actor_name,
-      actor_role,
-      module_key,
-      action,
-      target_type,
-      target_id,
-      target_label,
-      note,
-      meta,
-      created_at
-    FROM admin_activity_log
-    ORDER BY created_at DESC, id DESC
-    LIMIT $1
-  `,
-    [Math.min(500, Math.max(1, Number(limit) || 200))],
-  );
-
-  return result.rows.map((entry) => ({
-    id: entry.id,
-    at: entry.created_at,
-    actor: entry.actor_name || "System",
-    actor_role: entry.actor_role || "admin",
-    module: entry.module_key || "system",
-    action: entry.action || "updated",
-    target: entry.target_label || entry.target_type || entry.target_id || "",
-    target_type: entry.target_type || "",
-    target_id: entry.target_id || null,
-    note: entry.note || "",
-    meta: entry.meta || {},
-  }));
-};
-
-const resolveRbacUserById = async (id) => {
-  const userId = Number(id);
-  if (!Number.isInteger(userId) || userId <= 0) return null;
-  const users = await listRbacUsers({ includeInactive: true });
-  return users.find((user) => Number(user.id) === userId) || null;
-};
-
 app.post("/api/auth/customer/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -9791,779 +5852,6 @@ app.post("/api/careers", async (req, res) => {
   }
 });
 
-app.get(
-  "/api/users",
-  authenticate,
-  requireRolePermissions(["users.view", "users.manage"], { any: true }),
-  async (req, res) => {
-    try {
-      const includeInactive =
-        String(req.query.includeInactive || "true")
-          .trim()
-          .toLowerCase() !== "false";
-      const users = await listRbacUsers({ includeInactive });
-      return res.json(users);
-    } catch (err) {
-      console.error("GET /api/users error:", err);
-      return res.status(500).json({ message: "Failed to fetch users" });
-    }
-  },
-);
-
-app.get(
-  "/api/rbac/users",
-  authenticate,
-  requireRolePermissions(["users.view", "users.manage"], { any: true }),
-  async (req, res) => {
-    try {
-      const includeInactive =
-        String(req.query.includeInactive || "true")
-          .trim()
-          .toLowerCase() !== "false";
-      const users = await listRbacUsers({ includeInactive });
-      return res.json(users);
-    } catch (err) {
-      console.error("GET /api/rbac/users error:", err);
-      return res.status(500).json({ message: "Failed to fetch users" });
-    }
-  },
-);
-
-app.get(
-  "/api/users/:id",
-  authenticate,
-  requireRolePermissions(["users.view", "users.manage"], { any: true }),
-  async (req, res) => {
-    try {
-      const user = await resolveRbacUserById(req.params.id);
-      if (!user) return res.status(404).json({ message: "User not found" });
-      return res.json({ user });
-    } catch (err) {
-      console.error("GET /api/users/:id error:", err);
-      return res.status(500).json({ message: "Failed to fetch user" });
-    }
-  },
-);
-
-app.put(
-  "/api/users/:id",
-  authenticate,
-  requireRolePermissions(["users.edit", "users.manage"], { any: true }),
-  async (req, res) => {
-    try {
-      const userId = Number(req.params.id);
-      if (!Number.isInteger(userId) || userId <= 0) {
-        return res.status(400).json({ message: "Invalid user id" });
-      }
-
-      const existingResult = await db.query(
-        'SELECT * FROM "user" WHERE id = $1',
-        [userId],
-      );
-      if (!existingResult.rows.length) {
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      const existing = existingResult.rows[0];
-      const body = req.body || {};
-      const user_name =
-        String(
-          body.user_name || body.username || existing.user_name || "",
-        ).trim() || null;
-      const first_name =
-        String(body.first_name || existing.first_name || "").trim() || null;
-      const last_name =
-        String(body.last_name || existing.last_name || "").trim() || null;
-      const phone = String(body.phone || existing.phone || "").trim() || null;
-      const gender =
-        String(body.gender || existing.gender || "").trim() || null;
-      const email = String(body.email || existing.email || "")
-        .trim()
-        .toLowerCase();
-      const role = normalizeRole(body.role || existing.role || "viewer");
-      const displayName =
-        String(body.display_name || "").trim() ||
-        [first_name, last_name].filter(Boolean).join(" ").trim() ||
-        user_name ||
-        email ||
-        "User";
-      const bio = String(body.bio || existing.bio || "").trim() || null;
-      const department =
-        String(body.department || existing.department || "").trim() || null;
-      const status = normalizeUserStatus(body.status || existing.status);
-      const avatar =
-        String(
-          body.avatar || body.avatar_url || existing.avatar || "",
-        ).trim() || null;
-      const permissionsOverride = Array.from(
-        new Set(
-          parseJsonArray(
-            body.permissions_override ||
-              body.permissions ||
-              existing.permissions_override ||
-              [],
-            [],
-          )
-            .map((permission) => normalizePermissionToken(permission))
-            .filter(Boolean),
-        ),
-      );
-      const password = String(body.password || "").trim();
-
-      const duplicateEmail = await db.query(
-        'SELECT id FROM "user" WHERE LOWER(email) = $1 AND id != $2 LIMIT 1',
-        [email, userId],
-      );
-      if (duplicateEmail.rows.length) {
-        return res.status(409).json({ message: "Email already registered" });
-      }
-
-      const hashedPassword = password ? await bcrypt.hash(password, 10) : null;
-
-      const query = password
-        ? `
-          UPDATE "user"
-          SET user_name = $1,
-              first_name = $2,
-              last_name = $3,
-              phone = $4,
-              gender = $5,
-              email = $6,
-              role = $7,
-              display_name = $8,
-              bio = $9,
-              department = $10,
-              status = $11,
-              avatar = $12,
-              permissions_override = $13::jsonb,
-              password = $14,
-              updated_at = now()
-          WHERE id = $15
-          RETURNING *`
-        : `
-          UPDATE "user"
-          SET user_name = $1,
-              first_name = $2,
-              last_name = $3,
-              phone = $4,
-              gender = $5,
-              email = $6,
-              role = $7,
-              display_name = $8,
-              bio = $9,
-              department = $10,
-              status = $11,
-              avatar = $12,
-              permissions_override = $13::jsonb,
-              updated_at = now()
-          WHERE id = $14
-          RETURNING *`;
-
-      const params = password
-        ? [
-            user_name,
-            first_name,
-            last_name,
-            phone,
-            gender,
-            email,
-            role,
-            displayName,
-            bio,
-            department,
-            status,
-            avatar,
-            JSON.stringify(permissionsOverride),
-            hashedPassword,
-            userId,
-          ]
-        : [
-            user_name,
-            first_name,
-            last_name,
-            phone,
-            gender,
-            email,
-            role,
-            displayName,
-            bio,
-            department,
-            status,
-            avatar,
-            JSON.stringify(permissionsOverride),
-            userId,
-          ];
-
-      const result = await db.query(query, params);
-      const roleRecord = await getRoleAccessRow(result.rows[0]?.role);
-      const savedUser = normalizeAdminUserRow(result.rows[0], roleRecord);
-
-      await recordAdminActivity({
-        actorUserId: req.user?.id || null,
-        actorName: req.user?.username || req.user?.email || "System",
-        actorRole: req.user?.role || "admin",
-        moduleKey: "users",
-        action: "updated",
-        targetType: "user",
-        targetId: savedUser.id,
-        targetLabel: savedUser.display_name,
-        note: "Updated an admin user.",
-        meta: { role: savedUser.role },
-      });
-
-      return res.json({
-        message: "User updated successfully.",
-        user: savedUser,
-      });
-    } catch (err) {
-      console.error("PUT /api/users/:id error:", err);
-      return res.status(500).json({ message: "Failed to update user" });
-    }
-  },
-);
-
-app.delete(
-  "/api/users/:id",
-  authenticate,
-  requireRolePermissions(["users.delete", "users.manage"], { any: true }),
-  async (req, res) => {
-    try {
-      const userId = Number(req.params.id);
-      if (!Number.isInteger(userId) || userId <= 0) {
-        return res.status(400).json({ message: "Invalid user id" });
-      }
-
-      const result = await db.query(
-        'DELETE FROM "user" WHERE id = $1 RETURNING id, user_name, display_name, role',
-        [userId],
-      );
-
-      if (!result.rows.length) {
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      await recordAdminActivity({
-        actorUserId: req.user?.id || null,
-        actorName: req.user?.username || req.user?.email || "System",
-        actorRole: req.user?.role || "admin",
-        moduleKey: "users",
-        action: "deleted",
-        targetType: "user",
-        targetId: result.rows[0].id,
-        targetLabel: result.rows[0].display_name || result.rows[0].user_name,
-        note: "Deleted an admin user.",
-        meta: { role: result.rows[0].role || "viewer" },
-      });
-
-      return res.json({
-        message: "User deleted successfully",
-        user: result.rows[0],
-      });
-    } catch (err) {
-      console.error("DELETE /api/users/:id error:", err);
-      return res.status(500).json({ message: "Failed to delete user" });
-    }
-  },
-);
-
-app.post(
-  "/api/rbac/users/:id/roles",
-  authenticate,
-  requireRolePermissions(["users.assign", "roles.manage", "users.manage"], {
-    any: true,
-  }),
-  async (req, res) => {
-    try {
-      const userId = Number(req.params.id);
-      if (!Number.isInteger(userId) || userId <= 0) {
-        return res.status(400).json({ message: "Invalid user id" });
-      }
-
-      const roleId = String(req.body?.role_id || req.body?.roleId || "").trim();
-      if (!roleId) {
-        return res.status(400).json({ message: "role_id is required" });
-      }
-
-      const roleResult = await db.query(
-        `
-        SELECT id, name, title, description, permissions, built_in, created_at, updated_at
-        FROM admin_roles
-        WHERE CAST(id AS TEXT) = $1 OR LOWER(name) = LOWER($1)
-        LIMIT 1
-      `,
-        [roleId],
-      );
-      const roleRecord = normalizeAdminRoleRow(roleResult.rows[0] || null);
-      const roleName = roleRecord?.name || normalizeRole(roleId);
-
-      const updateResult = await db.query(
-        `
-        UPDATE "user"
-        SET role = $1, updated_at = now()
-        WHERE id = $2
-        RETURNING *
-      `,
-        [roleName, userId],
-      );
-      if (!updateResult.rows.length) {
-        return res.status(404).json({ message: "User not found" });
-      }
-
-      const savedUser = normalizeAdminUserRow(updateResult.rows[0], roleRecord);
-
-      await recordAdminActivity({
-        actorUserId: req.user?.id || null,
-        actorName: req.user?.username || req.user?.email || "System",
-        actorRole: req.user?.role || "admin",
-        moduleKey: "roles",
-        action: "assigned",
-        targetType: "user",
-        targetId: savedUser.id,
-        targetLabel: savedUser.display_name,
-        note: `Assigned ${roleName} role.`,
-        meta: { role: roleName },
-      });
-
-      return res.json({
-        message: "Role assigned successfully",
-        user: savedUser,
-        role: roleRecord,
-      });
-    } catch (err) {
-      console.error("POST /api/rbac/users/:id/roles error:", err);
-      return res.status(500).json({ message: "Failed to assign role" });
-    }
-  },
-);
-
-app.get(
-  "/api/rbac/roles",
-  authenticate,
-  requireRolePermissions(["roles.view", "permissions.view", "roles.manage"], {
-    any: true,
-  }),
-  async (_req, res) => {
-    try {
-      const roles = await listRbacRoles();
-      return res.json(roles);
-    } catch (err) {
-      console.error("GET /api/rbac/roles error:", err);
-      return res.status(500).json({ message: "Failed to fetch roles" });
-    }
-  },
-);
-
-app.post(
-  "/api/rbac/roles",
-  authenticate,
-  requireRolePermissions(["roles.create", "roles.manage"], { any: true }),
-  async (req, res) => {
-    try {
-      const name = normalizeRole(req.body?.name || req.body?.id || "");
-      if (!name) {
-        return res.status(400).json({ message: "Role name is required" });
-      }
-
-      const title = String(
-        req.body?.title || getRolePreset(name).label || name,
-      ).trim();
-      const description = String(
-        req.body?.description || getRolePreset(name).description || "",
-      ).trim();
-      const permissions = Array.from(
-        new Set(
-          parseJsonArray(req.body?.permissions || [], [])
-            .map((permission) => normalizePermissionToken(permission))
-            .filter(Boolean),
-        ),
-      );
-
-      const result = await db.query(
-        `
-        INSERT INTO admin_roles (name, title, description, permissions, built_in)
-        VALUES ($1,$2,$3,$4::jsonb,$5)
-        ON CONFLICT (name)
-        DO UPDATE SET
-          title = EXCLUDED.title,
-          description = EXCLUDED.description,
-          permissions = EXCLUDED.permissions,
-          built_in = EXCLUDED.built_in,
-          updated_at = now()
-        RETURNING id, name, title, description, permissions, built_in, created_at, updated_at
-      `,
-        [
-          name,
-          title,
-          description,
-          JSON.stringify(permissions),
-          Boolean(req.body?.built_in),
-        ],
-      );
-
-      const role = normalizeAdminRoleRow(result.rows[0]);
-      await recordAdminActivity({
-        actorUserId: req.user?.id || null,
-        actorName: req.user?.username || req.user?.email || "System",
-        actorRole: req.user?.role || "admin",
-        moduleKey: "roles",
-        action: "created",
-        targetType: "role",
-        targetId: role.id,
-        targetLabel: role.title,
-        note: "Created or updated a role.",
-        meta: { permissions: role.permissions },
-      });
-
-      return res.status(201).json({ role });
-    } catch (err) {
-      console.error("POST /api/rbac/roles error:", err);
-      return res.status(500).json({ message: "Failed to save role" });
-    }
-  },
-);
-
-app.put(
-  "/api/rbac/roles/:id",
-  authenticate,
-  requireRolePermissions(["roles.edit", "roles.manage"], { any: true }),
-  async (req, res) => {
-    try {
-      const lookup = String(req.params.id || "").trim();
-      const existing = await db.query(
-        `
-        SELECT id, name, title, description, permissions, built_in, created_at, updated_at
-        FROM admin_roles
-        WHERE CAST(id AS TEXT) = $1 OR LOWER(name) = LOWER($1)
-        LIMIT 1
-      `,
-        [lookup],
-      );
-      if (!existing.rows.length) {
-        return res.status(404).json({ message: "Role not found" });
-      }
-
-      const current = normalizeAdminRoleRow(existing.rows[0]);
-      const name = normalizeRole(req.body?.name || current.name);
-      const title = String(req.body?.title || current.title || name).trim();
-      const description = String(
-        req.body?.description || current.description || "",
-      ).trim();
-      const permissions = Array.from(
-        new Set(
-          parseJsonArray(req.body?.permissions || current.permissions || [], [])
-            .map((permission) => normalizePermissionToken(permission))
-            .filter(Boolean),
-        ),
-      );
-
-      const result = await db.query(
-        `
-        UPDATE admin_roles
-        SET name = $1,
-            title = $2,
-            description = $3,
-            permissions = $4::jsonb,
-            built_in = $5,
-            updated_at = now()
-        WHERE id = $6
-        RETURNING id, name, title, description, permissions, built_in, created_at, updated_at
-      `,
-        [
-          name,
-          title,
-          description,
-          JSON.stringify(permissions),
-          Boolean(req.body?.built_in),
-          current.id,
-        ],
-      );
-
-      const role = normalizeAdminRoleRow(result.rows[0]);
-      await recordAdminActivity({
-        actorUserId: req.user?.id || null,
-        actorName: req.user?.username || req.user?.email || "System",
-        actorRole: req.user?.role || "admin",
-        moduleKey: "roles",
-        action: "updated",
-        targetType: "role",
-        targetId: role.id,
-        targetLabel: role.title,
-        note: "Updated a role.",
-        meta: { permissions: role.permissions },
-      });
-
-      return res.json({ role });
-    } catch (err) {
-      console.error("PUT /api/rbac/roles/:id error:", err);
-      return res.status(500).json({ message: "Failed to update role" });
-    }
-  },
-);
-
-app.delete(
-  "/api/rbac/roles/:id",
-  authenticate,
-  requireRolePermissions(["roles.delete", "roles.manage"], { any: true }),
-  async (req, res) => {
-    try {
-      const lookup = String(req.params.id || "").trim();
-      const result = await db.query(
-        `
-        DELETE FROM admin_roles
-        WHERE CAST(id AS TEXT) = $1 OR LOWER(name) = LOWER($1)
-        RETURNING id, name, title
-      `,
-        [lookup],
-      );
-      if (!result.rows.length) {
-        return res.status(404).json({ message: "Role not found" });
-      }
-
-      await recordAdminActivity({
-        actorUserId: req.user?.id || null,
-        actorName: req.user?.username || req.user?.email || "System",
-        actorRole: req.user?.role || "admin",
-        moduleKey: "roles",
-        action: "deleted",
-        targetType: "role",
-        targetId: result.rows[0].id,
-        targetLabel: result.rows[0].title || result.rows[0].name,
-        note: "Deleted a role.",
-      });
-
-      return res.json({ role: result.rows[0] });
-    } catch (err) {
-      console.error("DELETE /api/rbac/roles/:id error:", err);
-      return res.status(500).json({ message: "Failed to delete role" });
-    }
-  },
-);
-
-app.get(
-  "/api/rbac/permissions",
-  authenticate,
-  requireRolePermissions(["permissions.view", "permissions.manage"], {
-    any: true,
-  }),
-  async (_req, res) => {
-    try {
-      const permissions = await listRbacPermissions();
-      return res.json(permissions);
-    } catch (err) {
-      console.error("GET /api/rbac/permissions error:", err);
-      return res.status(500).json({ message: "Failed to fetch permissions" });
-    }
-  },
-);
-
-app.post(
-  "/api/rbac/permissions",
-  authenticate,
-  requireRolePermissions(["permissions.create", "permissions.manage"], {
-    any: true,
-  }),
-  async (req, res) => {
-    try {
-      const name = normalizePermissionToken(
-        req.body?.name || req.body?.id || "",
-      );
-      if (!name) {
-        return res.status(400).json({ message: "Permission name is required" });
-      }
-
-      const description = String(req.body?.description || "").trim();
-      const moduleKey = String(
-        req.body?.module || req.body?.module_key || "",
-      ).trim();
-      const action = String(req.body?.action || "").trim();
-      const result = await db.query(
-        `
-        INSERT INTO admin_permissions (
-          name,
-          description,
-          module_key,
-          action,
-          built_in
-        )
-        VALUES ($1,$2,$3,$4,$5)
-        ON CONFLICT (name)
-        DO UPDATE SET
-          description = EXCLUDED.description,
-          module_key = EXCLUDED.module_key,
-          action = EXCLUDED.action,
-          built_in = EXCLUDED.built_in,
-          updated_at = now()
-        RETURNING id, name, description, module_key, action, built_in, created_at, updated_at
-      `,
-        [
-          name,
-          description,
-          moduleKey || null,
-          action || null,
-          Boolean(req.body?.built_in),
-        ],
-      );
-
-      const permission = normalizeAdminPermissionRow({
-        ...result.rows[0],
-        module: result.rows[0]?.module_key,
-      });
-
-      await recordAdminActivity({
-        actorUserId: req.user?.id || null,
-        actorName: req.user?.username || req.user?.email || "System",
-        actorRole: req.user?.role || "admin",
-        moduleKey: "permissions",
-        action: "created",
-        targetType: "permission",
-        targetId: permission.id,
-        targetLabel: permission.name,
-        note: "Created or updated a permission.",
-      });
-
-      return res.status(201).json({ permission });
-    } catch (err) {
-      console.error("POST /api/rbac/permissions error:", err);
-      return res.status(500).json({ message: "Failed to save permission" });
-    }
-  },
-);
-
-app.put(
-  "/api/rbac/permissions/:id",
-  authenticate,
-  requireRolePermissions(["permissions.edit", "permissions.manage"], {
-    any: true,
-  }),
-  async (req, res) => {
-    try {
-      const lookup = String(req.params.id || "").trim();
-      const existing = await db.query(
-        `
-        SELECT id, name, description, module_key, action, built_in, created_at, updated_at
-        FROM admin_permissions
-        WHERE CAST(id AS TEXT) = $1 OR LOWER(name) = LOWER($1)
-        LIMIT 1
-      `,
-        [lookup],
-      );
-      if (!existing.rows.length) {
-        return res.status(404).json({ message: "Permission not found" });
-      }
-
-      const current = normalizeAdminPermissionRow(existing.rows[0]);
-      const name = normalizePermissionToken(req.body?.name || current.name);
-      const description = String(
-        req.body?.description || current.description || "",
-      ).trim();
-      const moduleKey = String(
-        req.body?.module || req.body?.module_key || current.module || "",
-      ).trim();
-      const action = String(req.body?.action || current.action || "").trim();
-      const result = await db.query(
-        `
-        UPDATE admin_permissions
-        SET name = $1,
-            description = $2,
-            module_key = $3,
-            action = $4,
-            built_in = $5,
-            updated_at = now()
-        WHERE id = $6
-        RETURNING id, name, description, module_key, action, built_in, created_at, updated_at
-      `,
-        [
-          name,
-          description,
-          moduleKey || null,
-          action || null,
-          Boolean(req.body?.built_in),
-          current.id,
-        ],
-      );
-
-      const permission = normalizeAdminPermissionRow({
-        ...result.rows[0],
-        module: result.rows[0]?.module_key,
-      });
-
-      await recordAdminActivity({
-        actorUserId: req.user?.id || null,
-        actorName: req.user?.username || req.user?.email || "System",
-        actorRole: req.user?.role || "admin",
-        moduleKey: "permissions",
-        action: "updated",
-        targetType: "permission",
-        targetId: permission.id,
-        targetLabel: permission.name,
-        note: "Updated a permission.",
-      });
-
-      return res.json({ permission });
-    } catch (err) {
-      console.error("PUT /api/rbac/permissions/:id error:", err);
-      return res.status(500).json({ message: "Failed to update permission" });
-    }
-  },
-);
-
-app.delete(
-  "/api/rbac/permissions/:id",
-  authenticate,
-  requireRolePermissions(["permissions.delete", "permissions.manage"], {
-    any: true,
-  }),
-  async (req, res) => {
-    try {
-      const lookup = String(req.params.id || "").trim();
-      const result = await db.query(
-        `
-        DELETE FROM admin_permissions
-        WHERE CAST(id AS TEXT) = $1 OR LOWER(name) = LOWER($1)
-        RETURNING id, name
-      `,
-        [lookup],
-      );
-      if (!result.rows.length) {
-        return res.status(404).json({ message: "Permission not found" });
-      }
-
-      await recordAdminActivity({
-        actorUserId: req.user?.id || null,
-        actorName: req.user?.username || req.user?.email || "System",
-        actorRole: req.user?.role || "admin",
-        moduleKey: "permissions",
-        action: "deleted",
-        targetType: "permission",
-        targetId: result.rows[0].id,
-        targetLabel: result.rows[0].name,
-        note: "Deleted a permission.",
-      });
-
-      return res.json({ permission: result.rows[0] });
-    } catch (err) {
-      console.error("DELETE /api/rbac/permissions/:id error:", err);
-      return res.status(500).json({ message: "Failed to delete permission" });
-    }
-  },
-);
-
-app.get(
-  "/api/rbac/activity",
-  authenticate,
-  requireRolePermissions(["activity.view"], { any: true }),
-  async (req, res) => {
-    try {
-      const limit = Math.min(500, Number(req.query.limit || 100) || 100);
-      const activities = await listRbacActivities({ limit });
-      return res.json(activities);
-    } catch (err) {
-      console.error("GET /api/rbac/activity error:", err);
-      return res.status(500).json({ message: "Failed to fetch activity log" });
-    }
-  },
-);
-
 app.get("/api/admin/careers", authenticate, async (req, res) => {
   try {
     const pageRaw = Number(req.query.page);
@@ -10857,7 +6145,7 @@ app.post("/api/admin/careers/:id/notify", authenticate, async (req, res) => {
 /* ---- Blogs (Eligibility + Suggestions + Editor) ---- */
 app.get("/api/admin/blogs/candidates", authenticate, async (req, res) => {
   try {
-    if (!(await ensureBlogManagerAccess(req, res, "view"))) return;
+    if (!ensureBlogManagerAccess(req, res)) return;
 
     const rawType = String(req.query.type || "smartphone")
       .trim()
@@ -10929,7 +6217,7 @@ app.get(
   authenticate,
   async (req, res) => {
     try {
-      if (!(await ensureBlogManagerAccess(req, res, "view"))) return;
+      if (!ensureBlogManagerAccess(req, res)) return;
 
       const productId = Number(req.params.productId);
       if (!Number.isInteger(productId) || productId <= 0) {
@@ -10945,68 +6233,55 @@ app.get(
         return res.status(404).json({ message: "Product not found" });
       }
 
-      const selectionContext = buildBlogSelectionContext([snapshot]);
-      const suggestions = buildBlogSuggestionsForSelection(
-        [snapshot],
-        selectionContext.tokenMap,
-      );
-      const existingMatch = await findExistingBlogByOrderedProductSet([productId]);
-      const existing = existingMatch?.id
-        ? await db.query(
-            `
-              SELECT
-                id,
-                product_id,
-                category,
-                title,
-                slug,
-                excerpt,
-                author_name,
-                author_user_id,
-                content_template,
-                content_rendered,
-                status,
-                blog_eligible,
-                meta_title,
-                meta_description,
-                hero_image_source,
-                hero_image_alt,
-                hero_image_caption,
-                tags,
-                featured,
-                trending,
-                pinned,
-                CASE
-                  WHEN hero_image_source = 'none' THEN NULL
-                  ELSE COALESCE(
-                    hero_image,
-                    (
-                      SELECT pi.image_url
-                      FROM product_images pi
-                      WHERE pi.product_id = blogs.product_id
-                      ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-                      LIMIT 1
-                    )
-                  )
-                END AS hero_image,
-                published_at,
-                created_at,
-                updated_at
-              FROM blogs
-              WHERE id = $1
-              LIMIT 1
-            `,
-            [existingMatch.id],
+      const tokenMap = buildBlogTokenMap(snapshot);
+      const suggestions = buildBlogSuggestions(snapshot, tokenMap);
+      const existing = await db.query(
+        `
+      SELECT
+        id,
+        product_id,
+        title,
+        slug,
+        excerpt,
+        content_template,
+        content_rendered,
+        status,
+        blog_eligible,
+        meta_title,
+        meta_description,
+        COALESCE(
+          hero_image,
+          (
+            SELECT pi.image_url
+            FROM product_images pi
+            WHERE pi.product_id = blogs.product_id
+            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+            LIMIT 1
           )
-        : { rows: [] };
+        ) AS hero_image,
+        published_at,
+        created_at,
+        updated_at
+      FROM blogs
+      WHERE product_id = $1
+      LIMIT 1
+    `,
+        [productId],
+      );
 
       return res.json({
-        primary_product_id: selectionContext.productIds[0] || null,
-        product: selectionContext.products[0] || null,
-        products: selectionContext.products,
-        product_ids: selectionContext.productIds,
-        token_map: selectionContext.tokenMap,
-        token_keys: selectionContext.tokenKeys,
+        product: {
+          product_id: snapshot.product_id,
+          product_type: snapshot.product_type,
+          name: snapshot.core?.name || "",
+          brand_name: snapshot.core?.brand_name || "",
+          spec_score: snapshot.scored?.spec_score ?? 0,
+          price: formatBlogPrice(snapshot.lowest_price) || null,
+          image: snapshot.hero_image || null,
+          images: Array.isArray(snapshot.images) ? snapshot.images : [],
+        },
+        token_map: tokenMap,
+        token_keys: Object.keys(tokenMap).sort(),
         suggestions,
         existing_blog: existing.rows[0] || null,
       });
@@ -11021,33 +6296,27 @@ app.get(
 
 app.post("/api/admin/blogs/preview", authenticate, async (req, res) => {
   try {
-    if (!(await ensureBlogManagerAccess(req, res, "edit"))) return;
+    if (!ensureBlogManagerAccess(req, res)) return;
 
-    const productIds = orderBlogProductIds(
-      req.body?.product_ids ?? req.body?.productIds,
-      req.body?.primary_product_id ?? req.body?.primaryProductId ?? req.body?.product_id,
-    );
+    const productIdRaw = req.body?.product_id;
+    const productId = Number(productIdRaw);
+    const hasProductId = Number.isInteger(productId) && productId > 0;
     const content = String(req.body?.content || "");
     if (!content.trim()) {
       return res.status(400).json({ message: "content is required" });
     }
 
     let tokenMap = toPlainObject(req.body?.token_map);
-    if (productIds.length > 0) {
+    if (hasProductId) {
       const profileConfig = await readDeviceFieldProfilesConfig();
-      const snapshotResult = await fetchBlogSnapshotsByProductIds(
-        productIds,
+      const snapshot = await fetchBlogProductSnapshot(
+        productId,
         profileConfig.profiles,
       );
-      if (snapshotResult.missingIds.length) {
-        return res.status(404).json({
-          message: `Products not found: ${snapshotResult.missingIds.join(", ")}`,
-        });
+      if (!snapshot) {
+        return res.status(404).json({ message: "Product not found" });
       }
-      tokenMap = buildBlogSelectionContext(
-        snapshotResult.snapshots,
-        tokenMap,
-      ).tokenMap;
+      tokenMap = buildBlogTokenMap(snapshot);
     }
     const rendered = renderBlogTemplateWithTokens(content, tokenMap, {
       preserveUnknown: true,
@@ -11067,125 +6336,62 @@ app.post("/api/admin/blogs/preview", authenticate, async (req, res) => {
 
 app.post("/api/admin/blogs", authenticate, async (req, res) => {
   try {
-    if (!(await ensureBlogManagerAccess(req, res, "edit"))) return;
+    if (!ensureBlogManagerAccess(req, res)) return;
 
     const rawBlogId = Number(req.body?.blog_id);
+    const rawProductId = Number(req.body?.product_id);
     const hasBlogId = Number.isInteger(rawBlogId) && rawBlogId > 0;
-    const productIds = orderBlogProductIds(
-      req.body?.product_ids ?? req.body?.productIds ?? req.body?.products,
-      req.body?.primary_product_id ??
-        req.body?.primaryProductId ??
-        req.body?.product_id,
-    );
+    const hasProductId = Number.isInteger(rawProductId) && rawProductId > 0;
     let targetBlogId = hasBlogId ? rawBlogId : null;
-    const productId = productIds[0] || null;
+    const productId = hasProductId ? rawProductId : null;
 
     const title = String(req.body?.title || "").trim();
     const excerpt = String(req.body?.excerpt || "").trim();
     const contentTemplate = String(req.body?.content_template || "").trim();
     const requestedSlug = String(req.body?.slug || "").trim();
-    const requestedCategory = String(req.body?.category || "news")
-      .trim()
-      .toLowerCase();
     const requestedStatus = String(req.body?.status || "draft")
       .trim()
       .toLowerCase();
-    const category = BLOG_ALLOWED_CATEGORIES.has(requestedCategory)
-      ? requestedCategory
-      : "news";
     const status = BLOG_ALLOWED_STATUSES.has(requestedStatus)
       ? requestedStatus
       : "draft";
     const metaTitle = String(req.body?.meta_title || "").trim();
     const metaDescription = String(req.body?.meta_description || "").trim();
-    const authorName = String(
-      req.body?.author_name || req.body?.authorName || "",
-    ).trim();
-    const authorUserIdRaw = Number(req.body?.author_user_id);
-    const authorUserId =
-      Number.isInteger(authorUserIdRaw) && authorUserIdRaw > 0
-        ? authorUserIdRaw
-        : null;
-    const heroImageAlt = String(
-      req.body?.hero_image_alt || req.body?.heroImageAlt || "",
-    ).trim();
-    const heroImageCaption = String(
-      req.body?.hero_image_caption || req.body?.heroImageCaption || "",
-    ).trim();
-    const tags = parseBlogTags(req.body?.tags || req.body?.keywords);
-    const featured = parseBlogBoolean(req.body?.featured);
-    const trending = parseBlogBoolean(req.body?.trending);
-    const pinned = parseBlogBoolean(req.body?.pinned);
-    const publishedAtValue = parseBlogDate(
-      req.body?.published_at || req.body?.publishedAt,
-    );
-    const heroImageSourceRaw = String(req.body?.hero_image_source || "")
-      .trim()
-      .toLowerCase();
-    const heroImageSource =
-      heroImageSourceRaw === "asset" ||
-      heroImageSourceRaw === "url" ||
-      heroImageSourceRaw === "none"
-        ? heroImageSourceRaw
-        : null;
 
     if (!title) return res.status(400).json({ message: "title is required" });
     if (!contentTemplate) {
       return res.status(400).json({ message: "content_template is required" });
     }
 
-    if (!targetBlogId && productIds.length > 0) {
-      const existingBySelection = await findExistingBlogByOrderedProductSet(
-        productIds,
+    if (!targetBlogId && productId) {
+      const existingByProduct = await db.query(
+        "SELECT id FROM blogs WHERE product_id = $1 LIMIT 1",
+        [productId],
       );
-      targetBlogId = Number(existingBySelection?.id) || null;
+      targetBlogId = Number(existingByProduct.rows[0]?.id) || null;
     }
 
-    let existingBlog = null;
-    if (targetBlogId) {
-      const existingBlogResult = await db.query(
-        `
-        SELECT id, status, slug
-        FROM blogs
-        WHERE id = $1
-        LIMIT 1
-      `,
-        [targetBlogId],
-      );
-      existingBlog = existingBlogResult.rows[0] || null;
-    }
-
-    let selectionContext = {
-      primarySnapshot: null,
-      productIds: [],
-      products: [],
-      tokenMap: toPlainObject(req.body?.token_map),
-      tokenKeys: Object.keys(toPlainObject(req.body?.token_map)).sort(),
-    };
-    if (productIds.length > 0) {
+    let snapshot = null;
+    if (productId) {
       const profileConfig = await readDeviceFieldProfilesConfig();
-      const snapshotResult = await fetchBlogSnapshotsByProductIds(
-        productIds,
+      snapshot = await fetchBlogProductSnapshot(
+        productId,
         profileConfig.profiles,
       );
-      if (snapshotResult.missingIds.length) {
-        return res.status(404).json({
-          message: `Products not found: ${snapshotResult.missingIds.join(", ")}`,
-        });
+      if (!snapshot) {
+        return res.status(404).json({ message: "Product not found" });
       }
-      selectionContext = buildBlogSelectionContext(
-        snapshotResult.snapshots,
-        req.body?.token_map,
-      );
     }
 
     const eligibilitySnapshot = {
       advisory_only: true,
-      product_linked: productIds.length > 0,
-      linked_product_count: productIds.length,
-      product_ids: productIds,
+      product_linked: Boolean(productId),
     };
-    const tokenMap = selectionContext.tokenMap;
+
+    const requestedTokenMap = toPlainObject(req.body?.token_map);
+    const tokenMap = snapshot
+      ? { ...buildBlogTokenMap(snapshot), ...requestedTokenMap }
+      : requestedTokenMap;
 
     const contentRendered = renderBlogTemplateWithTokens(
       contentTemplate,
@@ -11195,280 +6401,155 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       },
     );
     const slug = await resolveUniqueBlogSlug(
-      requestedSlug || title || selectionContext.primarySnapshot?.core?.name,
+      requestedSlug || title || snapshot?.core?.name,
       productId,
       targetBlogId,
     );
-    const heroImage =
-      heroImageSource === "none"
-        ? ""
-        : String(
-            req.body?.hero_image ||
-              selectionContext.primarySnapshot?.hero_image ||
-              "",
-          ).trim();
-    const authorUser = authorUserId
-      ? await resolveRbacUserById(authorUserId)
-      : null;
-    const resolvedAuthorName =
-      authorName ||
-      authorUser?.display_name ||
-      authorUser?.author_name ||
-      authorUser?.user_name ||
-      null;
+    const heroImage = String(
+      req.body?.hero_image || snapshot?.hero_image || "",
+    ).trim();
+    const nowPublishedAt = status === "published" ? new Date() : null;
     const actorId =
       Number.isInteger(Number(req.user?.id)) && Number(req.user?.id) > 0
         ? Number(req.user.id)
         : null;
 
-    const client = await db.connect();
     let writeResult;
-
-    try {
-      await client.query("BEGIN");
-
-      if (targetBlogId) {
-        writeResult = await client.query(
-          `
-            UPDATE blogs
-            SET
-              product_id = $2,
-              category = $3,
-              title = $4,
-              slug = $5,
-              excerpt = $6,
-              author_name = $7,
-              author_user_id = $8,
-              content_template = $9,
-              content_rendered = $10,
-              status = $11,
-              blog_eligible = $12,
-              eligibility_snapshot = $13::jsonb,
-              token_snapshot = $14::jsonb,
-              meta_title = $15,
-              meta_description = $16,
-              hero_image = $17,
-              hero_image_source = $18,
-              hero_image_alt = $19,
-              hero_image_caption = $20,
-              tags = $21::jsonb,
-              featured = $22,
-              trending = $23,
-              pinned = $24,
-              updated_by = $25,
-              published_at = CASE
-                WHEN $11 = 'published' THEN COALESCE($26, published_at, now())
-                ELSE $26
-              END,
-              updated_at = now()
-            WHERE id = $1
-            RETURNING
-              id,
-              product_id,
-              category,
-              title,
-              slug,
-              excerpt,
-              author_name,
-              author_user_id,
-              content_template,
-              content_rendered,
-              status,
-              blog_eligible,
-              eligibility_snapshot,
-              token_snapshot,
-              meta_title,
-              meta_description,
-              hero_image,
-              hero_image_source,
-              hero_image_alt,
-              hero_image_caption,
-              tags,
-              featured,
-              trending,
-              pinned,
-              published_at,
-              created_at,
-              updated_at
-          `,
-          [
-            targetBlogId,
-            productId,
-            category,
-            title,
-            slug,
-            excerpt || null,
-            resolvedAuthorName || null,
-            authorUserId,
-            contentTemplate,
-            contentRendered,
-            status,
-            productIds.length > 0,
-            JSON.stringify(eligibilitySnapshot),
-            JSON.stringify(tokenMap),
-            metaTitle || null,
-            metaDescription || null,
-            heroImage || null,
-            heroImageSource,
-            heroImageAlt || null,
-            heroImageCaption || null,
-            JSON.stringify(tags),
-            featured,
-            trending,
-            pinned,
-            actorId,
-            publishedAtValue,
-          ],
-        );
-        if (!writeResult.rows.length) {
-          await client.query("ROLLBACK");
-          return res.status(404).json({ message: "Blog not found" });
-        }
-      } else {
-        writeResult = await client.query(
-          `
-            INSERT INTO blogs (
-              product_id,
-              category,
-              title,
-              slug,
-              excerpt,
-              author_name,
-              author_user_id,
-              content_template,
-              content_rendered,
-              status,
-              blog_eligible,
-              eligibility_snapshot,
-              token_snapshot,
-              meta_title,
-              meta_description,
-              hero_image,
-              hero_image_source,
-              hero_image_alt,
-              hero_image_caption,
-              tags,
-              featured,
-              trending,
-              pinned,
-              created_by,
-              updated_by,
-              published_at,
-              created_at,
-              updated_at
-            ) VALUES (
-              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14,$15,$16,$17,$18,$19,$20::jsonb,$21,$22,$23,$24,$25,$26,now(),now()
-            )
-            RETURNING
-              id,
-              product_id,
-              category,
-              title,
-              slug,
-              excerpt,
-              author_name,
-              author_user_id,
-              content_template,
-              content_rendered,
-              status,
-              blog_eligible,
-              eligibility_snapshot,
-              token_snapshot,
-              meta_title,
-              meta_description,
-              hero_image,
-              hero_image_source,
-              hero_image_alt,
-              hero_image_caption,
-              tags,
-              featured,
-              trending,
-              pinned,
-              published_at,
-              created_at,
-              updated_at
-          `,
-          [
-            productId,
-            category,
-            title,
-            slug,
-            excerpt || null,
-            resolvedAuthorName || null,
-            authorUserId,
-            contentTemplate,
-            contentRendered,
-            status,
-            productIds.length > 0,
-            JSON.stringify(eligibilitySnapshot),
-            JSON.stringify(tokenMap),
-            metaTitle || null,
-            metaDescription || null,
-            heroImage || null,
-            heroImageSource,
-            heroImageAlt || null,
-            heroImageCaption || null,
-            JSON.stringify(tags),
-            featured,
-            trending,
-            pinned,
-            actorId,
-            actorId,
-            publishedAtValue,
-          ],
-        );
-      }
-
-      const savedBlogId = Number(writeResult.rows[0]?.id) || null;
-      await syncBlogProducts(client, savedBlogId, productIds);
-      await client.query("COMMIT");
-    } catch (writeErr) {
-      await client.query("ROLLBACK");
-      throw writeErr;
-    } finally {
-      client.release();
-    }
-
-    const savedBlog = writeResult.rows[0] || null;
-    if (savedBlog) {
-      savedBlog.product_ids = productIds;
-      savedBlog.products = selectionContext.products;
-      savedBlog.linked_product_count = productIds.length;
-      savedBlog.token_map = tokenMap;
-      savedBlog.token_keys = selectionContext.tokenKeys;
-      savedBlog.product_names = selectionContext.products
-        .map((product) => String(product?.name || "").trim())
-        .filter(Boolean)
-        .join(", ");
-    }
-    const shouldSendPublishedPush =
-      savedBlog?.status === "published" && existingBlog?.status !== "published";
-    let pushNotification = null;
-
-    if (shouldSendPublishedPush) {
-      try {
-        pushNotification = await sendPublishedNewsPush(savedBlog);
-      } catch (pushErr) {
-        console.error("News push dispatch failed:", pushErr);
-      }
-    }
-
-    // Ensure proper HTML encoding for API responses
-    if (savedBlog) {
-      await attachBlogProductsToRows([savedBlog]);
-      savedBlog.content_template = ensureProperHtmlEncoding(
-        savedBlog.content_template,
+    if (targetBlogId) {
+      writeResult = await db.query(
+        `
+        UPDATE blogs
+        SET
+          product_id = $2,
+          title = $3,
+          slug = $4,
+          excerpt = $5,
+          content_template = $6,
+          content_rendered = $7,
+          status = $8,
+          blog_eligible = $9,
+          eligibility_snapshot = $10::jsonb,
+          token_snapshot = $11::jsonb,
+          meta_title = $12,
+          meta_description = $13,
+          hero_image = $14,
+          updated_by = $15,
+          published_at = CASE
+            WHEN $8 = 'published' THEN COALESCE(published_at, $16)
+            ELSE NULL
+          END,
+          updated_at = now()
+        WHERE id = $1
+        RETURNING
+          id,
+          product_id,
+          title,
+          slug,
+          excerpt,
+          content_template,
+          content_rendered,
+          status,
+          blog_eligible,
+          eligibility_snapshot,
+          token_snapshot,
+          meta_title,
+          meta_description,
+          hero_image,
+          published_at,
+          created_at,
+          updated_at
+      `,
+        [
+          targetBlogId,
+          productId,
+          title,
+          slug,
+          excerpt || null,
+          contentTemplate,
+          contentRendered,
+          status,
+          Boolean(productId),
+          JSON.stringify(eligibilitySnapshot),
+          JSON.stringify(tokenMap),
+          metaTitle || null,
+          metaDescription || null,
+          heroImage || null,
+          actorId,
+          nowPublishedAt,
+        ],
       );
-      savedBlog.content_rendered = ensureProperHtmlEncoding(
-        savedBlog.content_rendered,
+      if (!writeResult.rows.length) {
+        return res.status(404).json({ message: "Blog not found" });
+      }
+    } else {
+      writeResult = await db.query(
+        `
+        INSERT INTO blogs (
+          product_id,
+          title,
+          slug,
+          excerpt,
+          content_template,
+          content_rendered,
+          status,
+          blog_eligible,
+          eligibility_snapshot,
+          token_snapshot,
+          meta_title,
+          meta_description,
+          hero_image,
+          created_by,
+          updated_by,
+          published_at,
+          created_at,
+          updated_at
+        ) VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16,now(),now()
+        )
+        RETURNING
+          id,
+          product_id,
+          title,
+          slug,
+          excerpt,
+          content_template,
+          content_rendered,
+          status,
+          blog_eligible,
+          eligibility_snapshot,
+          token_snapshot,
+          meta_title,
+          meta_description,
+          hero_image,
+          published_at,
+          created_at,
+          updated_at
+      `,
+        [
+          productId,
+          title,
+          slug,
+          excerpt || null,
+          contentTemplate,
+          contentRendered,
+          status,
+          Boolean(productId),
+          JSON.stringify(eligibilitySnapshot),
+          JSON.stringify(tokenMap),
+          metaTitle || null,
+          metaDescription || null,
+          heroImage || null,
+          actorId,
+          actorId,
+          nowPublishedAt,
+        ],
       );
     }
 
     return res.status(201).json({
       message: "Blog saved successfully",
-      blog: savedBlog,
+      blog: writeResult.rows[0],
       unresolved_tokens: collectTemplateTokens(contentRendered),
-      push_notification: pushNotification,
     });
   } catch (err) {
     console.error("POST /api/admin/blogs error:", err);
@@ -11478,7 +6559,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
 
 app.get("/api/admin/blogs", authenticate, async (req, res) => {
   try {
-    if (!(await ensureBlogManagerAccess(req, res, "view"))) return;
+    if (!ensureBlogManagerAccess(req, res)) return;
 
     const page = toPositiveInt(req.query.page, 1);
     const limit = Math.min(100, toPositiveInt(req.query.limit, 20));
@@ -11497,40 +6578,25 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
       SELECT
         bl.id,
         bl.product_id,
-        bl.category,
         bl.title,
         bl.slug,
-        bl.excerpt,
-        bl.author_name,
-        bl.author_user_id,
         bl.status,
         bl.blog_eligible,
-        bl.hero_image_source,
-        bl.hero_image_alt,
-        bl.hero_image_caption,
-        bl.tags,
-        bl.featured,
-        bl.trending,
-        bl.pinned,
-        CASE
-          WHEN bl.hero_image_source = 'none' THEN NULL
-          ELSE COALESCE(
-            bl.hero_image,
-            (
-              SELECT pi.image_url
-              FROM product_images pi
-              WHERE pi.product_id = bl.product_id
-              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-              LIMIT 1
-            )
+        COALESCE(
+          bl.hero_image,
+          (
+            SELECT pi.image_url
+            FROM product_images pi
+            WHERE pi.product_id = bl.product_id
+            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+            LIMIT 1
           )
-        END AS hero_image,
+        ) AS hero_image,
         bl.published_at,
         bl.updated_at,
         p.name AS product_name,
         p.product_type,
-        b.name AS brand_name,
-        b.logo AS brand_logo
+        b.name AS brand_name
       FROM blogs bl
       LEFT JOIN products p
         ON p.id = bl.product_id
@@ -11552,14 +6618,12 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
       db.query(listSql, params),
       db.query(countSql, countParams),
     ]);
-    const rows = Array.isArray(listRes.rows) ? listRes.rows : [];
-    await attachBlogProductsToRows(rows);
 
     return res.json({
       page,
       limit,
       total: countRes.rows[0]?.total || 0,
-      rows,
+      rows: listRes.rows || [],
     });
   } catch (err) {
     console.error("GET /api/admin/blogs error:", err);
@@ -11567,57 +6631,26 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
   }
 });
 
-app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
+app.get("/api/public/blogs", async (req, res) => {
   try {
-    if (!(await ensureBlogManagerAccess(req, res, "view"))) return;
-
-    const blogId = Number(req.params.id);
-    if (!Number.isInteger(blogId) || blogId <= 0) {
-      return res.status(400).json({ message: "Invalid blog id" });
-    }
-
+    const limit = Math.min(50, toPositiveInt(req.query.limit, 12));
     const result = await db.query(
       `
       SELECT
-        bl.id,
-        bl.product_id,
-        bl.category,
-        bl.title,
         bl.slug,
+        bl.title,
         bl.excerpt,
-        bl.author_name,
-        bl.author_user_id,
-        bl.content_template,
-        bl.content_rendered,
-        bl.status,
-        bl.blog_eligible,
-        bl.eligibility_snapshot,
-        bl.token_snapshot,
-        bl.meta_title,
-        bl.meta_description,
-        bl.hero_image_source,
-        bl.hero_image_alt,
-        bl.hero_image_caption,
-        bl.tags,
-        bl.featured,
-        bl.trending,
-        bl.pinned,
-        CASE
-          WHEN bl.hero_image_source = 'none' THEN NULL
-          ELSE COALESCE(
-            bl.hero_image,
-            (
-              SELECT pi.image_url
-              FROM product_images pi
-              WHERE pi.product_id = bl.product_id
-              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-              LIMIT 1
-            )
+        COALESCE(
+          bl.hero_image,
+          (
+            SELECT pi.image_url
+            FROM product_images pi
+            WHERE pi.product_id = bl.product_id
+            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+            LIMIT 1
           )
-        END AS hero_image,
+        ) AS hero_image,
         bl.published_at,
-        bl.created_at,
-        bl.updated_at,
         p.name AS product_name,
         p.product_type,
         b.name AS brand_name
@@ -11626,380 +6659,16 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
         ON p.id = bl.product_id
       LEFT JOIN brands b
         ON b.id = p.brand_id
-      WHERE bl.id = $1
-      LIMIT 1
-    `,
-      [blogId],
-    );
-
-    if (!result.rows.length) {
-      return res.status(404).json({ message: "Blog not found" });
-    }
-
-    const blog = result.rows[0];
-    await attachBlogProductsToRows([blog]);
-    const productIds = normalizeBlogProductIds(blog.product_ids, blog.product_id);
-
-    if (productIds.length > 0) {
-      const profileConfig = await readDeviceFieldProfilesConfig().catch(() => ({
-        profiles: [],
-      }));
-      const snapshotResult = await fetchBlogSnapshotsByProductIds(
-        productIds,
-        profileConfig.profiles,
-      );
-      const selectionContext = buildBlogSelectionContext(
-        snapshotResult.snapshots,
-        blog.token_snapshot,
-      );
-
-      blog.product_ids = selectionContext.productIds;
-      blog.products = selectionContext.products;
-      blog.linked_product_count = selectionContext.productIds.length;
-      blog.product_names = selectionContext.products
-        .map((product) => String(product?.name || "").trim())
-        .filter(Boolean)
-        .join(", ");
-      blog.token_map = selectionContext.tokenMap;
-      blog.token_keys = selectionContext.tokenKeys;
-      if (!blog.product_name && selectionContext.products[0]?.name) {
-        blog.product_name = selectionContext.products[0].name;
-      }
-      if (!blog.product_type && selectionContext.products[0]?.product_type) {
-        blog.product_type = selectionContext.products[0].product_type;
-      }
-      if (!blog.brand_name && selectionContext.products[0]?.brand_name) {
-        blog.brand_name = selectionContext.products[0].brand_name;
-      }
-    }
-
-    // Ensure proper HTML encoding for API responses
-    blog.content_template = ensureProperHtmlEncoding(blog.content_template);
-    blog.content_rendered = ensureProperHtmlEncoding(blog.content_rendered);
-
-    return res.json({ blog });
-  } catch (err) {
-    console.error("GET /api/admin/blogs/:id error:", err);
-    return res.status(500).json({ message: "Failed to fetch blog" });
-  }
-});
-
-app.delete("/api/admin/blogs/:id", authenticate, async (req, res) => {
-  try {
-    if (!(await ensureBlogManagerAccess(req, res, "delete"))) return;
-
-    const blogId = Number(req.params.id);
-    if (!Number.isInteger(blogId) || blogId <= 0) {
-      return res.status(400).json({ message: "Invalid blog id" });
-    }
-
-    const deleteResult = await db.query(
-      `
-      DELETE FROM blogs
-      WHERE id = $1
-      RETURNING id, title, product_id
-    `,
-      [blogId],
-    );
-
-    if (!deleteResult.rows.length) {
-      return res.status(404).json({ message: "Blog not found" });
-    }
-
-    return res.json({
-      message: "Blog deleted successfully",
-      blog: deleteResult.rows[0],
-    });
-  } catch (err) {
-    console.error("DELETE /api/admin/blogs/:id error:", err);
-    return res.status(500).json({ message: "Failed to delete blog" });
-  }
-});
-
-app.get("/api/public/push/fcm/status", (_req, res) => {
-  return res.json({
-    configured: isFirebaseAdminConfigured(),
-    topic: NEWS_PUSH_TOPIC,
-    routes: {
-      register: "/api/public/push/fcm/register",
-      unregister: "/api/public/push/fcm/unregister",
-    },
-  });
-});
-
-app.post("/api/public/push/fcm/register", async (req, res) => {
-  const token = normalizePushToken(req.body?.token);
-  const topic = normalizePushTopic(req.body?.topic || NEWS_PUSH_TOPIC);
-  const permission = normalizePushPermission(req.body?.permission);
-  const userAgent = String(req.get("user-agent") || "").trim() || null;
-
-  if (!token) {
-    return res.status(400).json({ message: "A valid FCM token is required" });
-  }
-
-  if (!topic) {
-    return res.status(400).json({ message: "Unsupported push topic" });
-  }
-
-  if (!isFirebaseAdminConfigured()) {
-    return res.status(503).json({
-      message: "Push notifications are not configured on the server yet",
-    });
-  }
-
-  try {
-    await subscribeTokenToTopic(token, topic);
-
-    const result = await db.query(
-      `
-      INSERT INTO push_subscriptions (
-        token,
-        topic,
-        platform,
-        permission,
-        user_agent,
-        status,
-        last_error,
-        last_registered_at,
-        updated_at
-      ) VALUES ($1,$2,'web',$3,$4,'active',NULL,now(),now())
-      ON CONFLICT (token, topic)
-      DO UPDATE SET
-        platform = 'web',
-        permission = EXCLUDED.permission,
-        user_agent = EXCLUDED.user_agent,
-        status = 'active',
-        last_error = NULL,
-        last_registered_at = now(),
-        updated_at = now()
-      RETURNING id, topic, status, last_registered_at, updated_at
-    `,
-      [token, topic, permission, userAgent],
-    );
-
-    return res.status(201).json({
-      message: "News alerts enabled",
-      subscription: result.rows[0] || null,
-    });
-  } catch (err) {
-    console.error("POST /api/public/push/fcm/register error:", err);
-
-    await db
-      .query(
-        `
-        INSERT INTO push_subscriptions (
-          token,
-          topic,
-          platform,
-          permission,
-          user_agent,
-          status,
-          last_error,
-          last_registered_at,
-          updated_at
-        ) VALUES ($1,$2,'web',$3,$4,'error',$5,now(),now())
-        ON CONFLICT (token, topic)
-        DO UPDATE SET
-          permission = EXCLUDED.permission,
-          user_agent = EXCLUDED.user_agent,
-          status = 'error',
-          last_error = EXCLUDED.last_error,
-          updated_at = now()
-      `,
-        [token, topic, permission, userAgent, err?.message || "Unknown error"],
-      )
-      .catch(() => undefined);
-
-    return res.status(502).json({
-      message: "Unable to enable news alerts right now",
-    });
-  }
-});
-
-app.post("/api/public/push/fcm/unregister", async (req, res) => {
-  const token = normalizePushToken(req.body?.token);
-  const topic = normalizePushTopic(req.body?.topic || NEWS_PUSH_TOPIC);
-
-  if (!token) {
-    return res.status(400).json({ message: "A valid FCM token is required" });
-  }
-
-  if (!topic) {
-    return res.status(400).json({ message: "Unsupported push topic" });
-  }
-
-  try {
-    if (isFirebaseAdminConfigured()) {
-      await unsubscribeTokenFromTopic(token, topic).catch((err) => {
-        console.warn("FCM unsubscribe warning:", err?.message || err);
-      });
-    }
-
-    const result = await db.query(
-      `
-      INSERT INTO push_subscriptions (
-        token,
-        topic,
-        platform,
-        status,
-        last_error,
-        updated_at
-      ) VALUES ($1,$2,'web','inactive',NULL,now())
-      ON CONFLICT (token, topic)
-      DO UPDATE SET
-        status = 'inactive',
-        last_error = NULL,
-        updated_at = now()
-      RETURNING id, topic, status, updated_at
-    `,
-      [token, topic],
-    );
-
-    return res.json({
-      message: "News alerts disabled",
-      subscription: result.rows[0] || null,
-    });
-  } catch (err) {
-    console.error("POST /api/public/push/fcm/unregister error:", err);
-    return res.status(500).json({
-      message: "Unable to disable news alerts right now",
-    });
-  }
-});
-
-app.get("/api/public/blogs", async (req, res) => {
-  try {
-    const limit = Math.min(50, toPositiveInt(req.query.limit, 12));
-    const rawCategory = String(req.query.category || "")
-      .trim()
-      .toLowerCase();
-    const category = BLOG_ALLOWED_CATEGORIES.has(rawCategory)
-      ? rawCategory
-      : null;
-    const productId = toPositiveInt(req.query.productId, null);
-    const rawProductType = String(
-      req.query.productType || req.query.product_type || "",
-    )
-      .trim()
-      .toLowerCase();
-    const productType = BLOG_ALLOWED_PRODUCT_TYPES.has(rawProductType)
-      ? rawProductType
-      : null;
-    const params = [limit];
-    const whereClauses = [`bl.status = 'published'`];
-
-    if (category) {
-      params.push(category);
-      whereClauses.push(`bl.category = $${params.length}`);
-    }
-
-    if (productId) {
-      params.push(productId);
-      whereClauses.push(`
-        EXISTS (
-          SELECT 1
-          FROM blog_products bp
-          WHERE bp.blog_id = bl.id
-            AND bp.product_id = $${params.length}
-        )
-      `);
-    }
-
-    if (productType) {
-      params.push(productType);
-      whereClauses.push(`
-        EXISTS (
-          SELECT 1
-          FROM blog_products bp
-          INNER JOIN products related_product
-            ON related_product.id = bp.product_id
-          WHERE bp.blog_id = bl.id
-            AND related_product.product_type = $${params.length}
-        )
-      `);
-    }
-
-    const result = await db.query(
-      `
-      SELECT
-        bl.id,
-        bl.product_id,
-        bl.slug,
-        bl.category,
-        bl.title,
-        bl.excerpt,
-        bl.author_name,
-        bl.author_user_id,
-        bl.content_template,
-        bl.content_rendered,
-        bl.token_snapshot,
-        bl.meta_title,
-        bl.meta_description,
-        bl.hero_image_source,
-        bl.hero_image_alt,
-        bl.hero_image_caption,
-        bl.tags,
-        bl.featured,
-        bl.trending,
-        bl.pinned,
-        CASE
-          WHEN bl.hero_image_source = 'none' THEN NULL
-          ELSE COALESCE(
-            bl.hero_image,
-            (
-              SELECT pi.image_url
-              FROM product_images pi
-              WHERE pi.product_id = bl.product_id
-              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-              LIMIT 1
-            )
-          )
-        END AS hero_image,
-        bl.published_at,
-        bl.updated_at,
-        p.name AS product_name,
-        p.product_type,
-        b.name AS brand_name,
-        b.logo AS brand_logo
-      FROM blogs bl
-      LEFT JOIN products p
-        ON p.id = bl.product_id
-      LEFT JOIN brands b
-        ON b.id = p.brand_id
-      WHERE ${whereClauses.join("\n        AND ")}
+      WHERE bl.status = 'published'
       ORDER BY bl.published_at DESC NULLS LAST, bl.updated_at DESC
       LIMIT $1
     `,
-      params,
+      [limit],
     );
-
-    const rows = result.rows || [];
-    await attachBlogProductsToRows(rows);
-    const needsResolution = rows.some((row) => Number(row.product_id) > 0);
-    const blogs = needsResolution
-      ? await (async () => {
-          const profileConfig = await readDeviceFieldProfilesConfig().catch(
-            () => ({ profiles: [] }),
-          );
-          const snapshotCache = new Map();
-          return Promise.all(
-            rows.map((row) =>
-              resolvePublicBlogRow(row, profileConfig, snapshotCache),
-            ),
-          );
-        })()
-      : rows.map((blog) => ({
-          ...blog,
-          content_template: ensureProperHtmlEncoding(blog.content_template),
-          content_rendered: ensureProperHtmlEncoding(blog.content_rendered),
-        }));
 
     return res.json({
       limit,
-      category,
-      productId,
-      productType,
-      blogs,
+      blogs: result.rows || [],
     });
   } catch (err) {
     console.error("GET /api/public/blogs error:", err);
@@ -12019,39 +6688,23 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
       SELECT
         bl.id,
         bl.product_id,
-        bl.category,
         bl.title,
         bl.slug,
         bl.excerpt,
-        bl.author_name,
-        bl.author_user_id,
-        bl.content_template,
         bl.content_rendered,
-        bl.token_snapshot,
         bl.meta_title,
         bl.meta_description,
-        bl.hero_image_source,
-        bl.hero_image_alt,
-        bl.hero_image_caption,
-        bl.tags,
-        bl.featured,
-        bl.trending,
-        bl.pinned,
-        CASE
-          WHEN bl.hero_image_source = 'none' THEN NULL
-          ELSE COALESCE(
-            bl.hero_image,
-            (
-              SELECT pi.image_url
-              FROM product_images pi
-              WHERE pi.product_id = bl.product_id
-              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-              LIMIT 1
-            )
+        COALESCE(
+          bl.hero_image,
+          (
+            SELECT pi.image_url
+            FROM product_images pi
+            WHERE pi.product_id = bl.product_id
+            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+            LIMIT 1
           )
-        END AS hero_image,
+        ) AS hero_image,
         bl.published_at,
-        bl.updated_at,
         p.name AS product_name,
         p.product_type,
         b.name AS brand_name
@@ -12071,9 +6724,7 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
       return res.status(404).json({ message: "Blog not found" });
     }
 
-    await attachBlogProductsToRows(result.rows);
-    const blog = await resolvePublicBlogRow(result.rows[0]);
-    return res.json({ blog });
+    return res.json({ blog: result.rows[0] });
   } catch (err) {
     console.error("GET /api/public/blogs/:slug error:", err);
     return res.status(500).json({ message: "Failed to fetch blog" });
@@ -13565,7 +8216,7 @@ app.get("/api/laptops", async (req, res) => {
       "laptop",
       (result.rows || []).map(toCanonicalLaptopProductResponse),
       profileConfig.profiles,
-    ).map(toPublicLaptopCatalogResponseRow);
+    );
     res.json({ laptops });
   } catch (err) {
     console.error("GET /api/laptops error:", err);
@@ -14125,6 +8776,22 @@ const resolveBrandIdByName = async (client, brandName) => {
   return brandRes.rows[0] ? brandRes.rows[0].id : null;
 };
 
+const resolveExistingBrandId = async (client, brandIdInput, brandNameInput) => {
+  const brandId = Number(brandIdInput);
+  if (Number.isInteger(brandId) && brandId > 0) {
+    const brandRes = await client.query(
+      `SELECT id
+       FROM brands
+       WHERE id = $1
+       LIMIT 1`,
+      [brandId],
+    );
+    if (brandRes.rows[0]) return brandRes.rows[0].id;
+  }
+
+  return resolveBrandIdByName(client, brandNameInput);
+};
+
 app.post("/api/tvs", authenticate, async (req, res) => {
   const client = await db.connect();
   const toJSON = (v) => (v === undefined ? null : JSON.stringify(v));
@@ -14146,22 +8813,38 @@ app.post("/api/tvs", authenticate, async (req, res) => {
       return res.status(400).json({ message: "product_name is required" });
     }
 
+    const basicInfo = toPlainObject(payload.basic_info_json);
+    const product = toPlainObject(payload.product);
     const model = normalizeNullableText(
-      payload.model ||
-        toPlainObject(payload.basic_info_json).model_number ||
-        toPlainObject(payload.basic_info_json).model,
+      payload.model || basicInfo.model_number || basicInfo.model,
     );
+    if (!model) {
+      return res.status(400).json({ message: "model is required" });
+    }
+
     const category = normalizeNullableText(payload.category);
     const publish = hasOwn(payload, "publish")
       ? Boolean(payload.publish)
       : false;
 
-    let brandId =
-      payload.brand_id !== undefined && payload.brand_id !== null
-        ? Number(payload.brand_id)
-        : null;
-    if (!Number.isInteger(brandId) || brandId <= 0) {
-      brandId = await resolveBrandIdByName(client, payload.brand_name);
+    const brandName = normalizeNullableText(
+      payload.brand_name ||
+        payload.brand ||
+        product.brand_name ||
+        product.brand ||
+        basicInfo.brand_name ||
+        basicInfo.brand,
+    );
+    const brandId = await resolveExistingBrandId(
+      client,
+      payload.brand_id,
+      brandName,
+    );
+    if (!brandId) {
+      return res.status(400).json({
+        message:
+          "brand is required and must reference an existing brand using brand_id or brand_name",
+      });
     }
 
     const imagesJson = Array.isArray(payload.images_json)
@@ -14356,6 +9039,11 @@ app.get("/api/tvs", async (req, res) => {
         t.category,
         t.model,
         COALESCE(pub.is_published, false) AS publish,
+        ds.hook_score,
+        ds.buyer_intent,
+        ds.trend_velocity,
+        ds.freshness,
+        ds.calculated_at AS hook_calculated_at,
 
         t.key_specs_json,
         t.basic_info_json,
@@ -14459,7 +9147,7 @@ app.get("/api/tvs", async (req, res) => {
       "tv",
       (result.rows || []).map((row) => stripScoreRecursively(row || {})),
       profileConfig.profiles,
-    ).map(toPublicTvCatalogResponseRow);
+    );
     return res.json({ tvs });
   } catch (err) {
     console.error("GET /api/tvs error:", err);
@@ -16775,1278 +11463,6 @@ app.delete("/api/brands/:id", authenticate, async (req, res) => {
   }
 });
 
-const buildAffiliatePlacementAdminRow = (row) => ({
-  ...row,
-  source_type: normalizeAffiliateSourceType(row?.source_type, "manual"),
-  is_auto: normalizeAffiliateSourceType(row?.source_type, "manual") === "auto",
-  total_clicks: Number(row?.total_clicks || 0),
-  price:
-    row?.price === null || row?.price === undefined ? null : Number(row.price),
-  lifecycle_state: getAffiliatePlacementLifecycleState(row),
-  effective_unpublish_at: resolveAffiliateEffectiveUnpublishAt(row),
-  is_live: isAffiliatePlacementLive(row),
-});
-
-const readAffiliatePlacementAdminRowById = async (placementId) => {
-  const result = await db.query(
-    `
-    SELECT
-      ap.*,
-      p.name AS product_name,
-      p.product_type,
-      bl.title AS blog_title,
-      bl.slug AS blog_slug,
-      br.name AS brand_name,
-      COALESCE(clicks.total_clicks, 0)::int AS total_clicks,
-      clicks.last_clicked_at
-    FROM affiliate_placements ap
-    LEFT JOIN products p
-      ON p.id = ap.product_id
-    LEFT JOIN blogs bl
-      ON bl.id = ap.blog_id
-    LEFT JOIN brands br
-      ON br.id = ap.brand_id
-    LEFT JOIN (
-      SELECT
-        placement_id,
-        COUNT(*)::int AS total_clicks,
-        MAX(created_at) AS last_clicked_at
-      FROM affiliate_clicks
-      GROUP BY placement_id
-    ) clicks
-      ON clicks.placement_id = ap.id
-    WHERE ap.id = $1
-    LIMIT 1
-  `,
-    [placementId],
-  );
-
-  return result.rows[0] ? buildAffiliatePlacementAdminRow(result.rows[0]) : null;
-};
-
-const ensureUniqueAffiliatePlacementSlug = async (seed, excludeId = null) => {
-  const base = normalizeAffiliateSlug(seed, "affiliate-link");
-  let candidate = base;
-  let suffix = 2;
-
-  while (true) {
-    const query = excludeId
-      ? `SELECT id FROM affiliate_placements WHERE slug = $1 AND id <> $2 LIMIT 1`
-      : `SELECT id FROM affiliate_placements WHERE slug = $1 LIMIT 1`;
-    const params = excludeId ? [candidate, excludeId] : [candidate];
-    const existing = await db.query(query, params);
-
-    if (!existing.rows.length) return candidate;
-    candidate = `${base}-${suffix}`;
-    suffix += 1;
-  }
-};
-
-const readAffiliateBlogProductIds = async (blogId) => {
-  if (!Number.isInteger(Number(blogId)) || Number(blogId) <= 0) return [];
-
-  const result = await db.query(
-    `
-    SELECT product_id
-    FROM (
-      SELECT bp.product_id AS product_id, bp.position AS position, bp.id AS source_id
-      FROM blog_products bp
-      WHERE bp.blog_id = $1
-
-      UNION ALL
-
-      SELECT bl.product_id AS product_id, 999999 AS position, bl.id AS source_id
-      FROM blogs bl
-      WHERE bl.id = $1 AND bl.product_id IS NOT NULL
-    ) source
-    WHERE product_id IS NOT NULL
-    ORDER BY position ASC, source_id ASC
-  `,
-    [Number(blogId)],
-  );
-
-  return Array.from(
-    new Set(
-      (result.rows || [])
-        .map((row) => Number(row.product_id))
-        .filter((value) => Number.isInteger(value) && value > 0),
-    ),
-  );
-};
-
-const readAffiliateProductContexts = async (productIds = []) => {
-  const normalizedIds = normalizeAffiliateIdList(productIds);
-  if (!normalizedIds.length) return new Map();
-
-  const result = await db.query(
-    `
-    SELECT
-      p.id AS product_id,
-      p.product_type,
-      p.brand_id,
-      p.name AS product_name,
-      b.name AS brand_name,
-      LOWER(TRIM(COALESCE(s.category, ''))) AS category_name
-    FROM products p
-    LEFT JOIN brands b
-      ON b.id = p.brand_id
-    LEFT JOIN smartphones s
-      ON s.product_id = p.id
-    WHERE p.id = ANY($1::int[])
-  `,
-    [normalizedIds],
-  );
-
-  return new Map(
-    (result.rows || []).map((row) => [
-      Number(row.product_id),
-      {
-        product_id: Number(row.product_id),
-        product_type: String(row.product_type || "").trim().toLowerCase(),
-        brand_id: Number(row.brand_id) || null,
-        product_name: row.product_name || "",
-        brand_name: row.brand_name || "",
-        category_name: String(row.category_name || "").trim().toLowerCase(),
-      },
-    ]),
-  );
-};
-
-const readAutoAffiliateOfferSources = async ({
-  productIds = [],
-  latestLimit = 250,
-} = {}) => {
-  const normalizedIds = normalizeAffiliateIdList(productIds);
-  const params = [];
-  let whereSql = `
-    WHERE p.product_type = 'smartphone'
-      AND COALESCE(pp.is_published, false) = true
-      AND sp.url IS NOT NULL
-      AND BTRIM(sp.url) <> ''
-  `;
-
-  if (normalizedIds.length) {
-    params.push(normalizedIds);
-    whereSql += ` AND p.id = ANY($${params.length}::int[])`;
-  }
-
-  const limitSql =
-    normalizedIds.length || !Number.isFinite(Number(latestLimit))
-      ? ""
-      : ` LIMIT ${Math.max(1, Math.min(500, Math.floor(Number(latestLimit))))}`;
-
-  const result = await db.query(
-    `
-    WITH ranked_store_rows AS (
-      SELECT
-        p.id AS product_id,
-        p.name AS product_name,
-        p.product_type,
-        p.brand_id,
-        p.created_at AS product_created_at,
-        b.name AS brand_name,
-        LOWER(TRIM(COALESCE(s.category, ''))) AS category_name,
-        s.launch_date,
-        v.id AS variant_id,
-        sp.id AS store_price_id,
-        sp.store_name,
-        sp.price,
-        sp.url,
-        sp.offer_text,
-        sp.sale_start_date,
-        os.logo AS store_logo_url,
-        (
-          SELECT pi.image_url
-          FROM product_images pi
-          WHERE pi.product_id = p.id
-          ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-          LIMIT 1
-        ) AS image_url,
-        ROW_NUMBER() OVER (
-          PARTITION BY p.id
-          ORDER BY
-            CASE
-              WHEN sp.price IS NOT NULL AND sp.price > 0 THEN 0
-              ELSE 1
-            END ASC,
-            sp.price ASC NULLS LAST,
-            CASE
-              WHEN sp.url IS NOT NULL AND BTRIM(sp.url) <> '' THEN 0
-              ELSE 1
-            END ASC,
-            sp.sale_start_date DESC NULLS LAST,
-            sp.id ASC
-        ) AS row_rank
-      FROM products p
-      INNER JOIN smartphones s
-        ON s.product_id = p.id
-      LEFT JOIN brands b
-        ON b.id = p.brand_id
-      LEFT JOIN product_publish pp
-        ON pp.product_id = p.id
-      INNER JOIN product_variants v
-        ON v.product_id = p.id
-      INNER JOIN variant_store_prices sp
-        ON sp.variant_id = v.id
-      LEFT JOIN online_stores os
-        ON LOWER(TRIM(os.name)) = LOWER(TRIM(sp.store_name))
-      ${whereSql}
-    )
-    SELECT *
-    FROM ranked_store_rows
-    WHERE row_rank = 1
-    ORDER BY COALESCE(sale_start_date, launch_date, product_created_at) DESC NULLS LAST, product_id DESC
-    ${limitSql}
-  `,
-    params,
-  );
-
-  return result.rows || [];
-};
-
-const buildAutoAffiliatePlacementPayloadFromOffer = (offer = {}) => {
-  const productId = Number(offer.product_id);
-  const productName = String(offer.product_name || "").trim();
-  const storeName = String(offer.store_name || "").trim();
-  const targetUrl = String(offer.url || "").trim();
-  const autoKey = `auto:product:${productId}:best-offer`;
-  const publishAt =
-    offer.sale_start_date ||
-    offer.launch_date ||
-    offer.product_created_at ||
-    new Date().toISOString();
-  const priceValue = Number(offer.price);
-  const price =
-    Number.isFinite(priceValue) && priceValue > 0 ? priceValue : null;
-  const safeProductName = productName || `Product ${productId}`;
-  const safeStoreName = storeName || "Online Store";
-
-  return {
-    name: `${safeProductName} Auto Offer`,
-    slug: normalizeAffiliateSlug(`auto-product-${productId}-best-offer`),
-    source_type: "auto",
-    auto_key: autoKey,
-    auto_variant_id: Number(offer.variant_id) || null,
-    auto_store_price_id: Number(offer.store_price_id) || null,
-    title: `${safeProductName} latest price on ${safeStoreName}`,
-    description:
-      String(offer.offer_text || "").trim() ||
-      `Auto-generated from live store pricing data for ${safeProductName}.`,
-    cta_text: "Check price",
-    cta_subtext: "Auto-generated from store data",
-    badge_text: "Latest Offer",
-    disclosure_text: "Affiliate link",
-    store_name: safeStoreName,
-    store_logo_url: String(offer.store_logo_url || "").trim() || null,
-    image_url: String(offer.image_url || "").trim() || null,
-    destination_url: targetUrl || null,
-    affiliate_url: targetUrl || null,
-    price,
-    currency_code: "INR",
-    priority: 0,
-    status: "published",
-    publish_at: publishAt,
-    unpublish_at: null,
-    duration_days: null,
-    allow_product_list: true,
-    allow_product_detail: true,
-    allow_news: true,
-    scope_type: "product",
-    product_id: productId || null,
-    blog_id: null,
-    brand_id: Number(offer.brand_id) || null,
-    category_name: String(offer.category_name || "").trim() || null,
-    list_slot: "product_card",
-    detail_slot: "detail_highlight",
-    news_slot: "inline_after_intro",
-  };
-};
-
-const syncAutoAffiliatePlacementsForProducts = async ({
-  productIds = [],
-  includeLatest = false,
-  latestLimit = 250,
-} = {}) => {
-  const normalizedIds = normalizeAffiliateIdList(productIds);
-  if (!normalizedIds.length && !includeLatest) return [];
-
-  const sourceRows = await readAutoAffiliateOfferSources({
-    productIds: normalizedIds,
-    latestLimit,
-  });
-  const sourceProductIds = Array.from(
-    new Set(
-      sourceRows
-        .map((row) => Number(row.product_id))
-        .filter((value) => Number.isInteger(value) && value > 0),
-    ),
-  );
-
-  const staleProductIds = normalizedIds.filter(
-    (productId) => !sourceProductIds.includes(productId),
-  );
-  if (staleProductIds.length) {
-    await db.query(
-      `
-      DELETE FROM affiliate_placements
-      WHERE source_type = 'auto'
-        AND product_id = ANY($1::int[])
-    `,
-      [staleProductIds],
-    );
-  }
-
-  const syncedIds = [];
-  for (const row of sourceRows) {
-    const payload = buildAutoAffiliatePlacementPayloadFromOffer(row);
-    const upsertResult = await db.query(
-      `
-      INSERT INTO affiliate_placements (
-        name,
-        slug,
-        source_type,
-        auto_key,
-        auto_variant_id,
-        auto_store_price_id,
-        title,
-        description,
-        cta_text,
-        cta_subtext,
-        badge_text,
-        disclosure_text,
-        store_name,
-        store_logo_url,
-        image_url,
-        destination_url,
-        affiliate_url,
-        price,
-        currency_code,
-        priority,
-        status,
-        publish_at,
-        unpublish_at,
-        duration_days,
-        allow_product_list,
-        allow_product_detail,
-        allow_news,
-        scope_type,
-        product_id,
-        blog_id,
-        brand_id,
-        category_name,
-        list_slot,
-        detail_slot,
-        news_slot,
-        created_by,
-        updated_by
-      ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37
-      )
-      ON CONFLICT (auto_key)
-      WHERE auto_key IS NOT NULL
-      DO UPDATE SET
-        name = EXCLUDED.name,
-        slug = EXCLUDED.slug,
-        source_type = EXCLUDED.source_type,
-        auto_variant_id = EXCLUDED.auto_variant_id,
-        auto_store_price_id = EXCLUDED.auto_store_price_id,
-        title = EXCLUDED.title,
-        description = EXCLUDED.description,
-        cta_text = EXCLUDED.cta_text,
-        cta_subtext = EXCLUDED.cta_subtext,
-        badge_text = EXCLUDED.badge_text,
-        disclosure_text = EXCLUDED.disclosure_text,
-        store_name = EXCLUDED.store_name,
-        store_logo_url = EXCLUDED.store_logo_url,
-        image_url = EXCLUDED.image_url,
-        destination_url = EXCLUDED.destination_url,
-        affiliate_url = EXCLUDED.affiliate_url,
-        price = EXCLUDED.price,
-        currency_code = EXCLUDED.currency_code,
-        priority = EXCLUDED.priority,
-        status = EXCLUDED.status,
-        publish_at = EXCLUDED.publish_at,
-        unpublish_at = EXCLUDED.unpublish_at,
-        duration_days = EXCLUDED.duration_days,
-        allow_product_list = EXCLUDED.allow_product_list,
-        allow_product_detail = EXCLUDED.allow_product_detail,
-        allow_news = EXCLUDED.allow_news,
-        scope_type = EXCLUDED.scope_type,
-        product_id = EXCLUDED.product_id,
-        blog_id = EXCLUDED.blog_id,
-        brand_id = EXCLUDED.brand_id,
-        category_name = EXCLUDED.category_name,
-        list_slot = EXCLUDED.list_slot,
-        detail_slot = EXCLUDED.detail_slot,
-        news_slot = EXCLUDED.news_slot,
-        updated_by = NULL,
-        updated_at = NOW()
-      RETURNING id
-    `,
-      [
-        payload.name,
-        payload.slug,
-        payload.source_type,
-        payload.auto_key,
-        payload.auto_variant_id,
-        payload.auto_store_price_id,
-        payload.title,
-        payload.description,
-        payload.cta_text,
-        payload.cta_subtext,
-        payload.badge_text,
-        payload.disclosure_text,
-        payload.store_name,
-        payload.store_logo_url,
-        payload.image_url,
-        payload.destination_url,
-        payload.affiliate_url,
-        payload.price,
-        payload.currency_code,
-        payload.priority,
-        payload.status,
-        payload.publish_at,
-        payload.unpublish_at,
-        payload.duration_days,
-        payload.allow_product_list,
-        payload.allow_product_detail,
-        payload.allow_news,
-        payload.scope_type,
-        payload.product_id,
-        payload.blog_id,
-        payload.brand_id,
-        payload.category_name,
-        payload.list_slot,
-        payload.detail_slot,
-        payload.news_slot,
-        null,
-        null,
-      ],
-    );
-    if (upsertResult.rows[0]?.id) syncedIds.push(Number(upsertResult.rows[0].id));
-  }
-
-  return syncedIds;
-};
-
-const safeSyncAutoAffiliatePlacementsForProducts = async (
-  options = {},
-  label = "Affiliate auto-sync failed",
-) => {
-  try {
-    const ids = await syncAutoAffiliatePlacementsForProducts(options);
-    return { ok: true, ids };
-  } catch (err) {
-    console.error(label, err);
-    return { ok: false, ids: [], error: err };
-  }
-};
-
-const resolveAffiliateDuplicateTargetProductIds = async (payload = {}) => {
-  const scopeType = normalizeAffiliateScopeType(payload.scope_type, "global");
-  if (scopeType === "product") {
-    return normalizeAffiliateIdList(payload.product_id ? [payload.product_id] : []);
-  }
-  if (scopeType === "blog") {
-    return payload.blog_id ? readAffiliateBlogProductIds(payload.blog_id) : [];
-  }
-  return [];
-};
-
-const hasAffiliatePageOverlap = (left = {}, right = {}) =>
-  Boolean(
-    (Boolean(left.allow_product_list) && Boolean(right.allow_product_list)) ||
-      (Boolean(left.allow_product_detail) &&
-        Boolean(right.allow_product_detail)) ||
-      (Boolean(left.allow_news) && Boolean(right.allow_news)),
-  );
-
-const findAutomaticAffiliateDuplicate = async (
-  payload = {},
-  { excludeId = null } = {},
-) => {
-  const targetProductIds = await resolveAffiliateDuplicateTargetProductIds(payload);
-  if (!targetProductIds.length) return null;
-
-  await safeSyncAutoAffiliatePlacementsForProducts(
-    { productIds: targetProductIds },
-    "Automatic affiliate duplicate sync failed:",
-  );
-
-  const comparisonUrl =
-    normalizeAffiliateComparisonUrl(payload.affiliate_url) ||
-    normalizeAffiliateComparisonUrl(payload.destination_url);
-  const comparisonStore = normalizeAffiliateComparisonText(payload.store_name);
-
-  const params = [targetProductIds];
-  let excludeSql = "";
-  if (excludeId) {
-    params.push(excludeId);
-    excludeSql = ` AND ap.id <> $${params.length}`;
-  }
-
-  const result = await db.query(
-    `
-    SELECT
-      ap.*,
-      p.name AS product_name,
-      b.name AS brand_name
-    FROM affiliate_placements ap
-    LEFT JOIN products p
-      ON p.id = ap.product_id
-    LEFT JOIN brands b
-      ON b.id = ap.brand_id
-    WHERE ap.source_type = 'auto'
-      AND ap.product_id = ANY($1::int[])
-      ${excludeSql}
-    ORDER BY ap.updated_at DESC, ap.id DESC
-  `,
-    params,
-  );
-
-  for (const row of result.rows || []) {
-    if (!hasAffiliatePageOverlap(payload, row)) continue;
-
-    const rowUrl =
-      normalizeAffiliateComparisonUrl(row.affiliate_url) ||
-      normalizeAffiliateComparisonUrl(row.destination_url);
-    const rowStore = normalizeAffiliateComparisonText(row.store_name);
-    const urlMatches = comparisonUrl && rowUrl && comparisonUrl === rowUrl;
-    const storeMatches = comparisonStore && rowStore && comparisonStore === rowStore;
-
-    if (urlMatches || storeMatches) {
-      return {
-        id: Number(row.id),
-        source_type: row.source_type,
-        product_id: Number(row.product_id) || null,
-        product_name: row.product_name || "",
-        brand_name: row.brand_name || "",
-        store_name: row.store_name || "",
-        title: row.title || row.name || "",
-        affiliate_url: row.affiliate_url || "",
-        destination_url: row.destination_url || "",
-      };
-    }
-  }
-
-  return null;
-};
-
-const resolveAffiliatePlacementMatches = (placement, context = {}) => {
-  const scopeType = normalizeAffiliateScopeType(placement?.scope_type, "global");
-  const blogId = Number(context.blogId) || null;
-  const primaryProductId = Number(context.primaryProductId) || null;
-  const productIds = normalizeAffiliateIdList(context.productIds);
-  const productContextById = context.productContextById || new Map();
-  const productContexts = productIds
-    .map((productId) => productContextById.get(productId))
-    .filter(Boolean);
-
-  if (scopeType === "global") {
-    return [
-      {
-        match_type: "global",
-        matched_product_id:
-          context.pageType === "product_list" ? null : primaryProductId,
-        matched_blog_id: blogId,
-      },
-    ];
-  }
-
-  if (scopeType === "product") {
-    const placementProductId = Number(placement?.product_id);
-    if (!Number.isInteger(placementProductId) || placementProductId <= 0) {
-      return [];
-    }
-    if (!productIds.includes(placementProductId)) return [];
-
-    return [
-      {
-        match_type: "product",
-        matched_product_id: placementProductId,
-        matched_blog_id: blogId,
-      },
-    ];
-  }
-
-  if (scopeType === "blog") {
-    const placementBlogId = Number(placement?.blog_id);
-    if (!Number.isInteger(placementBlogId) || placementBlogId <= 0) return [];
-    if (!blogId || placementBlogId !== blogId) return [];
-
-    return [
-      {
-        match_type: "blog",
-        matched_product_id: primaryProductId,
-        matched_blog_id: blogId,
-      },
-    ];
-  }
-
-  if (scopeType === "brand") {
-    const brandId = Number(placement?.brand_id);
-    if (!Number.isInteger(brandId) || brandId <= 0) return [];
-
-    return productContexts
-      .filter((row) => Number(row.brand_id) === brandId)
-      .map((row) => ({
-        match_type: "brand",
-        matched_product_id: row.product_id,
-        matched_blog_id: blogId,
-      }));
-  }
-
-  if (scopeType === "category") {
-    const categoryName = String(placement?.category_name || "")
-      .trim()
-      .toLowerCase();
-    if (!categoryName) return [];
-
-    return productContexts
-      .filter((row) => row.category_name === categoryName)
-      .map((row) => ({
-        match_type: "category",
-        matched_product_id: row.product_id,
-        matched_blog_id: blogId,
-      }));
-  }
-
-  return [];
-};
-
-const serializeAffiliatePlacementForPublic = (
-  placement,
-  match,
-  pageType,
-  now = new Date(),
-) => ({
-  id: Number(placement.id),
-  name: placement.name || "",
-  slug: placement.slug || "",
-  title: placement.title || placement.name || "",
-  description: placement.description || "",
-  cta_text: placement.cta_text || "View offer",
-  cta_subtext: placement.cta_subtext || "",
-  badge_text: placement.badge_text || "",
-  disclosure_text: placement.disclosure_text || "Affiliate",
-  store_name: placement.store_name || "",
-  store_logo_url: placement.store_logo_url || "",
-  image_url: placement.image_url || "",
-  destination_url: placement.destination_url || "",
-  affiliate_url: placement.affiliate_url || "",
-  target_url: placement.affiliate_url || placement.destination_url || "",
-  price:
-    placement.price === null || placement.price === undefined
-      ? null
-      : Number(placement.price),
-  currency_code: placement.currency_code || "INR",
-  source_type: normalizeAffiliateSourceType(placement.source_type, "manual"),
-  priority: Number(placement.priority || 0),
-  scope_type: placement.scope_type || "global",
-  slot: resolveAffiliateCurrentSlot(placement, pageType),
-  match_type: match.match_type || "global",
-  match_score: buildAffiliatePlacementScore(placement, match.match_type, now),
-  matched_product_id: match.matched_product_id || null,
-  matched_blog_id: match.matched_blog_id || null,
-  total_clicks: Number(placement.total_clicks || 0),
-  lifecycle_state: getAffiliatePlacementLifecycleState(placement, now),
-  effective_unpublish_at: resolveAffiliateEffectiveUnpublishAt(placement),
-  product_name: placement.product_name || "",
-  product_type: placement.product_type || "",
-  blog_title: placement.blog_title || "",
-  blog_slug: placement.blog_slug || "",
-  brand_name: placement.brand_name || "",
-});
-
-/* -----------------------
-  Affiliate placements
-------------------------*/
-app.get("/api/admin/affiliate-placements/options", authenticate, async (req, res) => {
-  try {
-    const [productsRes, blogsRes, brandsRes, categoriesRes] = await Promise.all([
-      db.query(`
-        SELECT
-          p.id,
-          p.name,
-          p.product_type,
-          b.name AS brand_name,
-          s.category,
-          COALESCE(pp.is_published, false) AS is_published
-        FROM products p
-        INNER JOIN smartphones s
-          ON s.product_id = p.id
-        LEFT JOIN brands b
-          ON b.id = p.brand_id
-        LEFT JOIN product_publish pp
-          ON pp.product_id = p.id
-        ORDER BY COALESCE(pp.is_published, false) DESC, p.id DESC
-        LIMIT 250
-      `),
-      db.query(`
-        SELECT id, title, slug, status, updated_at
-        FROM blogs
-        WHERE status IN ('draft', 'published')
-        ORDER BY updated_at DESC, id DESC
-        LIMIT 150
-      `),
-      db.query(`
-        SELECT id, name, logo
-        FROM brands
-        ORDER BY name ASC
-      `),
-      db.query(`
-        SELECT id, name, product_type
-        FROM categories
-        ORDER BY name ASC
-      `),
-    ]);
-
-    return res.json({
-      products: productsRes.rows || [],
-      blogs: blogsRes.rows || [],
-      brands: brandsRes.rows || [],
-      categories: categoriesRes.rows || [],
-    });
-  } catch (err) {
-    console.error("GET /api/admin/affiliate-placements/options error:", err);
-    return res.status(500).json({ message: "Failed to load affiliate options" });
-  }
-});
-
-app.get("/api/admin/affiliate-placements", authenticate, async (req, res) => {
-  try {
-    const syncState = await safeSyncAutoAffiliatePlacementsForProducts(
-      {
-        includeLatest: true,
-        latestLimit: 250,
-      },
-      "GET /api/admin/affiliate-placements auto-sync error:",
-    );
-
-    const result = await db.query(`
-      SELECT
-        ap.*,
-        p.name AS product_name,
-        p.product_type,
-        bl.title AS blog_title,
-        bl.slug AS blog_slug,
-        br.name AS brand_name,
-        COALESCE(clicks.total_clicks, 0)::int AS total_clicks,
-        clicks.last_clicked_at
-      FROM affiliate_placements ap
-      LEFT JOIN products p
-        ON p.id = ap.product_id
-      LEFT JOIN blogs bl
-        ON bl.id = ap.blog_id
-      LEFT JOIN brands br
-        ON br.id = ap.brand_id
-      LEFT JOIN (
-        SELECT
-          placement_id,
-          COUNT(*)::int AS total_clicks,
-          MAX(created_at) AS last_clicked_at
-        FROM affiliate_clicks
-        GROUP BY placement_id
-      ) clicks
-        ON clicks.placement_id = ap.id
-      ORDER BY ap.updated_at DESC, ap.id DESC
-    `);
-
-    return res.json({
-      rows: (result.rows || []).map(buildAffiliatePlacementAdminRow),
-      warnings: syncState.ok
-        ? []
-        : ["Automatic affiliate sync failed. Showing existing placements only."],
-    });
-  } catch (err) {
-    console.error("GET /api/admin/affiliate-placements error:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to fetch affiliate placements" });
-  }
-});
-
-app.post("/api/admin/affiliate-placements", authenticate, async (req, res) => {
-  try {
-    const { payload, errors } = normalizeAffiliatePlacementInput(req.body || {});
-    if (payload.scope_type !== "product") payload.product_id = null;
-    if (payload.scope_type !== "blog") payload.blog_id = null;
-    if (payload.scope_type !== "brand") payload.brand_id = null;
-    if (payload.scope_type !== "category") payload.category_name = null;
-
-    if (errors.length) {
-      return res.status(400).json({ message: errors[0], errors });
-    }
-
-    const duplicateAuto = await findAutomaticAffiliateDuplicate(payload);
-    if (duplicateAuto) {
-      return res.status(409).json({
-        message:
-          "An automatic affiliate placement already exists for this product/store combination.",
-        duplicate: duplicateAuto,
-      });
-    }
-
-    const slug = await ensureUniqueAffiliatePlacementSlug(
-      payload.slug || payload.name || payload.title || "affiliate-link",
-    );
-
-    const result = await db.query(
-      `
-      INSERT INTO affiliate_placements (
-        name,
-        slug,
-        title,
-        description,
-        cta_text,
-        cta_subtext,
-        badge_text,
-        disclosure_text,
-        store_name,
-        store_logo_url,
-        image_url,
-        destination_url,
-        affiliate_url,
-        price,
-        currency_code,
-        priority,
-        status,
-        publish_at,
-        unpublish_at,
-        duration_days,
-        allow_product_list,
-        allow_product_detail,
-        allow_news,
-        scope_type,
-        product_id,
-        blog_id,
-        brand_id,
-        category_name,
-        list_slot,
-        detail_slot,
-        news_slot,
-        created_by,
-        updated_by
-      ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33
-      )
-      RETURNING *
-    `,
-      [
-        payload.name,
-        slug,
-        payload.title,
-        payload.description,
-        payload.cta_text,
-        payload.cta_subtext,
-        payload.badge_text,
-        payload.disclosure_text,
-        payload.store_name,
-        payload.store_logo_url,
-        payload.image_url,
-        payload.destination_url,
-        payload.affiliate_url,
-        payload.price,
-        payload.currency_code,
-        payload.priority,
-        payload.status,
-        payload.publish_at,
-        payload.unpublish_at,
-        payload.duration_days,
-        payload.allow_product_list,
-        payload.allow_product_detail,
-        payload.allow_news,
-        payload.scope_type,
-        payload.product_id,
-        payload.blog_id,
-        payload.brand_id,
-        payload.category_name,
-        payload.list_slot,
-        payload.detail_slot,
-        payload.news_slot,
-        req.user?.id ?? null,
-        req.user?.id ?? null,
-      ],
-    );
-
-    const adminRow = await readAffiliatePlacementAdminRowById(result.rows[0].id);
-
-    return res.status(201).json({
-      message: "Affiliate placement created",
-      data: adminRow || buildAffiliatePlacementAdminRow(result.rows[0]),
-    });
-  } catch (err) {
-    console.error("POST /api/admin/affiliate-placements error:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to create affiliate placement" });
-  }
-});
-
-app.put("/api/admin/affiliate-placements/:id", authenticate, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({ message: "Invalid affiliate placement id" });
-    }
-
-    const existing = await db.query(
-      `SELECT * FROM affiliate_placements WHERE id = $1 LIMIT 1`,
-      [id],
-    );
-    if (!existing.rows.length) {
-      return res.status(404).json({ message: "Affiliate placement not found" });
-    }
-    if (normalizeAffiliateSourceType(existing.rows[0].source_type) === "auto") {
-      return res.status(403).json({
-        message:
-          "Automatic affiliate placements are generated from product store data and cannot be edited manually.",
-      });
-    }
-
-    const { payload, errors } = normalizeAffiliatePlacementInput(req.body || {}, {
-      existing: existing.rows[0],
-    });
-    if (payload.scope_type !== "product") payload.product_id = null;
-    if (payload.scope_type !== "blog") payload.blog_id = null;
-    if (payload.scope_type !== "brand") payload.brand_id = null;
-    if (payload.scope_type !== "category") payload.category_name = null;
-
-    if (errors.length) {
-      return res.status(400).json({ message: errors[0], errors });
-    }
-
-    const duplicateAuto = await findAutomaticAffiliateDuplicate(payload, {
-      excludeId: id,
-    });
-    if (duplicateAuto) {
-      return res.status(409).json({
-        message:
-          "An automatic affiliate placement already exists for this product/store combination.",
-        duplicate: duplicateAuto,
-      });
-    }
-
-    const slug = await ensureUniqueAffiliatePlacementSlug(
-      payload.slug || payload.name || payload.title || existing.rows[0].slug,
-      id,
-    );
-
-    const result = await db.query(
-      `
-      UPDATE affiliate_placements
-      SET
-        name = $1,
-        slug = $2,
-        title = $3,
-        description = $4,
-        cta_text = $5,
-        cta_subtext = $6,
-        badge_text = $7,
-        disclosure_text = $8,
-        store_name = $9,
-        store_logo_url = $10,
-        image_url = $11,
-        destination_url = $12,
-        affiliate_url = $13,
-        price = $14,
-        currency_code = $15,
-        priority = $16,
-        status = $17,
-        publish_at = $18,
-        unpublish_at = $19,
-        duration_days = $20,
-        allow_product_list = $21,
-        allow_product_detail = $22,
-        allow_news = $23,
-        scope_type = $24,
-        product_id = $25,
-        blog_id = $26,
-        brand_id = $27,
-        category_name = $28,
-        list_slot = $29,
-        detail_slot = $30,
-        news_slot = $31,
-        updated_by = $32,
-        updated_at = NOW()
-      WHERE id = $33
-      RETURNING *
-    `,
-      [
-        payload.name,
-        slug,
-        payload.title,
-        payload.description,
-        payload.cta_text,
-        payload.cta_subtext,
-        payload.badge_text,
-        payload.disclosure_text,
-        payload.store_name,
-        payload.store_logo_url,
-        payload.image_url,
-        payload.destination_url,
-        payload.affiliate_url,
-        payload.price,
-        payload.currency_code,
-        payload.priority,
-        payload.status,
-        payload.publish_at,
-        payload.unpublish_at,
-        payload.duration_days,
-        payload.allow_product_list,
-        payload.allow_product_detail,
-        payload.allow_news,
-        payload.scope_type,
-        payload.product_id,
-        payload.blog_id,
-        payload.brand_id,
-        payload.category_name,
-        payload.list_slot,
-        payload.detail_slot,
-        payload.news_slot,
-        req.user?.id ?? null,
-        id,
-      ],
-    );
-
-    const adminRow = await readAffiliatePlacementAdminRowById(result.rows[0].id);
-
-    return res.json({
-      message: "Affiliate placement updated",
-      data: adminRow || buildAffiliatePlacementAdminRow(result.rows[0]),
-    });
-  } catch (err) {
-    console.error("PUT /api/admin/affiliate-placements/:id error:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to update affiliate placement" });
-  }
-});
-
-app.delete("/api/admin/affiliate-placements/:id", authenticate, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({ message: "Invalid affiliate placement id" });
-    }
-
-    const existing = await db.query(
-      `SELECT id, source_type FROM affiliate_placements WHERE id = $1 LIMIT 1`,
-      [id],
-    );
-    if (!existing.rows.length) {
-      return res.status(404).json({ message: "Affiliate placement not found" });
-    }
-    if (normalizeAffiliateSourceType(existing.rows[0].source_type) === "auto") {
-      return res.status(403).json({
-        message:
-          "Automatic affiliate placements are generated from product store data and cannot be deleted manually.",
-      });
-    }
-
-    const result = await db.query(
-      `DELETE FROM affiliate_placements WHERE id = $1`,
-      [id],
-    );
-
-    return res.json({ message: "Affiliate placement deleted" });
-  } catch (err) {
-    console.error("DELETE /api/admin/affiliate-placements/:id error:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to delete affiliate placement" });
-  }
-});
-
-app.get("/api/public/affiliate-placements", async (req, res) => {
-  try {
-    const pageType = normalizeAffiliatePageType(
-      req.query.pageType ?? req.query.page_type,
-    );
-    if (!pageType) {
-      return res.status(400).json({ message: "pageType is required" });
-    }
-
-    const pageColumn =
-      pageType === "product_list"
-        ? "allow_product_list"
-        : pageType === "product_detail"
-          ? "allow_product_detail"
-          : "allow_news";
-    const primaryProductId = toPositiveInt(
-      req.query.productId ?? req.query.product_id,
-      null,
-    );
-    const blogId = toPositiveInt(req.query.blogId ?? req.query.blog_id, null);
-    const requestedProductIds = Array.from(
-      new Set([
-        ...normalizeAffiliateIdList(
-          req.query.productIds ?? req.query.product_ids ?? [],
-        ),
-        ...(primaryProductId ? [primaryProductId] : []),
-      ]),
-    );
-    const blogProductIds = blogId ? await readAffiliateBlogProductIds(blogId) : [];
-    const candidateProductIds = Array.from(
-      new Set([...requestedProductIds, ...blogProductIds]),
-    );
-    const productContextById = await readAffiliateProductContexts(
-      candidateProductIds,
-    );
-    const context = {
-      pageType,
-      blogId,
-      primaryProductId: primaryProductId || candidateProductIds[0] || null,
-      productIds: candidateProductIds,
-      productContextById,
-    };
-    const now = new Date();
-
-    if (candidateProductIds.length) {
-      await safeSyncAutoAffiliatePlacementsForProducts(
-        {
-          productIds: candidateProductIds,
-        },
-        "GET /api/public/affiliate-placements auto-sync error:",
-      );
-    }
-
-    const result = await db.query(
-      `
-      SELECT
-        ap.*,
-        p.name AS product_name,
-        p.product_type,
-        bl.title AS blog_title,
-        bl.slug AS blog_slug,
-        br.name AS brand_name,
-        COALESCE(clicks.total_clicks, 0)::int AS total_clicks
-      FROM affiliate_placements ap
-      LEFT JOIN products p
-        ON p.id = ap.product_id
-      LEFT JOIN blogs bl
-        ON bl.id = ap.blog_id
-      LEFT JOIN brands br
-        ON br.id = ap.brand_id
-      LEFT JOIN (
-        SELECT placement_id, COUNT(*)::int AS total_clicks
-        FROM affiliate_clicks
-        GROUP BY placement_id
-      ) clicks
-        ON clicks.placement_id = ap.id
-      WHERE ap.status = 'published'
-        AND ap.${pageColumn} = true
-      ORDER BY ap.priority DESC, ap.updated_at DESC, ap.id DESC
-    `,
-    );
-
-    const placements = [];
-    for (const row of result.rows || []) {
-      if (!isAffiliatePlacementLive(row, now)) continue;
-      const matches = resolveAffiliatePlacementMatches(row, context);
-      for (const match of matches) {
-        placements.push(
-          serializeAffiliatePlacementForPublic(row, match, pageType, now),
-        );
-      }
-    }
-
-    placements.sort((left, right) => {
-      if (right.match_score !== left.match_score) {
-        return right.match_score - left.match_score;
-      }
-      return Number(right.id || 0) - Number(left.id || 0);
-    });
-
-    return res.json({
-      pageType,
-      placements,
-    });
-  } catch (err) {
-    console.error("GET /api/public/affiliate-placements error:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to fetch affiliate placements" });
-  }
-});
-
-app.get("/api/public/affiliate-redirect/:id", async (req, res) => {
-  try {
-    const placementId = Number(req.params.id);
-    if (!Number.isInteger(placementId) || placementId <= 0) {
-      return res.status(400).send("Invalid affiliate placement");
-    }
-
-    const result = await db.query(
-      `SELECT * FROM affiliate_placements WHERE id = $1 LIMIT 1`,
-      [placementId],
-    );
-    const placement = result.rows[0];
-    if (!placement) {
-      return res.status(404).send("Affiliate placement not found");
-    }
-
-    const targetUrl =
-      String(placement.affiliate_url || "").trim() ||
-      String(placement.destination_url || "").trim();
-    if (!targetUrl) {
-      return res.status(404).send("Affiliate destination not available");
-    }
-
-    const pageType =
-      normalizeAffiliatePageType(req.query.pageType ?? req.query.page_type) ||
-      null;
-    const slot = toNullableTrimmedText(req.query.slot, 80);
-    const productId = toPositiveInt(
-      req.query.productId ?? req.query.product_id,
-      null,
-    );
-    const blogId = toPositiveInt(req.query.blogId ?? req.query.blog_id, null);
-    const deviceType = normalizeAffiliateDeviceType(
-      req.query.deviceType ?? req.query.device_type,
-      req.get("user-agent") || "",
-    );
-
-    await db.query(
-      `
-      INSERT INTO affiliate_clicks (
-        placement_id,
-        page_type,
-        slot,
-        product_id,
-        blog_id,
-        device_type,
-        referer,
-        user_agent,
-        ip_address,
-        target_url,
-        was_live
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-    `,
-      [
-        placementId,
-        pageType,
-        slot,
-        productId,
-        blogId,
-        deviceType,
-        req.get("referer") || null,
-        req.get("user-agent") || null,
-        req.ip || null,
-        targetUrl,
-        isAffiliatePlacementLive(placement),
-      ],
-    );
-
-    return res.redirect(302, targetUrl);
-  } catch (err) {
-    console.error("GET /api/public/affiliate-redirect/:id error:", err);
-    return res.status(500).send("Unable to open affiliate destination");
-  }
-});
-
 /* -----------------------
   Banners (marketing)
 ------------------------*/
@@ -18366,211 +11782,6 @@ app.get("/api/reports/products-by-category", authenticate, async (req, res) => {
   }
 });
 
-// Launch timing analytics across device families
-app.get("/api/reports/launch-timing", authenticate, async (req, res) => {
-  try {
-    const laptopBrandSql = `
-      COALESCE(
-        b.name,
-        NULLIF(TRIM(l.meta->>'brand'), ''),
-        NULLIF(TRIM(l.spec_sections#>>'{basic_info_json,brand_name}'), ''),
-        NULLIF(TRIM(l.spec_sections#>>'{basic_info_json,brand}'), ''),
-        'Unknown'
-      )
-    `;
-
-    const laptopCategorySql = `
-      COALESCE(
-        NULLIF(TRIM(l.meta->>'category'), ''),
-        NULLIF(TRIM(l.spec_sections#>>'{basic_info_json,category}'), ''),
-        'Laptop'
-      )
-    `;
-
-    const laptopLaunchDateSql = `
-      COALESCE(
-        CASE
-          WHEN NULLIF(TRIM(l.meta->>'launch_date'), '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-            THEN (l.meta->>'launch_date')::date
-          ELSE NULL
-        END,
-        CASE
-          WHEN NULLIF(TRIM(l.spec_sections#>>'{basic_info_json,launch_date}'), '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-            THEN (l.spec_sections#>>'{basic_info_json,launch_date}')::date
-          ELSE NULL
-        END,
-        l.created_at::date,
-        p.created_at::date
-      )
-    `;
-
-    const tvCategorySql = `
-      COALESCE(
-        NULLIF(TRIM(t.category), ''),
-        NULLIF(TRIM(t.basic_info_json->>'category'), ''),
-        'TV'
-      )
-    `;
-
-    const tvLaunchDateSql = `
-      COALESCE(
-        CASE
-          WHEN NULLIF(TRIM(t.basic_info_json->>'launch_date'), '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-            THEN (t.basic_info_json->>'launch_date')::date
-          ELSE NULL
-        END,
-        CASE
-          WHEN NULLIF(TRIM(t.product_details_json->>'launch_date'), '') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-            THEN (t.product_details_json->>'launch_date')::date
-          ELSE NULL
-        END,
-        CASE
-          WHEN NULLIF(TRIM(t.product_details_json->>'launch_year'), '') ~ '^[0-9]{4}$'
-            THEN make_date((t.product_details_json->>'launch_year')::int, 1, 1)
-          ELSE NULL
-        END,
-        CASE
-          WHEN NULLIF(TRIM(t.basic_info_json->>'launch_year'), '') ~ '^[0-9]{4}$'
-            THEN make_date((t.basic_info_json->>'launch_year')::int, 1, 1)
-          ELSE NULL
-        END,
-        t.created_at::date,
-        p.created_at::date
-      )
-    `;
-
-    const [smartphoneRes, laptopRes, tvRes] = await Promise.all([
-      db.query(`
-        SELECT
-          p.id AS product_id,
-          p.product_type,
-          p.name AS product_name,
-          COALESCE(b.name, NULLIF(TRIM(s.brand), ''), 'Unknown') AS brand_name,
-          COALESCE(NULLIF(TRIM(s.category), ''), 'Uncategorized') AS category,
-          s.launch_date,
-          MIN(sp.sale_start_date) AS sale_start_date
-        FROM products p
-        INNER JOIN smartphones s
-          ON s.product_id = p.id
-        LEFT JOIN brands b
-          ON b.id = p.brand_id
-        LEFT JOIN product_variants v
-          ON v.product_id = p.id
-        LEFT JOIN variant_store_prices sp
-          ON sp.variant_id = v.id
-        WHERE p.product_type = 'smartphone'
-        GROUP BY
-          p.id,
-          p.product_type,
-          p.name,
-          b.name,
-          s.brand,
-          s.category,
-          s.launch_date
-      `),
-      db.query(`
-        SELECT
-          p.id AS product_id,
-          p.product_type,
-          p.name AS product_name,
-          ${laptopBrandSql} AS brand_name,
-          ${laptopCategorySql} AS category,
-          ${laptopLaunchDateSql} AS launch_date,
-          MIN(sp.sale_start_date) AS sale_start_date
-        FROM products p
-        INNER JOIN laptop l
-          ON l.product_id = p.id
-        LEFT JOIN brands b
-          ON b.id = p.brand_id
-        LEFT JOIN product_variants v
-          ON v.product_id = p.id
-        LEFT JOIN variant_store_prices sp
-          ON sp.variant_id = v.id
-        WHERE p.product_type = 'laptop'
-        GROUP BY
-          p.id,
-          p.product_type,
-          p.name,
-          ${laptopBrandSql},
-          ${laptopCategorySql},
-          ${laptopLaunchDateSql}
-      `),
-      db.query(`
-        SELECT
-          p.id AS product_id,
-          p.product_type,
-          p.name AS product_name,
-          COALESCE(b.name, 'Unknown') AS brand_name,
-          ${tvCategorySql} AS category,
-          ${tvLaunchDateSql} AS launch_date,
-          MIN(sp.sale_start_date) AS sale_start_date
-        FROM products p
-        INNER JOIN tvs t
-          ON t.product_id = p.id
-        LEFT JOIN brands b
-          ON b.id = p.brand_id
-        LEFT JOIN product_variants v
-          ON v.product_id = p.id
-        LEFT JOIN variant_store_prices sp
-          ON sp.variant_id = v.id
-        WHERE p.product_type = 'tv'
-        GROUP BY
-          p.id,
-          p.product_type,
-          p.name,
-          b.name,
-          ${tvCategorySql},
-          ${tvLaunchDateSql}
-      `),
-    ]);
-
-    const normalizeTimingRow = (row) => {
-      const launchDate = normalizeDateOnlyInput(row?.launch_date);
-      const saleStartDate = normalizeDateOnlyInput(row?.sale_start_date);
-
-      return {
-        product_id: Number(row?.product_id),
-        product_type: String(row?.product_type || ""),
-        product_name: String(row?.product_name || "Unnamed device"),
-        brand_name: row?.brand_name ? String(row.brand_name) : null,
-        category: row?.category ? String(row.category) : "Uncategorized",
-        launch_date: launchDate,
-        sale_start_date: saleStartDate,
-        sale_gap_days: diffDateOnlyDays(launchDate, saleStartDate),
-      };
-    };
-
-    const devices = [
-      ...(smartphoneRes.rows || []),
-      ...(laptopRes.rows || []),
-      ...(tvRes.rows || []),
-    ]
-      .map(normalizeTimingRow)
-      .sort((left, right) => {
-        const launchDiff =
-          (toDateOnlyUtcMillis(right?.launch_date) || 0) -
-          (toDateOnlyUtcMillis(left?.launch_date) || 0);
-        if (launchDiff !== 0) return launchDiff;
-        return Number(right?.product_id || 0) - Number(left?.product_id || 0);
-      });
-
-    return res.json({
-      devices,
-      totals: {
-        total_devices: devices.length,
-        devices_with_sale_date: devices.filter((item) => item.sale_start_date)
-          .length,
-        devices_with_gap: devices.filter((item) =>
-          Number.isFinite(item.sale_gap_days),
-        ).length,
-      },
-    });
-  } catch (err) {
-    console.error("GET /api/reports/launch-timing error:", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
 // Publish status grouped by product_type
 app.get("/api/reports/publish-status", authenticate, async (req, res) => {
   try {
@@ -18687,42 +11898,6 @@ app.post("/api/public/product/:id/view", async (req, res) => {
   } catch (err) {
     console.error("Error recording product view:", err);
     return res.status(500).json({ message: "Failed to record view" });
-  }
-});
-
-app.post("/api/public/page-engagement", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const productId = Number(body.product_id ?? body.productId);
-    const durationRaw = Number(body.duration_ms ?? body.durationMs ?? 0);
-    const durationMs = Number.isFinite(durationRaw)
-      ? Math.min(30 * 60 * 1000, Math.max(0, Math.floor(durationRaw)))
-      : 0;
-    const pagePath =
-      cleanText(body.page_path ?? body.pagePath ?? "", 255) || null;
-    const source = cleanToken(body.source, 48) || "detail";
-
-    if (!Number.isInteger(productId) || productId <= 0) {
-      return res.status(400).json({ message: "Invalid product id" });
-    }
-
-    await db.query(
-      `
-      INSERT INTO page_engagement_events (
-        product_id,
-        page_path,
-        source,
-        duration_ms
-      )
-      VALUES ($1, $2, $3, $4)
-      `,
-      [productId, pagePath, source, durationMs],
-    );
-
-    return res.json({ success: true });
-  } catch (err) {
-    console.error("POST /api/public/page-engagement error:", err);
-    return res.status(500).json({ success: false });
   }
 });
 
@@ -19128,410 +12303,27 @@ app.put("/api/admin/compare-scoring", authenticate, async (req, res) => {
   }
 });
 
-app.get("/api/admin/compare-pages", authenticate, async (req, res) => {
-  try {
-    if (req.user?.role !== "admin") {
-      return res.status(403).json({ message: "Admin access required" });
-    }
-
-    const pages = await readPublishedComparePages({
-      limit: Math.min(100, Math.max(1, Number(req.query?.limit) || 100)),
-    });
-    return res.json({ pages });
-  } catch (err) {
-    console.error("GET /api/admin/compare-pages error:", err);
-    return res.status(500).json({ message: "Failed to load compare pages" });
-  }
-});
-
-app.get(
-  "/api/admin/compare-pages/suggestions/:productId",
-  authenticate,
-  async (req, res) => {
-    try {
-      if (req.user?.role !== "admin") {
-        return res.status(403).json({ message: "Admin access required" });
-      }
-
-      const result = await readSmartphoneCompareSuggestions(
-        req.params.productId,
-        2,
-      );
-      return res.json(result);
-    } catch (err) {
-      console.error(
-        "GET /api/admin/compare-pages/suggestions/:productId error:",
-        err,
-      );
-      return res.status(500).json({ message: "Failed to load suggestions" });
-    }
-  },
-);
-
-app.get("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
-  try {
-    if (req.user?.role !== "admin") {
-      return res.status(403).json({ message: "Admin access required" });
-    }
-
-    const pageId = Number(req.params.id);
-    if (!Number.isInteger(pageId) || pageId <= 0) {
-      return res.status(400).json({ message: "Invalid id" });
-    }
-
-    const pages = await readPublishedComparePages({ id: pageId, limit: 1 });
-    if (!pages.length) {
-      return res.status(404).json({ message: "Compare page not found" });
-    }
-
-    return res.json({ page: pages[0] });
-  } catch (err) {
-    console.error("GET /api/admin/compare-pages/:id error:", err);
-    return res.status(500).json({ message: "Failed to load compare page" });
-  }
-});
-
-app.post("/api/admin/compare-pages", authenticate, async (req, res) => {
-  try {
-    if (req.user?.role !== "admin") {
-      return res.status(403).json({ message: "Admin access required" });
-    }
-
-    const page = await savePublishedComparePage({
-      payload: req.body || {},
-      userId: req.user?.id ?? null,
-    });
-    return res.status(201).json({ success: true, page });
-  } catch (err) {
-    console.error("POST /api/admin/compare-pages error:", err);
-    return res
-      .status(err.statusCode || 500)
-      .json({
-        message: err.message || "Failed to create compare page",
-        existingPage: err.existingPage || null,
-      });
-  }
-});
-
-app.put("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
-  try {
-    if (req.user?.role !== "admin") {
-      return res.status(403).json({ message: "Admin access required" });
-    }
-
-    const pageId = Number(req.params.id);
-    if (!Number.isInteger(pageId) || pageId <= 0) {
-      return res.status(400).json({ message: "Invalid id" });
-    }
-
-    const page = await savePublishedComparePage({
-      pageId,
-      payload: req.body || {},
-      userId: req.user?.id ?? null,
-    });
-    return res.json({ success: true, page });
-  } catch (err) {
-    console.error("PUT /api/admin/compare-pages/:id error:", err);
-    return res
-      .status(err.statusCode || 500)
-      .json({
-        message: err.message || "Failed to update compare page",
-        existingPage: err.existingPage || null,
-      });
-  }
-});
-
-app.post(
-  "/api/admin/compare-pages/auto-sync",
-  authenticate,
-  async (req, res) => {
-    try {
-      if (req.user?.role !== "admin") {
-        return res.status(403).json({ message: "Admin access required" });
-      }
-
-      const result = await syncAutomaticSmartphoneComparePages({
-        userId: req.user?.id ?? null,
-        recomputeIfMissing: true,
-      });
-      return res.json({ success: true, result });
-    } catch (err) {
-      console.error("POST /api/admin/compare-pages/auto-sync error:", err);
-      return res.status(500).json({
-        message: "Failed to sync automatic compare pages",
-      });
-    }
-  },
-);
-
-app.post("/api/admin/blogs/context", authenticate, async (req, res) => {
-  try {
-    if (!(await ensureBlogManagerAccess(req, res, "view"))) return;
-
-    const productIds = orderBlogProductIds(
-      req.body?.product_ids ?? req.body?.productIds ?? req.body?.products,
-      req.body?.primary_product_id ?? req.body?.primaryProductId ?? req.body?.product_id,
-    );
-    if (!productIds.length) {
-      return res.status(400).json({ message: "At least one product is required" });
-    }
-
-    const profileConfig = await readDeviceFieldProfilesConfig();
-    const snapshotResult = await fetchBlogSnapshotsByProductIds(
-      productIds,
-      profileConfig.profiles,
-    );
-    if (snapshotResult.missingIds.length) {
-      return res.status(404).json({
-        message: `Products not found: ${snapshotResult.missingIds.join(", ")}`,
-      });
-    }
-
-    const selectionContext = buildBlogSelectionContext(
-      snapshotResult.snapshots,
-      req.body?.token_map,
-    );
-    const suggestions = buildBlogSuggestionsForSelection(
-      snapshotResult.snapshots,
-      selectionContext.tokenMap,
-    );
-    const shouldMatchExisting = req.body?.match_existing !== false;
-    const existingMatch = shouldMatchExisting
-      ? await findExistingBlogByOrderedProductSet(selectionContext.productIds)
-      : null;
-    const existing = existingMatch?.id
-      ? await db.query(
-          `
-            SELECT
-              id,
-              product_id,
-              category,
-              title,
-              slug,
-              excerpt,
-              author_name,
-              author_user_id,
-              content_template,
-              content_rendered,
-              status,
-              blog_eligible,
-              meta_title,
-              meta_description,
-              hero_image_source,
-              hero_image_alt,
-              hero_image_caption,
-              tags,
-              featured,
-              trending,
-              pinned,
-              CASE
-                WHEN hero_image_source = 'none' THEN NULL
-                ELSE COALESCE(
-                  hero_image,
-                  (
-                    SELECT pi.image_url
-                    FROM product_images pi
-                    WHERE pi.product_id = blogs.product_id
-                    ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-                    LIMIT 1
-                  )
-                )
-              END AS hero_image,
-              published_at,
-              created_at,
-              updated_at
-            FROM blogs
-            WHERE id = $1
-            LIMIT 1
-          `,
-          [existingMatch.id],
-        )
-      : { rows: [] };
-
-    return res.json({
-      primary_product_id: selectionContext.productIds[0] || null,
-      primary_product_type:
-        selectionContext.primarySnapshot?.product_type || null,
-      product_ids: selectionContext.productIds,
-      products: selectionContext.products,
-      token_map: selectionContext.tokenMap,
-      token_keys: selectionContext.tokenKeys,
-      suggestions,
-      existing_blog: existing.rows[0] || null,
-    });
-  } catch (err) {
-    console.error("POST /api/admin/blogs/context error:", err);
-    return res.status(500).json({ message: "Failed to load blog context" });
-  }
-});
-
-app.delete("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
-  try {
-    if (req.user?.role !== "admin") {
-      return res.status(403).json({ message: "Admin access required" });
-    }
-
-    const pageId = Number(req.params.id);
-    if (!Number.isInteger(pageId) || pageId <= 0) {
-      return res.status(400).json({ message: "Invalid id" });
-    }
-
-    const result = await db.query(
-      `DELETE FROM published_compare_pages WHERE id = $1 RETURNING id`,
-      [pageId],
-    );
-    if (!result.rows.length) {
-      return res.status(404).json({ message: "Compare page not found" });
-    }
-
-    return res.json({ success: true, id: pageId });
-  } catch (err) {
-    console.error("DELETE /api/admin/compare-pages/:id error:", err);
-    return res.status(500).json({ message: "Failed to delete compare page" });
-  }
-});
-
-const FEATURE_CLICK_DEVICE_TYPE_LABELS = {
-  smartphone: "Smartphone",
-  laptop: "Laptop",
-  tv: "TV",
-  "home-appliance": "Home Appliance",
-  networking: "Networking",
-};
-
-const FEATURE_CLICK_DEVICE_TYPE_ALIASES = {
-  mobile: "smartphone",
-  mobiles: "smartphone",
-  phone: "smartphone",
-  phones: "smartphone",
-  notebook: "laptop",
-  notebooks: "laptop",
-  television: "tv",
-  televisions: "tv",
-  appliance: "home-appliance",
-  appliances: "home-appliance",
-  "home-appliances": "home-appliance",
-};
-
-const FEATURE_CLICK_META = {
-  "ai-features": { label: "AI Features", category: "Smart Features" },
-  "high-camera": { label: "High MP Camera", category: "Camera" },
-  "long-battery": { label: "Long Battery", category: "Battery" },
-  "fast-charging": { label: "Fast Charging", category: "Battery" },
-  "wireless-charging": { label: "Wireless Charging", category: "Battery" },
-  amoled: { label: "AMOLED Display", category: "Display" },
-  "high-refresh-rate": { label: "120Hz+ Refresh Rate", category: "Display" },
-  "5g": { label: "5G Connectivity", category: "Connectivity" },
-  "wifi-7": { label: "Wi-Fi 7", category: "Connectivity" },
-  "ip-rating": { label: "IP Rating", category: "Security" },
-  "high-ram": { label: "High RAM", category: "Performance" },
-  gaming: { label: "Gaming Ready", category: "Performance" },
-  esim: { label: "eSIM", category: "Connectivity" },
-  nfc: { label: "NFC", category: "Connectivity" },
-  ois: { label: "OIS Camera", category: "Camera" },
-  periscope: { label: "Periscope Lens", category: "Camera" },
-  "ufs-4": { label: "UFS 4.x Storage", category: "Performance" },
-  lpddr5x: { label: "LPDDR5X Memory", category: "Performance" },
-  fingerprint: { label: "Fingerprint Security", category: "Security" },
-  "high-storage": { label: "High Storage", category: "Performance" },
-  lightweight: { label: "Lightweight Design", category: "Design" },
-  "oled-display": { label: "OLED Display", category: "Display" },
-  touchscreen: { label: "Touchscreen", category: "Display" },
-  intel: { label: "Intel Powered", category: "Performance" },
-  amd: { label: "AMD Powered", category: "Performance" },
-  "large-screen": { label: "Large Screen", category: "Display" },
-  "ultra-hd-4k": { label: "4K Ultra HD", category: "Display" },
-  "oled-qled": { label: "OLED / QLED", category: "Display" },
-  "smart-tv": { label: "Smart TV", category: "Smart Features" },
-  hdr: { label: "HDR", category: "Display" },
-  "dolby-audio": { label: "Dolby Audio", category: "Audio" },
-  wifi: { label: "Wi-Fi", category: "Connectivity" },
-  "voice-assistant": { label: "Voice Assistant", category: "Smart Features" },
-};
-
-const normalizeFeatureClickToken = (value) =>
-  String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[_\s]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-const normalizeFeatureClickDeviceType = (value, allowAll = false) => {
-  const normalized = normalizeFeatureClickToken(value);
-  if (allowAll && (!normalized || normalized === "all")) {
-    return "all";
-  }
-  return FEATURE_CLICK_DEVICE_TYPE_ALIASES[normalized] || normalized;
-};
-
-const isSafeFeatureClickId = (value) =>
-  /^[a-z0-9][a-z0-9-]{0,63}$/.test(String(value || ""));
-
-const toFeatureClickLabel = (value) =>
-  String(value || "")
-    .split("-")
-    .filter(Boolean)
-    .map((token) => token.charAt(0).toUpperCase() + token.slice(1))
-    .join(" ");
-
-const getFeatureClickMeta = (featureId) => {
-  const normalized = normalizeFeatureClickToken(featureId);
-  const matched = FEATURE_CLICK_META[normalized] || null;
-  return {
-    feature_id: normalized,
-    feature_label: matched?.label || toFeatureClickLabel(normalized) || "Feature",
-    category: matched?.category || "Other",
-  };
-};
-
-const getFeatureClickDeviceLabel = (deviceType) => {
-  const normalized = normalizeFeatureClickDeviceType(deviceType);
-  return (
-    FEATURE_CLICK_DEVICE_TYPE_LABELS[normalized] ||
-    toFeatureClickLabel(normalized) ||
-    "Unknown"
-  );
-};
-
-const roundFeatureMetric = (value, digits = 1) => {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return 0;
-  return Number(parsed.toFixed(digits));
-};
-
-const computeFeatureChangePercent = (currentValue, previousValue) => {
-  const current = Number(currentValue) || 0;
-  const previous = Number(previousValue) || 0;
-  if (current === 0 && previous === 0) return 0;
-  if (previous <= 0) return current > 0 ? 100 : 0;
-  return roundFeatureMetric(((current - previous) / previous) * 100, 1);
-};
-
-const shiftFeatureDateOnly = (value, offsetDays) => {
-  const base = new Date(`${String(value || "").slice(0, 10)}T00:00:00Z`);
-  if (Number.isNaN(base.getTime())) return null;
-  base.setUTCDate(base.getUTCDate() + Number(offsetDays || 0));
-  return base.toISOString().slice(0, 10);
-};
-
 // Popular feature clicks (public) - aggregated per day
 app.post("/api/public/feature-click", async (req, res) => {
   try {
     const b = req.body || {};
-    const deviceType = normalizeFeatureClickDeviceType(
-      b.device_type ?? b.deviceType ?? "",
-    );
-    const featureId = normalizeFeatureClickToken(
-      b.feature_id ?? b.featureId ?? b.id ?? "",
-    );
+    const normalize = (v) =>
+      String(v || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "-");
+
+    const deviceType = normalize(b.device_type ?? b.deviceType ?? "");
+    const featureId = normalize(b.feature_id ?? b.featureId ?? b.id ?? "");
+
+    const isSafeId = (s) => /^[a-z0-9][a-z0-9-]{0,63}$/.test(String(s));
 
     if (!deviceType || !featureId) {
       return res
         .status(400)
         .json({ message: "device_type and feature_id are required" });
     }
-    if (!isSafeFeatureClickId(deviceType) || !isSafeFeatureClickId(featureId)) {
+    if (!isSafeId(deviceType) || !isSafeId(featureId)) {
       return res
         .status(400)
         .json({ message: "Invalid device_type/feature_id" });
@@ -19556,92 +12348,19 @@ app.post("/api/public/feature-click", async (req, res) => {
   }
 });
 
-app.post("/api/public/search-interest", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const query = cleanText(body.query, 180) || null;
-    const rawProductType = body.product_type ?? body.productType ?? "";
-    const rawDeviceType =
-      body.device_type ?? body.deviceType ?? rawProductType ?? "";
-    const normalizedProductType =
-      rawProductType === "" ||
-      rawProductType === null ||
-      rawProductType === undefined
-        ? null
-        : normalizeProductType(rawProductType);
-    const normalizedDeviceType =
-      rawDeviceType === "" ||
-      rawDeviceType === null ||
-      rawDeviceType === undefined
-        ? null
-        : normalizeProductType(rawDeviceType);
-
-    if (rawProductType && normalizedProductType === undefined) {
-      return res.status(400).json({ message: "Invalid product_type" });
-    }
-
-    if (rawDeviceType && normalizedDeviceType === undefined) {
-      return res.status(400).json({ message: "Invalid device_type" });
-    }
-
-    const resolvedProduct = await resolveSearchInterestProduct(db, {
-      productId: body.product_id ?? body.productId,
-      productType: normalizedProductType || normalizedDeviceType || null,
-      query,
-    });
-
-    if (!query && !resolvedProduct?.product_id) {
-      return res
-        .status(400)
-        .json({ message: "query or product_id is required" });
-    }
-
-    const eventId = cleanToken(body.event_id ?? body.eventId, 96) || null;
-    const source = cleanToken(body.source, 48) || "search";
-
-    await db.query(
-      `
-      INSERT INTO search_interest_events (
-        event_id,
-        query,
-        normalized_query,
-        product_id,
-        product_type,
-        device_type,
-        source
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      ON CONFLICT (event_id) DO NOTHING
-      `,
-      [
-        eventId,
-        query,
-        query ? normalizeSearchQuery(query) : null,
-        resolvedProduct?.product_id || null,
-        resolvedProduct?.product_type || normalizedProductType || null,
-        normalizedDeviceType || normalizedProductType || null,
-        source,
-      ],
-    );
-
-    return res.json({
-      success: true,
-      product_id: resolvedProduct?.product_id || null,
-    });
-  } catch (err) {
-    console.error("POST /api/public/search-interest error:", err);
-    return res.status(500).json({ success: false });
-  }
-});
-
 // Popular feature ordering (public) - last N days
 app.get("/api/public/popular-features", async (req, res) => {
   try {
     const q = req.query || {};
-    const deviceType = normalizeFeatureClickDeviceType(
-      q.deviceType ?? q.device_type ?? "smartphone",
-    );
-    if (!isSafeFeatureClickId(deviceType)) {
+    const normalize = (v) =>
+      String(v || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "-");
+
+    const deviceType = normalize(q.deviceType ?? q.device_type ?? "smartphone");
+    const isSafeId = (s) => /^[a-z0-9][a-z0-9-]{0,63}$/.test(String(s));
+    if (!isSafeId(deviceType)) {
       return res.status(400).json({ message: "Invalid deviceType" });
     }
 
@@ -19678,381 +12397,6 @@ app.get("/api/public/popular-features", async (req, res) => {
   } catch (err) {
     console.error("GET /api/public/popular-features error:", err);
     return res.status(500).json({ message: "Failed to load popular features" });
-  }
-});
-
-app.get("/api/reports/feature-clicks", authenticate, async (req, res) => {
-  try {
-    const q = req.query || {};
-    const deviceType = normalizeFeatureClickDeviceType(
-      q.deviceType ?? q.device_type ?? "all",
-      true,
-    );
-    const daysRaw = Number(q.days ?? 7);
-    const days = Number.isFinite(daysRaw)
-      ? Math.min(90, Math.max(1, Math.floor(daysRaw)))
-      : 7;
-
-    if (deviceType !== "all" && !isSafeFeatureClickId(deviceType)) {
-      return res.status(400).json({ message: "Invalid deviceType" });
-    }
-
-    const currentRangeSql =
-      deviceType === "all"
-        ? "day >= (CURRENT_DATE - (($1::int) - 1))"
-        : "device_type = $1 AND day >= (CURRENT_DATE - (($2::int) - 1))";
-    const previousRangeSql =
-      deviceType === "all"
-        ? "day >= (CURRENT_DATE - ((($1::int) * 2) - 1)) AND day < (CURRENT_DATE - (($1::int) - 1))"
-        : "device_type = $1 AND day >= (CURRENT_DATE - ((($2::int) * 2) - 1)) AND day < (CURRENT_DATE - (($2::int) - 1))";
-    const scopedParams = deviceType === "all" ? [days] : [deviceType, days];
-
-    const [
-      todayRes,
-      dailyRes,
-      previousDailyRes,
-      featureRes,
-      previousFeatureRes,
-      deviceRes,
-    ] =
-      await Promise.all([
-        db.query(`SELECT CURRENT_DATE::text AS current_date`),
-        db.query(
-          `
-          SELECT day::text AS day, SUM(clicks)::int AS clicks
-          FROM feature_click_stats
-          WHERE ${currentRangeSql}
-          GROUP BY day
-          ORDER BY day ASC
-          `,
-          scopedParams,
-        ),
-        db.query(
-          `
-          SELECT day::text AS day, SUM(clicks)::int AS clicks
-          FROM feature_click_stats
-          WHERE ${previousRangeSql}
-          GROUP BY day
-          ORDER BY day ASC
-          `,
-          scopedParams,
-        ),
-        db.query(
-          `
-          SELECT
-            feature_id,
-            ARRAY_AGG(DISTINCT device_type ORDER BY device_type) AS device_types,
-            SUM(clicks)::int AS clicks,
-            MAX(last_clicked_at) AS last_clicked_at
-          FROM feature_click_stats
-          WHERE ${currentRangeSql}
-          GROUP BY feature_id
-          ORDER BY clicks DESC, last_clicked_at DESC
-          `,
-          scopedParams,
-        ),
-        db.query(
-          `
-          SELECT
-            feature_id,
-            SUM(clicks)::int AS clicks
-          FROM feature_click_stats
-          WHERE ${previousRangeSql}
-          GROUP BY feature_id
-          `,
-          scopedParams,
-        ),
-        db.query(
-          `
-          SELECT device_type, SUM(clicks)::int AS clicks
-          FROM feature_click_stats
-          WHERE ${currentRangeSql}
-          GROUP BY device_type
-          ORDER BY clicks DESC, device_type ASC
-          `,
-          scopedParams,
-        ),
-      ]);
-
-    const currentDate =
-      todayRes.rows?.[0]?.current_date ||
-      new Date().toISOString().slice(0, 10);
-    const rangeEnd = currentDate;
-    const rangeStart = shiftFeatureDateOnly(currentDate, -(days - 1)) || currentDate;
-    const previousRangeEnd = shiftFeatureDateOnly(rangeStart, -1) || rangeStart;
-    const previousRangeStart =
-      shiftFeatureDateOnly(previousRangeEnd, -(days - 1)) || previousRangeEnd;
-
-    const dailyMap = new Map(
-      (dailyRes.rows || []).map((row) => [
-        String(row.day || "").slice(0, 10),
-        Number(row.clicks) || 0,
-      ]),
-    );
-    const previousDailyMap = new Map(
-      (previousDailyRes.rows || []).map((row) => [
-        String(row.day || "").slice(0, 10),
-        Number(row.clicks) || 0,
-      ]),
-    );
-
-    const series = [];
-    for (let index = 0; index < days; index += 1) {
-      const dateValue = shiftFeatureDateOnly(rangeStart, index) || rangeStart;
-      series.push({
-        date: dateValue,
-        clicks: dailyMap.get(dateValue) || 0,
-      });
-    }
-
-    const activeDays = series.filter((item) => Number(item.clicks) > 0).length;
-    const previousSeries = [];
-    for (let index = 0; index < days; index += 1) {
-      const dateValue =
-        shiftFeatureDateOnly(previousRangeStart, index) || previousRangeStart;
-      previousSeries.push({
-        date: dateValue,
-        clicks: previousDailyMap.get(dateValue) || 0,
-      });
-    }
-    const previousActiveDays = previousSeries.filter(
-      (item) => Number(item.clicks) > 0,
-    ).length;
-    const previousFeatureMap = new Map(
-      (previousFeatureRes.rows || []).map((row) => [
-        normalizeFeatureClickToken(row.feature_id),
-        Number(row.clicks) || 0,
-      ]),
-    );
-
-    const currentFeatureRows = (featureRes.rows || []).map((row) => {
-      const featureId = normalizeFeatureClickToken(row.feature_id);
-      const meta = getFeatureClickMeta(featureId);
-      const clicks = Number(row.clicks) || 0;
-      const previousClicks = previousFeatureMap.get(featureId) || 0;
-      const normalizedDevices = Array.isArray(row.device_types)
-        ? row.device_types
-            .map((item) => normalizeFeatureClickDeviceType(item))
-            .filter(Boolean)
-        : [];
-
-      return {
-        feature_id: featureId,
-        feature_label: meta.feature_label,
-        category: meta.category,
-        clicks,
-        change_pct: computeFeatureChangePercent(clicks, previousClicks),
-        last_clicked_at: row.last_clicked_at || null,
-        device_types: normalizedDevices,
-        device_labels: normalizedDevices.map(getFeatureClickDeviceLabel),
-      };
-    });
-
-    const totalClicks = currentFeatureRows.reduce(
-      (sum, row) => sum + Number(row.clicks || 0),
-      0,
-    );
-    const previousTotalClicks = Array.from(previousFeatureMap.values()).reduce(
-      (sum, value) => sum + Number(value || 0),
-      0,
-    );
-
-    const categoryMap = new Map();
-    const previousCategoryMap = new Map();
-
-    for (const row of currentFeatureRows) {
-      const existing = categoryMap.get(row.category) || 0;
-      categoryMap.set(row.category, existing + Number(row.clicks || 0));
-    }
-
-    for (const [featureId, clicks] of previousFeatureMap.entries()) {
-      const meta = getFeatureClickMeta(featureId);
-      const existing = previousCategoryMap.get(meta.category) || 0;
-      previousCategoryMap.set(meta.category, existing + Number(clicks || 0));
-    }
-
-    const categoryBreakdown = Array.from(categoryMap.entries())
-      .map(([label, clicks]) => {
-        const previousClicks = previousCategoryMap.get(label) || 0;
-        const percent = totalClicks > 0 ? (Number(clicks) / totalClicks) * 100 : 0;
-        return {
-          label,
-          clicks: Number(clicks) || 0,
-          percent: roundFeatureMetric(percent, 1),
-          change_pct: computeFeatureChangePercent(clicks, previousClicks),
-        };
-      })
-      .sort((left, right) => right.clicks - left.clicks);
-
-    const previousCategoryBreakdown = Array.from(previousCategoryMap.entries())
-      .map(([label, clicks]) => {
-        const percent =
-          previousTotalClicks > 0
-            ? (Number(clicks) / previousTotalClicks) * 100
-            : 0;
-        return {
-          label,
-          clicks: Number(clicks) || 0,
-          percent: roundFeatureMetric(percent, 1),
-        };
-      })
-      .sort((left, right) => right.clicks - left.clicks);
-
-    const topCategory = categoryBreakdown[0] || null;
-    const previousTopCategory = previousCategoryBreakdown[0] || null;
-    const uniqueFeatures = currentFeatureRows.length;
-    const previousUniqueFeatures = previousFeatureMap.size;
-    const avgDailyClicks = days > 0 ? totalClicks / days : 0;
-    const previousAvgDailyClicks = days > 0 ? previousTotalClicks / days : 0;
-    const avgClicksPerFeature =
-      uniqueFeatures > 0 ? totalClicks / uniqueFeatures : 0;
-    const previousAvgClicksPerFeature =
-      previousUniqueFeatures > 0
-        ? previousTotalClicks / previousUniqueFeatures
-        : 0;
-
-    const deviceBreakdown = (deviceRes.rows || []).map((row) => {
-      const clicks = Number(row.clicks) || 0;
-      return {
-        key: normalizeFeatureClickDeviceType(row.device_type),
-        label: getFeatureClickDeviceLabel(row.device_type),
-        clicks,
-        percent:
-          totalClicks > 0 ? roundFeatureMetric((clicks / totalClicks) * 100, 1) : 0,
-      };
-    });
-
-    const topFeatures = currentFeatureRows.slice(0, 8).map((row, index) => ({
-      ...row,
-      rank: index + 1,
-      share_pct:
-        totalClicks > 0
-          ? roundFeatureMetric((Number(row.clicks || 0) / totalClicks) * 100, 1)
-          : 0,
-    }));
-
-    return res.json({
-      success: true,
-      generated_at: new Date().toISOString(),
-      filters: {
-        days,
-        device_type: deviceType,
-        range_start: rangeStart,
-        range_end: rangeEnd,
-        previous_range_start: previousRangeStart,
-        previous_range_end: previousRangeEnd,
-      },
-      summary: {
-        total_clicks: totalClicks,
-        total_clicks_change_pct: computeFeatureChangePercent(
-          totalClicks,
-          previousTotalClicks,
-        ),
-        avg_daily_clicks: roundFeatureMetric(avgDailyClicks, 1),
-        avg_daily_clicks_change_pct: computeFeatureChangePercent(
-          avgDailyClicks,
-          previousAvgDailyClicks,
-        ),
-        avg_clicks_per_feature: roundFeatureMetric(avgClicksPerFeature, 1),
-        avg_clicks_per_feature_change_pct: computeFeatureChangePercent(
-          avgClicksPerFeature,
-          previousAvgClicksPerFeature,
-        ),
-        features_clicked: uniqueFeatures,
-        features_clicked_change_pct: computeFeatureChangePercent(
-          uniqueFeatures,
-          previousUniqueFeatures,
-        ),
-        top_category_label: topCategory?.label || "None",
-        top_category_share_pct: roundFeatureMetric(topCategory?.percent || 0, 1),
-        top_category_share_change_pct: computeFeatureChangePercent(
-          topCategory?.percent || 0,
-          previousTopCategory?.percent || 0,
-        ),
-        active_days: activeDays,
-        active_days_change_pct: computeFeatureChangePercent(
-          activeDays,
-          previousActiveDays,
-        ),
-      },
-      series,
-      top_features: topFeatures,
-      device_breakdown: deviceBreakdown,
-      category_breakdown: categoryBreakdown,
-    });
-  } catch (err) {
-    console.error("GET /api/reports/feature-clicks error:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to load feature clicks report" });
-  }
-});
-
-app.get("/api/public/search-popularity", async (req, res) => {
-  try {
-    const query = req.query || {};
-    const rawType = String(
-      query.productType ?? query.product_type ?? query.type ?? "",
-    ).trim();
-
-    if (rawType && normalizeProductType(rawType) === undefined) {
-      return res.status(400).json({ message: "Invalid productType" });
-    }
-
-    const result = await getSearchPopularityDevices(db, {
-      productType: rawType,
-      days: query.days,
-      limit: query.limit ?? 5,
-    });
-
-    return res.json({
-      success: true,
-      product_type: result.productType || "all",
-      days: result.days,
-      generated_at: new Date().toISOString(),
-      devices: result.devices,
-    });
-  } catch (err) {
-    console.error("GET /api/public/search-popularity error:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to load search popularity" });
-  }
-});
-
-app.get("/api/admin/search-popularity", authenticate, async (req, res) => {
-  try {
-    if (req.user?.role !== "admin") {
-      return res.status(403).json({ message: "Admin access required" });
-    }
-
-    const query = req.query || {};
-    const rawType = String(
-      query.productType ?? query.product_type ?? query.type ?? "",
-    ).trim();
-
-    if (rawType && normalizeProductType(rawType) === undefined) {
-      return res.status(400).json({ message: "Invalid productType" });
-    }
-
-    const result = await getSearchPopularityDevices(db, {
-      productType: rawType,
-      days: query.days,
-      limit: query.limit ?? 100,
-    });
-
-    return res.json({
-      success: true,
-      product_type: result.productType || "all",
-      days: result.days,
-      generated_at: new Date().toISOString(),
-      devices: result.devices,
-    });
-  } catch (err) {
-    console.error("GET /api/admin/search-popularity error:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to load search popularity report" });
   }
 });
 
@@ -20674,7 +13018,7 @@ app.get("/api/public/trending/laptops", async (req, res) => {
         };
       }),
       profileConfig.profiles,
-    ).map(toPublicLaptopResponseRow);
+    );
 
     return res.json({
       period: "7d",
@@ -20904,7 +13248,7 @@ app.get("/api/public/trending/tvs", async (req, res) => {
         };
       }),
       profileConfig.profiles,
-    ).map(toPublicTvResponseRow);
+    );
 
     return res.json({
       period: "7d",
@@ -21068,7 +13412,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
   }
 });
 
-// Latest Entries - Laptops
+// New Launches - Laptops
 app.get("/api/public/new/laptops", async (req, res) => {
   try {
     const profileConfig = await readDeviceFieldProfilesConfig();
@@ -21089,7 +13433,7 @@ app.get("/api/public/new/laptops", async (req, res) => {
         l.physical,
         l.meta,
         l.spec_sections,
-        COALESCE(l.created_at, p.created_at) AS created_at,
+        l.created_at AS launch_date,
         (
           SELECT pi.image_url
           FROM product_images pi
@@ -21108,7 +13452,7 @@ app.get("/api/public/new/laptops", async (req, res) => {
       LEFT JOIN laptop l ON l.product_id = p.id
       INNER JOIN product_publish pub ON pub.product_id = p.id AND pub.is_published = true
       WHERE p.product_type = 'laptop'
-      ORDER BY COALESCE(l.created_at, p.created_at) DESC, p.id DESC
+      ORDER BY COALESCE(l.created_at, p.created_at) DESC
       LIMIT 20;
     `);
 
@@ -21120,7 +13464,7 @@ app.get("/api/public/new/laptops", async (req, res) => {
         variants: [],
       })),
       profileConfig.profiles,
-    ).map(toPublicLaptopResponseRow);
+    );
 
     return res.json({ new: launches });
   } catch (err) {
@@ -21238,7 +13582,7 @@ app.get("/api/public/new/tvs", async (req, res) => {
       "tv",
       result.rows || [],
       profileConfig.profiles,
-    ).map(toPublicTvResponseRow);
+    );
 
     return res.json({ new: launches });
   } catch (err) {
@@ -21328,58 +13672,6 @@ app.get("/api/public/trending/all", async (req, res) => {
   }
 });
 
-app.get("/api/public/compare-pages/routes", async (_req, res) => {
-  try {
-    const pages = await readPublishedComparePages({
-      publishedOnly: true,
-      limit: 400,
-    });
-
-    return res.json({
-      routes: pages.map((page) => ({
-        slug: page.slug,
-        route_path: page.route_path,
-        title: page.title,
-        meta_description: page.meta_description,
-        updated_at: page.updated_at,
-      })),
-    });
-  } catch (err) {
-    console.error("GET /api/public/compare-pages/routes error:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to load compare page routes" });
-  }
-});
-
-app.get("/api/public/compare-pages/resolve", async (req, res) => {
-  try {
-    const slug = normalizeComparePageSlugInput(req.query?.slug);
-    if (!slug) {
-      return res.status(400).json({ message: "slug is required" });
-    }
-
-    const pages = await readPublishedComparePages({
-      slug,
-      publishedOnly: true,
-      limit: 1,
-    });
-    const page = pages[0] || null;
-    if (!page) {
-      return res.status(404).json({ message: "Compare page not found" });
-    }
-
-    return res.json({
-      matched: true,
-      page,
-      compare_path: page.route_path,
-    });
-  } catch (err) {
-    console.error("GET /api/public/compare-pages/resolve error:", err);
-    return res.status(500).json({ message: "Failed to resolve compare page" });
-  }
-});
-
 app.get("/api/public/compare/resolve", async (req, res) => {
   try {
     const normalizeCompareSlug = (value) =>
@@ -21458,11 +13750,7 @@ app.get("/api/public/compare/resolve", async (req, res) => {
       matched,
       left,
       right,
-      compare_path: matched
-        ? getComparePageRoutePath(
-            buildComparePageSlug([left.product_name, right.product_name]),
-          )
-        : null,
+      compare_path: matched ? `/compare/${left.slug}-vs-${right.slug}` : null,
     });
   } catch (err) {
     console.error("GET /api/public/compare/resolve error:", err);
@@ -21522,23 +13810,6 @@ app.post("/api/public/compare/scores", async (req, res) => {
         COALESCE(s.display, l.display, t.display_json, '{}'::jsonb) AS display,
         COALESCE(s.camera, '{}'::jsonb) AS camera,
         COALESCE(s.battery, l.battery, t.power_json, '{}'::jsonb) AS battery,
-        COALESCE(s.connectivity, l.connectivity, n.connectivity, t.connectivity_json, '{}'::jsonb) AS connectivity,
-        COALESCE(s.network, '{}'::jsonb) AS network,
-        COALESCE(s.build_design, '{}'::jsonb) AS build_design,
-        COALESCE(s.audio, t.audio_json, '{}'::jsonb) AS audio,
-        COALESCE(s.multimedia, '{}'::jsonb) AS multimedia,
-        COALESCE(s.sensors, '{}'::jsonb) AS sensors,
-        COALESCE(l.memory, '{}'::jsonb) AS memory,
-        COALESCE(l.storage, '{}'::jsonb) AS storage,
-        COALESCE(l.physical, t.physical_json, n.physical_details, '{}'::jsonb) AS physical,
-        COALESCE(l.software, '{}'::jsonb) AS software,
-        COALESCE(l.features, '{}'::jsonb) AS features,
-        COALESCE(t.smart_tv_json, '{}'::jsonb) AS smart_features,
-        COALESCE(t.gaming_json, '{}'::jsonb) AS gaming,
-        COALESCE(t.ports_json, '{}'::jsonb) AS ports,
-        COALESCE(n.specifications, '{}'::jsonb) AS specifications,
-        COALESCE(n.features, '{}'::jsonb) AS networking_features,
-        COALESCE(n.performance, '{}'::jsonb) AS networking_performance,
         (
           SELECT MIN(v.base_price)
           FROM product_variants v
@@ -21552,10 +13823,7 @@ app.post("/api/public/compare/scores", async (req, res) => {
                 'id', v.id,
                 'base_price', v.base_price,
                 'price', v.base_price,
-                'attributes', v.attributes,
-                'ram', v.attributes->>'ram',
-                'storage', v.attributes->>'storage',
-                'storage_type', v.attributes->>'storage_type'
+                'attributes', v.attributes
               )
               ORDER BY v.id ASC
             )
@@ -21585,53 +13853,20 @@ app.post("/api/public/compare/scores", async (req, res) => {
       return res.status(404).json({ message: "Products not found" });
     }
 
-    const productTypes = [
-      ...new Set(
-        (productResult.rows || [])
-          .map((row) => String(row?.product_type || "").trim().toLowerCase())
-          .filter(Boolean),
-      ),
-    ];
-
-    if (productTypes.length > 1) {
-      return res.status(400).json({
-        message:
-          "Comparison scoring is available only for devices from the same product type.",
-      });
-    }
-
     const compareConfig = await readCompareScoringConfig();
     const variantSelection = Object.fromEntries(
       normalizedDevices.map((entry) => [String(entry.product_id), entry]),
     );
-    const analysis = buildCompareRanking(
+    const ranking = buildCompareRanking(
       productResult.rows,
       variantSelection,
       compareConfig,
     );
 
-    if (!analysis.ranking.length && analysis.warnings?.length) {
-      return res.status(400).json({
-        message: analysis.warnings[0],
-        warnings: analysis.warnings,
-      });
-    }
-
     return res.json({
-      score_version: "compare_v2",
-      product_type: analysis.productType,
-      overall_winner: analysis.overallWinner,
-      category_winners: analysis.categoryWinners,
-      warnings: analysis.warnings || [],
-      scores: analysis.ranking.map((row) => ({
+      scores: ranking.map((row) => ({
         product_id: Number(row.productId),
         overall_score: row.overallScore,
-        rank: row.rank,
-        confidence: row.confidence,
-        price: row.price,
-        reasons: row.reasons || [],
-        breakdown: row.breakdown || {},
-        details: row.details || {},
       })),
     });
   } catch (err) {
@@ -22784,66 +15019,66 @@ app.get("/api/public/product/:id", async (req, res) => {
   }
 });
 
-async function runGlobalSearch(
-  queryText,
-  { publishedOnly = true, limit = 5 } = {},
-) {
+async function runGlobalSearch(queryText, { publishedOnly = true } = {}) {
   const q = (queryText || "").trim();
   if (!q) return [];
 
-  const normalizedQuery = q.toLowerCase();
-  const containsTerm = `%${normalizedQuery}%`;
-  const prefixTerm = `${normalizedQuery}%`;
-  const wordPrefixTerm = `% ${normalizedQuery}%`;
-  const resultLimit = Math.min(20, toPositiveInt(limit, 5));
+  const term = `%${q}%`;
 
-  const publishFilter = publishedOnly
+  const publishJoin = publishedOnly
     ? `
-       EXISTS (
-         SELECT 1
-         FROM product_publish pub
-         WHERE pub.product_id = p.id
-           AND pub.is_published = true
-       )
+       INNER JOIN product_publish pub
+         ON pub.product_id = p.id
+        AND pub.is_published = true
       `
-    : "TRUE";
+    : "";
+
+  const brandExistsClause = publishedOnly
+    ? `
+         AND EXISTS (
+           SELECT 1
+           FROM products p
+           INNER JOIN product_publish pub
+             ON pub.product_id = p.id
+            AND pub.is_published = true
+           WHERE p.brand_id = b.id
+         )
+      `
+    : `
+         AND EXISTS (
+           SELECT 1
+           FROM products p
+           WHERE p.brand_id = b.id
+         )
+      `;
 
   // Search products by name and brand with image
   const products = await db.query(
-    `SELECT
+    `SELECT DISTINCT
       p.id,
       p.name,
       p.product_type,
       b.name AS brand_name,
-      (SELECT image_url FROM product_images WHERE product_id = p.id AND position = 1 LIMIT 1) AS image_url,
-      CASE
-        WHEN LOWER(p.name) = $1 THEN 0
-        WHEN LOWER(COALESCE(b.name, '')) = $1 THEN 1
-        WHEN LOWER(p.name) LIKE $2 THEN 2
-        WHEN LOWER(COALESCE(b.name, '')) LIKE $2 THEN 3
-        WHEN LOWER(p.name) LIKE $3 THEN 4
-        WHEN LOWER(p.name) LIKE $4 THEN 5
-        WHEN LOWER(COALESCE(b.name, '')) LIKE $4 THEN 6
-        ELSE 7
-      END AS relevance_rank,
-      CASE
-        WHEN LOWER(p.name) LIKE $4 THEN POSITION($1 IN LOWER(p.name))
-        ELSE 999
-      END AS name_match_position
+      (SELECT image_url FROM product_images WHERE product_id = p.id AND position = 1 LIMIT 1) AS image_url
      FROM products p
+     ${publishJoin}
      LEFT JOIN brands b ON b.id = p.brand_id
-     WHERE ${publishFilter}
-       AND (
-         LOWER(p.name) LIKE $4
-         OR LOWER(COALESCE(b.name, '')) LIKE $4
-       )
-     ORDER BY
-       relevance_rank ASC,
-       name_match_position ASC,
-       LENGTH(p.name) ASC,
-       p.name ASC
-     LIMIT $5`,
-    [normalizedQuery, prefixTerm, wordPrefixTerm, containsTerm, resultLimit],
+     WHERE p.name ILIKE $1
+        OR b.name ILIKE $1
+     ORDER BY p.name ASC
+     LIMIT 10`,
+    [term],
+  );
+
+  // Search brands only
+  const brands = await db.query(
+    `SELECT b.id, b.name
+     FROM brands b
+     WHERE b.name ILIKE $1
+     ${brandExistsClause}
+     ORDER BY b.name ASC
+     LIMIT 6`,
+    [term],
   );
 
   const safeNum = (v) => {
@@ -23005,17 +15240,31 @@ async function runGlobalSearch(
     });
   }
 
+  // Add brands to results (avoid duplicates)
+  for (const b of brands.rows) {
+    const brandExists = results.some(
+      (item) => item.type === "brand" && item.name === b.name,
+    );
+    const productExists = results.some(
+      (item) => item.type === "product" && item.brand_name === b.name,
+    );
+
+    if (!brandExists && !productExists) {
+      results.push({
+        type: "brand",
+        id: b.id,
+        name: b.name,
+      });
+    }
+  }
+
   return results;
 }
 
 // Public search: published products only
 app.get("/api/search", async (req, res) => {
   try {
-    const limit = Math.min(20, toPositiveInt(req.query.limit, 5));
-    const results = await runGlobalSearch(req.query.q, {
-      publishedOnly: true,
-      limit,
-    });
+    const results = await runGlobalSearch(req.query.q, { publishedOnly: true });
     res.json({ results });
   } catch (err) {
     console.error("GET /api/search error:", err);
@@ -23026,10 +15275,8 @@ app.get("/api/search", async (req, res) => {
 // Admin search: includes published + unpublished products
 app.get("/api/search/admin", authenticate, async (req, res) => {
   try {
-    const limit = Math.min(20, toPositiveInt(req.query.limit, 5));
     const results = await runGlobalSearch(req.query.q, {
       publishedOnly: false,
-      limit,
     });
     res.json({ results });
   } catch (err) {
@@ -23266,20 +15513,6 @@ app.use("/api/import", authenticate, importSmartphonesRouter);
 app.use("/api/import", authenticate, importLaptopsRouter);
 app.use("/api/smartphones", authenticate, smartphonesReqRouter);
 
-// ===== SPA CATCH-ALL ROUTE =====
-// Serve index.html for any route that doesn't match an API endpoint.
-// This allows React Router to handle client-side routing.
-app.get("/{*splat}", (req, res) => {
-  // Missing file requests should return 404 instead of HTML to avoid
-  // module/CSS MIME mismatches when an outdated page references old assets.
-  if (isDirectFileRequest(req.path)) {
-    return res.status(404).end();
-  }
-
-  applyNoCacheHtmlHeaders(res);
-  res.sendFile(path.join(distPath, "index.html"));
-});
-
 async function start() {
   try {
     // Wait for DB to be reachable before running migrations
@@ -23380,17 +15613,6 @@ async function start() {
             limit,
           });
           console.log("Competitor analysis recompute:", result);
-          try {
-            const syncResult = await syncAutomaticSmartphoneComparePages({
-              recomputeIfMissing: false,
-            });
-            console.log("Automatic compare page sync after competitor recompute:", syncResult);
-          } catch (syncErr) {
-            console.error(
-              "Automatic compare page sync after competitor recompute failed:",
-              syncErr,
-            );
-          }
         } catch (err) {
           console.error("Competitor analysis recompute failed:", err);
         }
@@ -23401,39 +15623,13 @@ async function start() {
       if (typeof timer.unref === "function") timer.unref();
       console.log("Competitor analysis cron enabled:", { intervalMs });
     }
-
-    // Automatically generate and refresh SEO compare pages from competitor data
-    // so newly inserted launch/spec details can appear within a few hours.
-    if (process.env.AUTO_COMPARE_PAGES_CRON_ENABLED !== "false") {
-      const defaultMs = 3 * 60 * 60 * 1000; // 3 hours
-      const intervalRaw = Number(process.env.AUTO_COMPARE_PAGES_CRON_INTERVAL_MS);
-      const intervalMs = Number.isFinite(intervalRaw)
-        ? Math.max(30 * 60 * 1000, Math.floor(intervalRaw))
-        : defaultMs;
-
-      const run = async () => {
-        try {
-          const result = await syncAutomaticSmartphoneComparePages({
-            recomputeIfMissing: true,
-          });
-          console.log("Automatic compare page sync:", result);
-        } catch (err) {
-          console.error("Automatic compare page sync failed:", err);
-        }
-      };
-
-      void run();
-      const timer = setInterval(run, intervalMs);
-      if (typeof timer.unref === "function") timer.unref();
-      console.log("Automatic compare page cron enabled:", { intervalMs });
-    }
   } catch (err) {
     console.error("Migrations failed:", err);
     process.exit(1);
   }
 
-  app.listen(PORT, "0.0.0.0", async () => {
-    console.log(`Server running at ${PORT}`);
+  app.listen(PORT, "127.0.0.1", async () => {
+    console.log(`🚀 Server running at http://localhost:${PORT}`);
     try {
       const r = await db.query("SELECT now()");
       console.log("DB time:", r.rows[0].now);
