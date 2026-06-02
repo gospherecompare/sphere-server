@@ -248,7 +248,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 // Server-side proxy for external API calls to avoid CORS when needed.
 // Example: POST /proxy/external/api/auth/login -> forwards to https://api.apisphere.in/api/auth/login
 app.use("/proxy/external", express.json({ limit: "50kb" }));
-app.all("/proxy/external/*", async (req, res) => {
+app.all(["/proxy/external", "/proxy/external/*proxyPath"], async (req, res) => {
   try {
     const targetBase = "https://api.apisphere.in";
     const targetPath = req.originalUrl.replace(/^\/proxy\/external/, "");
