@@ -12,7 +12,9 @@ const pool = new Pool({
   idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT_MS, 10) || 30000,
   connectionTimeoutMillis:
     parseInt(process.env.DB_CONN_TIMEOUT_MS, 10) || 10000,
-  ssl: false,
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
 
 pool.on("error", (err) => {

@@ -245,6 +245,52 @@ app.use(function xssSafe(req, res, next) {
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+// Server-side proxy for external API calls to avoid CORS when needed.
+// Example: POST /proxy/external/api/auth/login -> forwards to https://api.apisphere.in/api/auth/login
+app.use("/proxy/external", express.json({ limit: "50kb" }));
+app.all("/proxy/external/*", async (req, res) => {
+  try {
+    const targetBase = "https://api.apisphere.in";
+    const targetPath = req.originalUrl.replace(/^\/proxy\/external/, "");
+    const targetUrl = `${targetBase}${targetPath}`;
+
+    const headers = { ...req.headers };
+    // remove hop-by-hop headers that shouldn't be forwarded
+    delete headers.host;
+    delete headers.connection;
+    delete headers.accept_encoding;
+    delete headers.origin;
+
+    const options = {
+      method: req.method,
+      headers,
+    };
+
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      // forward JSON bodies (most auth endpoints use JSON)
+      if (req.is("application/json") || typeof req.body === "object") {
+        options.body = JSON.stringify(req.body || {});
+        options.headers["content-type"] = "application/json";
+      }
+    }
+
+    const fetchRes = await fetch(targetUrl, options);
+    const arrayBuffer = await fetchRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // Copy selected response headers
+    fetchRes.headers.forEach((value, name) => {
+      // skip transfer-encoding which may cause issues
+      if (name.toLowerCase() === "transfer-encoding") return;
+      res.setHeader(name, value);
+    });
+
+    res.status(fetchRes.status).send(buffer);
+  } catch (err) {
+    res.status(502).json({ error: "proxy_error", message: String(err) });
+  }
+});
+
 /* -----------------------
   Utilities
 ------------------------*/
