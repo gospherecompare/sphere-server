@@ -3777,6 +3777,37 @@ async function runMigrations() {
       `);
 
     await safeQuery(`
+      CREATE TABLE IF NOT EXISTS contact_submissions (
+        id SERIAL PRIMARY KEY,
+        full_name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        subject_label TEXT NOT NULL,
+        message TEXT NOT NULL,
+        agree_terms BOOLEAN NOT NULL DEFAULT false,
+        source TEXT,
+        payload JSONB,
+        created_at TIMESTAMP DEFAULT now(),
+        updated_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_contact_submissions_created_at
+      ON contact_submissions (created_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_contact_submissions_email
+      ON contact_submissions (email);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_contact_submissions_subject
+      ON contact_submissions (subject);
+    `);
+
+    await safeQuery(`
       CREATE TABLE IF NOT EXISTS blogs (
         id SERIAL PRIMARY KEY,
         product_id INT UNIQUE
