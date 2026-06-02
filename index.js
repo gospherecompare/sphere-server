@@ -3455,6 +3455,16 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
+      CREATE TABLE IF NOT EXISTS auth_organization_pin (
+        id INT PRIMARY KEY CHECK (id = 1),
+        pin_hash TEXT NOT NULL,
+        updated_by INT REFERENCES "user"(id) ON DELETE SET NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
       CREATE TABLE IF NOT EXISTS auth_webauthn_credentials (
         id SERIAL PRIMARY KEY,
         user_id INT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
@@ -3899,6 +3909,7 @@ async function runMigrations() {
 ------------------------*/
 
 const OTP_CHALLENGE_TABLE = "auth_login_challenges";
+const ORGANIZATION_PIN_TABLE = "auth_organization_pin";
 const WEBAUTHN_CREDENTIAL_TABLE = "auth_webauthn_credentials";
 const WEBAUTHN_CHALLENGE_TABLE = "auth_webauthn_challenges";
 const OTP_CODE_LENGTH = 6;
@@ -3906,6 +3917,8 @@ const OTP_TTL_MS = 5 * 60 * 1000;
 const OTP_RESEND_COOLDOWN_MS = 30 * 1000;
 const OTP_MAX_ATTEMPTS = 5;
 const OTP_HASH_ROUNDS = 10;
+const ORGANIZATION_PIN_HASH_ROUNDS = 10;
+const ORGANIZATION_PIN_LENGTH = 7;
 const OTP_REVERIFY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const ACCESS_TOKEN_TTL = "1h";
 const PENDING_LOGIN_TOKEN_PURPOSE = "admin_pending_login";
@@ -3927,6 +3940,9 @@ const WEBAUTHN_ALLOWED_ORIGINS = new Set([
     .map(normalizeOrigin)
     .filter(Boolean),
 ]);
+const ORGANIZATION_PIN_PATTERN = new RegExp(
+  `^\\d{${ORGANIZATION_PIN_LENGTH}}$`,
+);
 
 const loginInitiateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -3958,10 +3974,28 @@ const loginOtpResendLimiter = rateLimit({
   },
 });
 
+const loginPinVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message: "Too many PIN verification attempts. Please try again later.",
+  },
+});
+
 const normalizeLoginEmail = (value) =>
   String(value || "")
     .trim()
     .toLowerCase();
+
+const normalizeOrganizationPinInput = (value) =>
+  String(value || "")
+    .replace(/\D/g, "")
+    .slice(0, ORGANIZATION_PIN_LENGTH);
+
+const isValidOrganizationPin = (value) =>
+  ORGANIZATION_PIN_PATTERN.test(String(value || ""));
 
 const parseBooleanInput = (value) => {
   if (typeof value === "boolean") return value;
@@ -4171,6 +4205,52 @@ const buildPendingLoginResponse = (user, nextAction, message) => {
 
   return payload;
 };
+
+async function readOrganizationPinRecord() {
+  const result = await db.query(
+    `SELECT id, pin_hash, updated_by, updated_at
+     FROM ${ORGANIZATION_PIN_TABLE}
+     WHERE id = 1
+     LIMIT 1`,
+  );
+  return result.rows[0] || null;
+}
+
+async function createOrganizationPin(pin, updatedBy) {
+  const pinHash = await bcrypt.hash(pin, ORGANIZATION_PIN_HASH_ROUNDS);
+  const result = await db.query(
+    `INSERT INTO ${ORGANIZATION_PIN_TABLE} (id, pin_hash, updated_by, updated_at)
+     VALUES (1, $1, $2, now())
+     ON CONFLICT (id) DO NOTHING
+     RETURNING updated_by, updated_at`,
+    [pinHash, updatedBy],
+  );
+  return result.rows[0] || null;
+}
+
+async function updateOrganizationPin(pin, updatedBy) {
+  const pinHash = await bcrypt.hash(pin, ORGANIZATION_PIN_HASH_ROUNDS);
+  const result = await db.query(
+    `INSERT INTO ${ORGANIZATION_PIN_TABLE} (id, pin_hash, updated_by, updated_at)
+     VALUES (1, $1, $2, now())
+     ON CONFLICT (id) DO UPDATE
+       SET pin_hash = EXCLUDED.pin_hash,
+           updated_by = EXCLUDED.updated_by,
+           updated_at = EXCLUDED.updated_at
+     RETURNING updated_by, updated_at`,
+    [pinHash, updatedBy],
+  );
+  return result.rows[0] || null;
+}
+
+async function getOrganizationPinStatus() {
+  const record = await readOrganizationPinRecord();
+  return {
+    isConfigured: Boolean(record?.pin_hash),
+    updated_at: record?.updated_at || null,
+    updated_by: record?.updated_by || null,
+  };
+}
 
 const hashLoginTicket = (loginTicket) =>
   crypto
@@ -4423,8 +4503,6 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
     const b = req.body || {};
     const email = normalizeLoginEmail(b.email);
     const password = String(b.password || "");
-    const deviceAuthSupported = parseBooleanInput(b.deviceAuthSupported);
-    const forceOtpFallback = parseBooleanInput(b.forceOtpFallback);
 
     if (!email || !password) {
       return res.status(400).json({ message: "email and password required" });
@@ -4444,40 +4522,125 @@ app.post("/api/auth/login", loginInitiateLimiter, async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    const credentials = await listUserWebAuthnCredentials(user.id);
-    const canUseRegisteredDevice =
-      credentials.length > 0 && deviceAuthSupported && !forceOtpFallback;
-    const otpStillFresh = hasFreshOtpVerification(user.last_otp_verified_at);
-
-    if (canUseRegisteredDevice && otpStillFresh) {
+    const organizationPinStatus = await getOrganizationPinStatus();
+    if (!organizationPinStatus.isConfigured) {
       return res.json(
         buildPendingLoginResponse(
           user,
-          "device_auth",
-          "Use your device verification to finish signing in.",
+          "pin_setup",
+          "Create the 7-digit organization PIN to finish signing in.",
         ),
       );
     }
 
-    const challenge = await issueLoginOtpChallenge(user);
-
-    return res.json({
-      message: "OTP sent",
-      nextStep: "otp",
-      otpRequired: true,
-      challengeId: challenge.challengeId,
-      expiresIn: challenge.expiresInSeconds,
-      resendAfterMs: challenge.resendAfterMs,
-      maxAttempts: challenge.maxAttempts,
-      deliveryChannels: challenge.deliveryChannels,
-    });
+    return res.json(
+      buildPendingLoginResponse(
+        user,
+        "pin",
+        "Enter the 7-digit organization PIN to finish signing in.",
+      ),
+    );
   } catch (err) {
-    console.error("Login OTP initiation error:", err);
+    console.error("Login PIN initiation error:", err);
     res.status(500).json({
-      message: "Unable to start OTP login. Please try again.",
+      message: "Unable to start PIN login. Please try again.",
     });
   }
 });
+
+app.post("/api/auth/login/pin", loginPinVerifyLimiter, async (req, res) => {
+  try {
+    const loginTicket = String(req.body?.loginTicket || "").trim();
+    const pin = normalizeOrganizationPinInput(req.body?.pin);
+    const pendingLogin = verifyPendingLoginTicket(loginTicket);
+
+    if (!pendingLogin || pendingLogin.nextAction !== "pin") {
+      return res.status(401).json({
+        message: "Login session expired. Please sign in again.",
+      });
+    }
+
+    if (!isValidOrganizationPin(pin)) {
+      return res.status(400).json({
+        message: "Organization PIN must be exactly 7 digits.",
+      });
+    }
+
+    const user = await getAdminUserById(pendingLogin.id);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const organizationPin = await readOrganizationPinRecord();
+    if (!organizationPin?.pin_hash) {
+      return res.status(410).json({
+        message:
+          "Organization PIN is not configured. Please sign in again to set it up.",
+      });
+    }
+
+    const matches = await bcrypt.compare(pin, organizationPin.pin_hash);
+    if (!matches) {
+      return res.status(401).json({ message: "Invalid organization PIN." });
+    }
+
+    return res.json(buildSuccessfulAdminLoginResponse(user));
+  } catch (err) {
+    console.error("PIN login verification error:", err);
+    return res.status(500).json({
+      message: "Unable to verify the organization PIN. Please try again.",
+    });
+  }
+});
+
+app.post(
+  "/api/auth/login/pin/setup/verify",
+  loginPinVerifyLimiter,
+  async (req, res) => {
+    try {
+      const loginTicket = String(req.body?.loginTicket || "").trim();
+      const newPin = normalizeOrganizationPinInput(req.body?.newPin);
+      const pendingLogin = verifyPendingLoginTicket(loginTicket);
+
+      if (!pendingLogin || pendingLogin.nextAction !== "pin_setup") {
+        return res.status(401).json({
+          message: "Login session expired. Please sign in again.",
+        });
+      }
+
+      if (!isValidOrganizationPin(newPin)) {
+        return res.status(400).json({
+          message: "Organization PIN must be exactly 7 digits.",
+        });
+      }
+
+      const user = await getAdminUserById(pendingLogin.id);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const created = await createOrganizationPin(newPin, user.id);
+      if (!created) {
+        return res.status(409).json({
+          message:
+            "Organization PIN has already been configured. Please sign in again and use the current PIN.",
+        });
+      }
+
+      return res.json(
+        buildSuccessfulAdminLoginResponse(
+          user,
+          "Organization PIN created successfully",
+        ),
+      );
+    } catch (err) {
+      console.error("PIN setup verification error:", err);
+      return res.status(500).json({
+        message: "Unable to create the organization PIN. Please try again.",
+      });
+    }
+  },
+);
 
 app.post(
   "/api/auth/login/verify-otp",
@@ -5220,6 +5383,83 @@ app.post(
     }
   },
 );
+
+app.get("/api/auth/organization-pin/status", authenticate, async (req, res) => {
+  try {
+    const pinStatus = await getOrganizationPinStatus();
+    return res.json({
+      success: true,
+      isConfigured: pinStatus.isConfigured,
+      updated_at: pinStatus.updated_at,
+      updated_by: pinStatus.updated_by,
+    });
+  } catch (err) {
+    console.error("Get organization PIN status error:", err);
+    return res.status(500).json({
+      message: "Unable to load organization PIN status.",
+    });
+  }
+});
+
+app.put("/api/auth/organization-pin", authenticate, async (req, res) => {
+  try {
+    const currentPin = normalizeOrganizationPinInput(req.body?.currentPin);
+    const newPin = normalizeOrganizationPinInput(req.body?.newPin);
+    const pinStatus = await getOrganizationPinStatus();
+
+    if (!isValidOrganizationPin(newPin)) {
+      return res.status(400).json({
+        message: "Organization PIN must be exactly 7 digits.",
+      });
+    }
+
+    if (pinStatus.isConfigured) {
+      if (!currentPin) {
+        return res
+          .status(400)
+          .json({ message: "Current organization PIN is required" });
+      }
+
+      if (!isValidOrganizationPin(currentPin)) {
+        return res.status(400).json({
+          message: "Organization PIN must be exactly 7 digits.",
+        });
+      }
+
+      if (currentPin === newPin) {
+        return res.status(400).json({
+          message: "New PIN must be different from current PIN",
+        });
+      }
+
+      const organizationPin = await readOrganizationPinRecord();
+      const matches =
+        organizationPin?.pin_hash &&
+        (await bcrypt.compare(currentPin, organizationPin.pin_hash));
+      if (!matches) {
+        return res
+          .status(401)
+          .json({ message: "Current organization PIN is incorrect" });
+      }
+    }
+
+    const updated = await updateOrganizationPin(newPin, req.user.id);
+    return res.json({
+      success: true,
+      message: pinStatus.isConfigured
+        ? "Organization PIN updated successfully"
+        : "Organization PIN created successfully",
+      isConfigured: true,
+      updated_at: updated?.updated_at || null,
+      updated_by: updated?.updated_by ?? req.user.id,
+    });
+  } catch (err) {
+    console.error("Update organization PIN error:", err);
+    return res.status(500).json({
+      message: "Unable to update the organization PIN. Please try again.",
+    });
+  }
+});
 
 /* ---- ADMIN Profile Endpoints ---- */
 app.get("/api/auth/profile", authenticate, async (req, res) => {
