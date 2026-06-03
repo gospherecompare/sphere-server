@@ -2512,6 +2512,12 @@ const applySpecScoreToRow = (type, row, profiles) => {
           score: cameraScoreV2Display8099,
         }
       : row.camera_json;
+  const specScoreDisplay =
+    specScoreV2Display8098 != null ? specScoreV2Display8098 : specScore;
+  const overallScoreDisplay =
+    overallScoreV2Display8098 != null
+      ? overallScoreV2Display8098
+      : overallScore;
 
   return {
     ...row,
@@ -2529,6 +2535,8 @@ const applySpecScoreToRow = (type, row, profiles) => {
     overall_score_v2_source: overallScoreV2Source,
     spec_score_v2_display_80_98: specScoreV2Display8098,
     overall_score_v2_display_80_98: overallScoreV2Display8098,
+    spec_score_display: specScoreDisplay,
+    overall_score_display: overallScoreDisplay,
     spec_score_price: specScorePrice,
     spec_score_price_band: specScorePriceBand,
     spec_score_feature_coverage: specFeatureCoverage,
@@ -13410,11 +13418,20 @@ app.get("/api/public/trending/tvs", async (req, res) => {
           WHERE v.product_id = p.id
         ) AS price,
         (
-          SELECT pi.image_url
-          FROM product_images pi
-          WHERE pi.product_id = p.id
-          ORDER BY pi.position ASC NULLS LAST, pi.id ASC
-          LIMIT 1
+          SELECT COALESCE(
+            (
+              SELECT pi.image_url
+              FROM product_images pi
+              WHERE pi.product_id = p.id
+              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+              LIMIT 1
+            ),
+            CASE
+              WHEN jsonb_typeof(t.images_json) = 'array'
+              THEN t.images_json->>0
+              ELSE NULL
+            END
+          )
         ) AS image,
         COALESCE(
           (
@@ -13422,7 +13439,11 @@ app.get("/api/public/trending/tvs", async (req, res) => {
             FROM product_images pi
             WHERE pi.product_id = p.id
           ),
-          '[]'::json
+          CASE
+            WHEN jsonb_typeof(t.images_json) = 'array'
+            THEN t.images_json::json
+            ELSE '[]'::json
+          END
         ) AS images,
         COALESCE(
           (
@@ -13513,7 +13534,8 @@ app.get("/api/public/trending/tvs", async (req, res) => {
         t.physical_json,
         t.product_details_json,
         t.in_the_box_json,
-        t.warranty_json
+        t.warranty_json,
+        t.images_json
       ORDER BY
         COALESCE(MAX(ts.manual_priority), 0) DESC,
         COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
