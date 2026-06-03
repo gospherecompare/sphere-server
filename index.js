@@ -1205,6 +1205,53 @@ const stripScoreRecursively = (value) => {
   return cleaned;
 };
 
+const normalizePublicSpecScoreKey = (key) =>
+  String(key || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+
+const PUBLIC_SPEC_SCORE_EXCLUDE_KEYS = new Set([
+  "fieldprofile",
+  "specscoresource",
+  "overallscore",
+  "overallscoresource",
+  "specscorev2raw",
+  "specscorev2",
+  "specscorev2source",
+  "overallscorev2",
+  "overallscorev2source",
+  "specscorev2display8098",
+  "overallscorev2display8098",
+  "specscoredisplay",
+  "overallscoredisplay",
+  "specscoreprice",
+  "specscorepriceband",
+  "specscorefeaturecoverage",
+  "camerascorev2raw",
+  "camerascorev2display8099",
+  "spectierv2",
+  "mandatorycoverage",
+  "displaycoverage",
+  "sectionscores",
+]);
+
+const stripPublicSpecScoreDecorations = (value) => {
+  if (value instanceof Date) return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => stripPublicSpecScoreDecorations(item));
+  }
+  if (!value || typeof value !== "object") return value;
+
+  const cleaned = {};
+  for (const [key, val] of Object.entries(value)) {
+    const normalized = normalizePublicSpecScoreKey(key);
+    if (normalized === "score") continue;
+    if (PUBLIC_SPEC_SCORE_EXCLUDE_KEYS.has(normalized)) continue;
+    cleaned[key] = stripPublicSpecScoreDecorations(val);
+  }
+  return cleaned;
+};
+
 const removeSectionKeyCollisions = (
   rowValue,
   sectionsValue,
@@ -9710,7 +9757,7 @@ app.get("/api/tvs", async (req, res) => {
       "tv",
       (result.rows || []).map((row) => stripScoreRecursively(row || {})),
       profileConfig.profiles,
-    );
+    ).map((row) => stripPublicSpecScoreDecorations(row || {}));
     return res.json({ tvs });
   } catch (err) {
     console.error("GET /api/tvs error:", err);
@@ -10989,7 +11036,7 @@ app.get("/api/tv", authenticate, async (req, res) => {
       "tv",
       (result.rows || []).map((row) => stripScoreRecursively(row || {})),
       profileConfig.profiles,
-    );
+    ).map((row) => stripPublicSpecScoreDecorations(row || {}));
     return res.json({ tvs });
   } catch (err) {
     console.error("GET /api/tv error:", err);
@@ -11096,18 +11143,20 @@ app.get("/api/tvs/:id", authenticate, async (req, res) => {
       ? publishRes.rows[0].is_published
       : false;
 
-    const scoredTv = applySpecScoreToRow(
-      "tv",
-      stripScoreRecursively({
-        ...tv,
-        name: product.name || null,
-        brand_name: product.brand_name || null,
-        images: imagesJson,
-        images_json: imagesJson,
-        variants: variantsJson,
-        variants_json: variantsJson,
-      }),
-      profileConfig.profiles,
+    const scoredTv = stripPublicSpecScoreDecorations(
+      applySpecScoreToRow(
+        "tv",
+        stripScoreRecursively({
+          ...tv,
+          name: product.name || null,
+          brand_name: product.brand_name || null,
+          images: imagesJson,
+          images_json: imagesJson,
+          variants: variantsJson,
+          variants_json: variantsJson,
+        }),
+        profileConfig.profiles,
+      ),
     );
 
     return res.json({
