@@ -3816,6 +3816,26 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
+      ALTER TABLE contact_submissions
+      ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'new';
+    `);
+
+    await safeQuery(`
+      ALTER TABLE contact_submissions
+      ADD COLUMN IF NOT EXISTS admin_notes TEXT;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE contact_submissions
+      ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP;
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_contact_submissions_status
+      ON contact_submissions (status, created_at DESC);
+    `);
+
+    await safeQuery(`
       CREATE TABLE IF NOT EXISTS blogs (
         id SERIAL PRIMARY KEY,
         product_id INT UNIQUE
@@ -6042,6 +6062,228 @@ app.post("/api/change-password", authenticateCustomer, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+/* ---- Contact (Public Submit + Admin Inbox) ---- */
+const CONTACT_SUBJECT_LABELS = {
+  "general-support": "General support",
+  "product-correction": "Product correction",
+  "feature-request": "Feature request",
+  "partnership-inquiry": "Partnership inquiry",
+  "media-press": "Media or press inquiry",
+};
+
+const CONTACT_SUBMISSION_STATUSES = new Set([
+  "new",
+  "in_progress",
+  "resolved",
+  "archived",
+]);
+
+const normalizeContactStatus = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z_]/g, "");
+
+const cleanContactText = (value) => {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text.length ? text : null;
+};
+
+const buildContactSubjectKey = (value) => {
+  const text = cleanContactText(value);
+  if (!text) return null;
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+};
+
+const resolveContactSubjectLabel = (subject, explicitLabel) => {
+  const label = cleanContactText(explicitLabel);
+  if (label) return label;
+  if (subject && CONTACT_SUBJECT_LABELS[subject]) {
+    return CONTACT_SUBJECT_LABELS[subject];
+  }
+  return subject
+    ? String(subject)
+        .replace(/[-_]+/g, " ")
+        .replace(/\b\w/g, (char) => char.toUpperCase())
+    : "Contact request";
+};
+
+app.post("/api/contact-submissions", async (req, res) => {
+  try {
+    const b = req.body || {};
+    const fullName = cleanContactText(b.full_name || b.fullName);
+    const email = cleanContactText(b.email);
+    const subject =
+      buildContactSubjectKey(b.subject) ||
+      buildContactSubjectKey(b.subject_label || b.subjectLabel);
+    const subjectLabel = resolveContactSubjectLabel(
+      subject,
+      b.subject_label || b.subjectLabel,
+    );
+    const message = cleanContactText(b.message);
+    const agreeTerms = Boolean(b.agree_terms ?? b.agreeTerms ?? b.agreed);
+    const source = cleanContactText(b.source || "hooks-web-contact");
+
+    if (!fullName || !email || !subject || !message || !agreeTerms) {
+      return res.status(400).json({
+        message: "full name, email, subject, message and consent are required",
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ message: "Invalid email address" });
+    }
+
+    const inserted = await db.query(
+      `INSERT INTO contact_submissions (
+         full_name, email, subject, subject_label, message,
+         agree_terms, source, payload
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8
+       )
+       RETURNING id, status, created_at`,
+      [
+        fullName,
+        email.toLowerCase(),
+        subject,
+        subjectLabel,
+        message,
+        agreeTerms,
+        source,
+        b,
+      ],
+    );
+
+    return res.status(201).json({
+      message: "Contact request submitted successfully",
+      submission: inserted.rows[0],
+    });
+  } catch (err) {
+    console.error("Create contact submission error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to submit contact request" });
+  }
+});
+
+app.get("/api/admin/contact-submissions", authenticate, async (req, res) => {
+  try {
+    const pageRaw = Number(req.query.page);
+    const limitRaw = Number(req.query.limit);
+    const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+    const limit =
+      Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 100) : 25;
+    const offset = (page - 1) * limit;
+
+    const [rowsResult, countResult] = await Promise.all([
+      db.query(
+        `SELECT id, full_name, email, subject, subject_label, message,
+                agree_terms, source, payload, status, admin_notes,
+                resolved_at, created_at, updated_at
+         FROM contact_submissions
+         ORDER BY created_at DESC
+         LIMIT $1 OFFSET $2`,
+        [limit, offset],
+      ),
+      db.query(`SELECT COUNT(*)::int AS total FROM contact_submissions`),
+    ]);
+
+    return res.json({
+      page,
+      limit,
+      total: countResult.rows[0]?.total || 0,
+      rows: rowsResult.rows,
+    });
+  } catch (err) {
+    console.error("List contact submissions error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to fetch contact submissions" });
+  }
+});
+
+app.patch(
+  "/api/admin/contact-submissions/:id",
+  authenticate,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      const body = req.body || {};
+      const statusProvided = Object.prototype.hasOwnProperty.call(
+        body,
+        "status",
+      );
+      const notesProvided =
+        Object.prototype.hasOwnProperty.call(body, "admin_notes") ||
+        Object.prototype.hasOwnProperty.call(body, "adminNotes");
+      const nextStatus = statusProvided
+        ? normalizeContactStatus(body.status)
+        : null;
+      const adminNotes = notesProvided
+        ? cleanContactText(body.admin_notes ?? body.adminNotes)
+        : null;
+
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ message: "Invalid id" });
+      }
+
+      if (!statusProvided && !notesProvided) {
+        return res.status(400).json({
+          message: "At least one of status or admin_notes is required",
+        });
+      }
+
+      if (statusProvided && !CONTACT_SUBMISSION_STATUSES.has(nextStatus)) {
+        return res.status(400).json({
+          message:
+            "Invalid status. Allowed values: new, in_progress, resolved, archived",
+        });
+      }
+
+      const result = await db.query(
+        `UPDATE contact_submissions
+       SET status = COALESCE($1, status),
+           admin_notes = CASE WHEN $2 THEN $3 ELSE admin_notes END,
+           resolved_at = CASE
+             WHEN COALESCE($1, status) = 'resolved' AND status <> 'resolved'
+               THEN now()
+             WHEN COALESCE($1, status) <> 'resolved'
+               THEN NULL
+             ELSE resolved_at
+           END,
+           updated_at = now()
+       WHERE id = $4
+       RETURNING id, full_name, email, subject, subject_label, message,
+                 agree_terms, source, payload, status, admin_notes,
+                 resolved_at, created_at, updated_at`,
+        [statusProvided ? nextStatus : null, notesProvided, adminNotes, id],
+      );
+
+      if (!result.rows.length) {
+        return res
+          .status(404)
+          .json({ message: "Contact submission not found" });
+      }
+
+      return res.json({
+        message: "Contact submission updated successfully",
+        submission: result.rows[0],
+      });
+    } catch (err) {
+      console.error("Update contact submission error:", err);
+      return res
+        .status(500)
+        .json({ message: "Failed to update contact submission" });
+    }
+  },
+);
 
 /* ---- Careers (Public Apply + Admin View) ---- */
 app.post("/api/careers", async (req, res) => {
@@ -9367,11 +9609,6 @@ app.get("/api/tvs", async (req, res) => {
         t.category,
         t.model,
         COALESCE(pub.is_published, false) AS publish,
-        ds.hook_score,
-        ds.buyer_intent,
-        ds.trend_velocity,
-        ds.freshness,
-        ds.calculated_at AS hook_calculated_at,
 
         t.key_specs_json,
         t.basic_info_json,
@@ -9465,10 +9702,8 @@ app.get("/api/tvs", async (req, res) => {
        AND pub.is_published = true
       LEFT JOIN brands b
         ON b.id = p.brand_id
-      LEFT JOIN product_dynamic_score ds
-        ON ds.product_id = p.id
       WHERE p.product_type = 'tv'
-      ORDER BY COALESCE(ds.hook_score, 0) DESC, p.id DESC
+      ORDER BY p.id DESC
     `);
 
     const tvs = applySpecScoreToRows(
