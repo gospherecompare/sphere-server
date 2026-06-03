@@ -53,7 +53,7 @@ app.set("trust proxy", 1);
 const ALLOWED_ORIGINS = new Set([
   "http://localhost:3000",
   "http://localhost:5173",
-  "https://main.d8c9hzzm0g9ux.amplifyapp.com",
+  "https://www.workspace.tryhook.shop/",
   "https://www.tryhook.shop",
   "https://tryhook.shop",
 ]);
