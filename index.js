@@ -50,22 +50,85 @@ const app = express();
 
 app.set("trust proxy", 1);
 
-const ALLOWED_ORIGINS = new Set([
+const normalizeOrigin = (value) =>
+  String(value || "")
+    .trim()
+    .replace(/\/$/, "");
+
+const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:3000",
   "http://localhost:5173",
   "https://workspace.tryhook.shop",
   "https://www.tryhook.shop",
   "https://tryhook.shop",
-]);
+  "https://www.hooks.in",
+  "https://hooks.in",
+];
+
+const ENV_ALLOWED_ORIGINS = [
+  process.env.PUBLIC_SITE_ORIGIN,
+  process.env.ADMIN_SITE_ORIGIN,
+  process.env.CLIENT_SITE_ORIGIN,
+  process.env.CLIENT_ADMIN_ORIGIN,
+  ...String(
+    process.env.CORS_ALLOWED_ORIGINS ||
+      process.env.ALLOWED_ORIGINS ||
+      process.env.WEBAUTHN_ALLOWED_ORIGINS ||
+      "",
+  ).split(","),
+];
+
+const ALLOWED_ORIGINS = new Set(
+  [...DEFAULT_ALLOWED_ORIGINS, ...ENV_ALLOWED_ORIGINS]
+    .map(normalizeOrigin)
+    .filter(Boolean),
+);
+
+const ALLOWED_ORIGIN_HOST_SUFFIXES = [
+  ".tryhook.shop",
+  ".hooks.in",
+];
+
+const isAllowedOriginHost = (hostname) => {
+  const normalizedHost = String(hostname || "")
+    .trim()
+    .toLowerCase();
+  if (!normalizedHost) return false;
+  if (
+    normalizedHost === "localhost" ||
+    normalizedHost === "127.0.0.1" ||
+    normalizedHost === "::1"
+  ) {
+    return true;
+  }
+  return ALLOWED_ORIGIN_HOST_SUFFIXES.some((suffix) =>
+    normalizedHost.endsWith(suffix),
+  );
+};
+
+const isAllowedCorsOrigin = (origin) => {
+  if (!origin) return true;
+
+  const normalizedOrigin = normalizeOrigin(origin);
+  if (!normalizedOrigin) return true;
+  if (ALLOWED_ORIGINS.has(normalizedOrigin)) return true;
+
+  try {
+    const parsed = new URL(normalizedOrigin);
+    return isAllowedOriginHost(parsed.hostname);
+  } catch (error) {
+    return false;
+  }
+};
 
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow non-browser clients (no Origin header) and explicitly allow known web origins.
+      // Allow non-browser clients and our known first-party origins.
       if (!origin) return callback(null, true);
-      const normalizedOrigin = String(origin).replace(/\/$/, "");
-      if (ALLOWED_ORIGINS.has(normalizedOrigin)) return callback(null, true);
-      return callback(new Error("Not allowed by CORS"));
+      if (isAllowedCorsOrigin(origin)) return callback(null, true);
+      console.warn("CORS blocked origin:", normalizeOrigin(origin));
+      return callback(null, false);
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -4033,11 +4096,6 @@ const PENDING_LOGIN_TOKEN_TTL = `${PENDING_LOGIN_TOKEN_TTL_SECONDS}s`;
 const WEBAUTHN_CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const WEBAUTHN_RP_NAME =
   String(process.env.WEBAUTHN_RP_NAME || "Hooks Admin").trim() || "Hooks Admin";
-
-const normalizeOrigin = (value) =>
-  String(value || "")
-    .trim()
-    .replace(/\/$/, "");
 
 const WEBAUTHN_ALLOWED_ORIGINS = new Set([
   ...Array.from(ALLOWED_ORIGINS).map(normalizeOrigin).filter(Boolean),
@@ -11971,6 +12029,151 @@ app.get("/api/brands", async (req, res) => {
   } catch (err) {
     console.error("GET /api/brands error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/brands/:id/products", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: "Invalid brand id" });
+    }
+
+    const brandRes = await db.query(
+      `
+      SELECT
+        b.id,
+        b.name,
+        b.logo,
+        b.status,
+        MAX(to_jsonb(b)->>'website') AS website,
+        b.description,
+        b.category,
+        b.created_at,
+        COUNT(DISTINCT p.id)::int AS product_count,
+        COUNT(DISTINCT p.id) FILTER (WHERE pp.is_published = true)::int AS published_products
+      FROM brands b
+      LEFT JOIN products p
+        ON p.brand_id = b.id
+      LEFT JOIN product_publish pp
+        ON pp.product_id = p.id
+      WHERE b.id = $1
+      GROUP BY
+        b.id,
+        b.name,
+        b.logo,
+        b.status,
+        b.description,
+        b.category,
+        b.created_at
+      LIMIT 1
+      `,
+      [id],
+    );
+
+    if (!brandRes.rows.length) {
+      return res.status(404).json({ message: "Brand not found" });
+    }
+
+    const productsRes = await db.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        p.product_type,
+        p.created_at AS product_created_at,
+        COALESCE(pp.is_published, false) AS is_published,
+        COALESCE(
+          NULLIF(s.category, ''),
+          NULLIF(t.category, ''),
+          CASE
+            WHEN p.product_type = 'smartphone' THEN 'Smartphones'
+            WHEN p.product_type = 'laptop' THEN 'Laptops'
+            WHEN p.product_type = 'tv' THEN 'TVs'
+            WHEN p.product_type = 'networking' THEN 'Networking'
+            WHEN p.product_type = 'accessories' THEN 'Accessories'
+            ELSE initcap(replace(p.product_type, '_', ' '))
+          END
+        ) AS category,
+        COALESCE(
+          NULLIF(s.model, ''),
+          NULLIF(t.model, ''),
+          NULLIF(n.model_number, ''),
+          NULLIF(l.meta->>'model_name', ''),
+          NULLIF(l.meta->>'model', ''),
+          NULLIF(l.meta->>'series', ''),
+          p.name
+        ) AS model,
+        CASE
+          WHEN s.launch_date IS NOT NULL
+            THEN EXTRACT(YEAR FROM s.launch_date)::int
+          WHEN n.release_year IS NOT NULL
+            THEN n.release_year
+          WHEN COALESCE(
+            l.meta->>'release_year',
+            l.meta->>'launch_year',
+            l.meta->>'year',
+            ''
+          ) ~ '^[0-9]{4}$'
+            THEN COALESCE(
+              l.meta->>'release_year',
+              l.meta->>'launch_year',
+              l.meta->>'year'
+            )::int
+          WHEN COALESCE(
+            t.basic_info_json->>'release_year',
+            t.basic_info_json->>'launch_year',
+            t.basic_info_json->>'year',
+            ''
+          ) ~ '^[0-9]{4}$'
+            THEN COALESCE(
+              t.basic_info_json->>'release_year',
+              t.basic_info_json->>'launch_year',
+              t.basic_info_json->>'year'
+            )::int
+          ELSE NULL
+        END AS release_year,
+        COALESCE(
+          (
+            SELECT pi.image_url
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+            LIMIT 1
+          ),
+          CASE
+            WHEN jsonb_typeof(t.images_json) = 'array'
+            THEN t.images_json->>0
+            ELSE NULL
+          END
+        ) AS image_url
+      FROM products p
+      LEFT JOIN product_publish pp
+        ON pp.product_id = p.id
+      LEFT JOIN smartphones s
+        ON s.product_id = p.id
+      LEFT JOIN tvs t
+        ON t.product_id = p.id
+      LEFT JOIN laptop l
+        ON l.product_id = p.id
+      LEFT JOIN networking n
+        ON n.product_id = p.id
+      WHERE p.brand_id = $1
+      ORDER BY
+        COALESCE(pp.is_published, false) DESC,
+        COALESCE(s.launch_date, t.created_at, l.created_at, p.created_at) DESC,
+        p.id DESC
+      `,
+      [id],
+    );
+
+    return res.json({
+      brand: brandRes.rows[0],
+      products: productsRes.rows || [],
+    });
+  } catch (err) {
+    console.error("GET /api/brands/:id/products error:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
