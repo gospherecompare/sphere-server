@@ -1418,6 +1418,60 @@ const toPublicSmartphoneResponse = (value) => {
   return publicRow;
 };
 
+const PUBLIC_TV_RESPONSE_EXACT_EXCLUDE_KEYS = new Set(
+  PUBLIC_SMARTPHONE_RESPONSE_EXACT_EXCLUDE_KEYS,
+);
+
+const PUBLIC_TV_RESPONSE_NORMALIZED_EXCLUDE_KEYS = new Set([
+  ...PUBLIC_SMARTPHONE_RESPONSE_NORMALIZED_EXCLUDE_KEYS,
+  "views7d",
+  "viewsprev7d",
+  "velocity",
+  "manualboost",
+  "manualpriority",
+  "manualbadge",
+  "trendbadge",
+  "trenddelta",
+  "trendingcalculatedat",
+]);
+
+const stripPublicTvBusinessFields = (value) => {
+  if (value instanceof Date) return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => stripPublicTvBusinessFields(item));
+  }
+  if (!value || typeof value !== "object") return value;
+
+  const cleaned = {};
+  for (const [key, val] of Object.entries(value)) {
+    if (PUBLIC_TV_RESPONSE_EXACT_EXCLUDE_KEYS.has(key)) continue;
+
+    const normalized = normalizePublicSpecScoreKey(key);
+    if (PUBLIC_TV_RESPONSE_NORMALIZED_EXCLUDE_KEYS.has(normalized)) {
+      continue;
+    }
+
+    cleaned[key] = stripPublicTvBusinessFields(val);
+  }
+  return cleaned;
+};
+
+const toPublicTvResponse = (value) => {
+  const withoutBusinessFields = stripPublicTvBusinessFields(value);
+  const resolvedSpecScore = resolvePublicSmartphoneSpecScore(
+    withoutBusinessFields,
+  );
+  const publicRow = stripPublicSpecScoreDecorations(withoutBusinessFields);
+
+  if (resolvedSpecScore != null) {
+    publicRow.spec_score = resolvedSpecScore;
+  } else if (Object.prototype.hasOwnProperty.call(publicRow, "spec_score")) {
+    publicRow.spec_score = toNullableOneDecimalNumber(publicRow.spec_score);
+  }
+
+  return publicRow;
+};
+
 const removeSectionKeyCollisions = (
   rowValue,
   sectionsValue,
@@ -10472,15 +10526,22 @@ app.get("/api/tvs", async (req, res) => {
        AND pub.is_published = true
       LEFT JOIN brands b
         ON b.id = p.brand_id
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
       WHERE p.product_type = 'tv'
-      ORDER BY p.id DESC
+      ORDER BY
+        COALESCE(ds.hook_score, 0) DESC,
+        COALESCE(ds.buyer_intent, 0) DESC,
+        COALESCE(ds.trend_velocity, 0) DESC,
+        COALESCE(ds.freshness, 0) DESC,
+        p.id DESC
     `);
 
     const tvs = applySpecScoreToRows(
       "tv",
       (result.rows || []).map((row) => stripScoreRecursively(row || {})),
       profileConfig.profiles,
-    ).map((row) => stripPublicSpecScoreDecorations(row || {}));
+    ).map((row) => toPublicTvResponse(row || {}));
     return res.json({ tvs });
   } catch (err) {
     console.error("GET /api/tvs error:", err);
@@ -15096,6 +15157,8 @@ app.get("/api/public/trending/tvs", async (req, res) => {
         ON b.id = p.brand_id
       LEFT JOIN product_trending_score ts
         ON ts.product_id = p.id
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
       WHERE p.product_type = 'tv'
       GROUP BY
         p.id,
@@ -15119,6 +15182,10 @@ app.get("/api/public/trending/tvs", async (req, res) => {
         t.warranty_json,
         t.images_json
       ORDER BY
+        COALESCE(MAX(ds.hook_score), 0) DESC,
+        COALESCE(MAX(ds.buyer_intent), 0) DESC,
+        COALESCE(MAX(ds.trend_velocity), 0) DESC,
+        COALESCE(MAX(ds.freshness), 0) DESC,
         COALESCE(MAX(ts.manual_priority), 0) DESC,
         COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
         COALESCE(MAX(ts.trending_score), 0) DESC,
@@ -15172,7 +15239,7 @@ app.get("/api/public/trending/tvs", async (req, res) => {
         };
       }),
       profileConfig.profiles,
-    );
+    ).map((row) => toPublicTvResponse(row || {}));
 
     return res.json({
       period: "7d",
@@ -15510,7 +15577,7 @@ app.get("/api/public/new/tvs", async (req, res) => {
       "tv",
       result.rows || [],
       profileConfig.profiles,
-    );
+    ).map((item) => toPublicTvResponse(item || {}));
 
     return res.json({ new: launches });
   } catch (err) {
