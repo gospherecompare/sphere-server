@@ -15314,6 +15314,32 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
           WHERE v.product_id = p.id
             AND sp.price IS NOT NULL
         ) AS best_price,
+        COALESCE(
+          (
+            SELECT json_agg(
+              jsonb_build_object(
+                'id', v.id,
+                'variant_id', v.id,
+                'variant_key', v.variant_key,
+                'ram', v.attributes->>'ram',
+                'storage', v.attributes->>'storage',
+                'base_price', v.base_price,
+                'store_prices', (
+                  SELECT COALESCE(
+                    json_agg(to_jsonb(sp) ORDER BY sp.price ASC NULLS LAST, sp.id ASC),
+                    '[]'::json
+                  )
+                  FROM variant_store_prices sp
+                  WHERE sp.variant_id = v.id
+                )
+              )
+              ORDER BY v.id ASC
+            )
+            FROM product_variants v
+            WHERE v.product_id = p.id
+          ),
+          '[]'::json
+        ) AS variants,
         COALESCE(MAX(ds.hook_score), 0) AS hook_score,
         COALESCE(MAX(ds.buyer_intent), 0) AS buyer_intent,
         COALESCE(MAX(ds.trend_velocity), 0) AS trend_velocity,
@@ -15368,25 +15394,27 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
     const todayIndia = getIndiaDateOnly();
     const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
     const rows = (result.rows || []).map((row) => {
-      const launchStage = resolveSmartphoneLaunchStage(
-        {
-          launch_status_override: row?.launch_status_override ?? null,
-          launch_date: row?.launch_date ?? null,
-          sale_start_date: row?.sale_start_date ?? null,
+      const variants = (Array.isArray(row?.variants) ? row.variants : []).map(
+        (variant) => {
+          const variantObj = toPlainObject(variant);
+          return {
+            ...variantObj,
+            id: variantObj.id ?? variantObj.variant_id ?? null,
+            variant_id: variantObj.variant_id ?? variantObj.id ?? null,
+            store_prices: decorateStorePriceList(
+              Array.isArray(variantObj.store_prices)
+                ? variantObj.store_prices
+                : [],
+              todayIndia,
+            ),
+          };
         },
-        todayIndia,
       );
-      const saleStage = resolveSmartphoneSaleStage(
-        {
-          launch_status_override: row?.launch_status_override ?? null,
-          launch_date: row?.launch_date ?? null,
-          sale_start_date: row?.sale_start_date ?? null,
-          variants: [],
-        },
-        todayIndia,
-      );
-
-      return {
+      const bestPrice =
+        row.best_price !== null && row.best_price !== undefined
+          ? Number(row.best_price)
+          : resolveEffectiveSmartphonePrice(variants, null);
+      const base = {
         product_id: Number(row.product_id),
         id: Number(row.product_id),
         name: row.name || row.model || "Smartphone",
@@ -15395,16 +15423,16 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
         brand_name: row.brand_name || null,
         brand_logo: row.brand_logo || null,
         brand_logo_url: row.brand_logo || null,
-        launch_status: launchStage,
         launch_status_override: row.launch_status_override || null,
         official_preorder_url: row.official_preorder_url || null,
-        sale_start_date: row.sale_start_date || null,
-        best_price:
-          row.best_price !== null && row.best_price !== undefined
-            ? Number(row.best_price)
-            : null,
-        sale_status: saleStage,
-        is_prebooking: saleStage === "preorder" || saleStage === "sale_scheduled",
+        sale_start_date:
+          getEarliestSaleStartDateFromVariants(variants) ||
+          row.sale_start_date ||
+          null,
+        price: bestPrice,
+        starting_price: bestPrice,
+        best_price: bestPrice,
+        variants,
         hook_score: toFiniteNumber(row.hook_score),
         buyer_intent: toFiniteNumber(row.buyer_intent),
         trend_velocity: toFiniteNumber(row.trend_velocity),
@@ -15412,11 +15440,18 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
         has_purchase_signal: Boolean(row.has_purchase_signal),
       };
 
-      return applySmartphoneAvailabilityDetails(
-        base,
-        availabilityForecast,
-        todayIndia,
-      );
+      applySmartphoneAvailabilityDetails(base, availabilityForecast, todayIndia);
+      const launchStage = resolveSmartphoneLaunchStage(base, todayIndia);
+      const saleStage = resolveSmartphoneSaleStage(base, todayIndia);
+      base.launch_status = launchStage;
+      base.launchStatus = launchStage;
+      base.sale_status = saleStage;
+      base.saleStatus = saleStage;
+      base.is_prebooking =
+        saleStage === "preorder" || saleStage === "sale_scheduled";
+      applySmartphoneLaunchPolicy(base, launchStage);
+
+      return base;
     });
 
     const compareDescendingSignals =
@@ -15486,8 +15521,12 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
     const upcomingPhones = [...rows]
       .filter((item) => isSmartphoneUpcomingFeedItem(item, todayIndia))
       .sort((left, right) => {
-        const leftDate = toDateMs(left.sale_start_date || null);
-        const rightDate = toDateMs(right.sale_start_date || null);
+        const leftDate = toDateMs(
+          left.available_date || left.sale_start_date || null,
+        );
+        const rightDate = toDateMs(
+          right.available_date || right.sale_start_date || null,
+        );
         if (leftDate != null && rightDate != null && leftDate !== rightDate) {
           return leftDate - rightDate;
         }
@@ -15550,21 +15589,6 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
       {
         label: "Upcoming Phones",
         phones: sanitizePhones(upcomingPhones),
-      },
-      {
-        label: "Highest Hook Scores",
-        phones: sanitizePhones(
-          [...rows]
-            .filter((item) => item.hook_score > 0)
-            .sort(
-              compareDescendingSignals(
-                (item) => item.hook_score,
-                (item) => item.buyer_intent,
-                (item) => item.trend_velocity,
-                (item) => item.freshness,
-              ),
-            ),
-        ),
       },
     ].filter((row) => row.phones.length > 0);
 
