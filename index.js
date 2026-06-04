@@ -4205,6 +4205,40 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
+      CREATE TABLE IF NOT EXISTS compare_pages (
+        id SERIAL PRIMARY KEY,
+        compare_key TEXT NOT NULL UNIQUE,
+        primary_product_id INT REFERENCES products(id) ON DELETE SET NULL,
+        items JSONB NOT NULL DEFAULT '[]'::jsonb,
+        segment_label TEXT,
+        smartphone_type_label TEXT,
+        slug TEXT,
+        title TEXT,
+        meta_description TEXT,
+        status TEXT NOT NULL DEFAULT 'published',
+        source TEXT NOT NULL DEFAULT 'manual',
+        generation_reason TEXT,
+        system_score NUMERIC NOT NULL DEFAULT 0,
+        manual_compare_count INT NOT NULL DEFAULT 0,
+        last_compared_at TIMESTAMP,
+        generated_at TIMESTAMP,
+        route_path TEXT,
+        updated_at TIMESTAMP DEFAULT now(),
+        published_at TIMESTAMP
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_compare_pages_updated_at
+      ON compare_pages (updated_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_compare_pages_status_source
+      ON compare_pages (status, source);
+    `);
+
+    await safeQuery(`
       CREATE TABLE IF NOT EXISTS device_field_profiles_config (
         id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
         profiles JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -13541,6 +13575,151 @@ app.get(
   },
 );
 
+app.get("/api/reports/launch-timing", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const limitRaw = Number(req.query?.limit ?? 1000);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(5000, Math.max(1, Math.floor(limitRaw)))
+      : 1000;
+
+    const result = await db.query(
+      `
+      WITH launch_rows AS (
+        SELECT
+          p.id AS product_id,
+          p.name AS product_name,
+          p.product_type,
+          b.name AS brand_name,
+          COALESCE(
+            NULLIF(s.category, ''),
+            NULLIF(t.category, ''),
+            NULLIF(l.meta->>'category', ''),
+            'Uncategorized'
+          ) AS category,
+          COALESCE(
+            s.launch_date::date,
+            l.created_at::date,
+            t.created_at::date,
+            p.created_at::date
+          ) AS launch_date,
+          (
+            SELECT MIN(sp.sale_start_date)
+            FROM product_variants pv
+            INNER JOIN variant_store_prices sp
+              ON sp.variant_id = pv.id
+            WHERE pv.product_id = p.id
+              AND sp.sale_start_date IS NOT NULL
+          ) AS sale_start_date,
+          (
+            SELECT MIN(sp.price)::numeric
+            FROM product_variants pv
+            INNER JOIN variant_store_prices sp
+              ON sp.variant_id = pv.id
+            WHERE pv.product_id = p.id
+              AND sp.price IS NOT NULL
+          ) AS best_price,
+          (
+            SELECT pi.image_url
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+            LIMIT 1
+          ) AS image_url,
+          COALESCE(ts.trending_score, 0) AS trending_score,
+          COALESCE(ts.views_7d, 0) AS views_7d,
+          COALESCE(ts.compares_7d, 0) AS compares_7d,
+          COALESCE(ts.views_prev_7d, 0) AS views_prev_7d,
+          COALESCE(ts.velocity, 0) AS velocity,
+          COALESCE(ts.manual_boost, false) AS manual_boost,
+          COALESCE(ts.manual_priority, 0) AS manual_priority,
+          ts.manual_badge,
+          ts.calculated_at AS trending_calculated_at,
+          COALESCE(ds.buyer_intent, 0) AS buyer_intent,
+          COALESCE(ds.hook_score, 0) AS hook_score,
+          COALESCE(ds.trend_velocity, 0) AS trend_velocity,
+          COALESCE(ds.freshness, 0) AS freshness,
+          ds.calculated_at AS dynamic_calculated_at
+        FROM products p
+        INNER JOIN product_publish pub
+          ON pub.product_id = p.id
+         AND pub.is_published = true
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        LEFT JOIN smartphones s
+          ON s.product_id = p.id
+        LEFT JOIN laptop l
+          ON l.product_id = p.id
+        LEFT JOIN tvs t
+          ON t.product_id = p.id
+        LEFT JOIN product_trending_score ts
+          ON ts.product_id = p.id
+        LEFT JOIN product_dynamic_score ds
+          ON ds.product_id = p.id
+        WHERE p.product_type IN ('smartphone', 'laptop', 'tv')
+      )
+      SELECT
+        *,
+        CASE
+          WHEN launch_date IS NOT NULL AND sale_start_date IS NOT NULL
+            THEN (sale_start_date::date - launch_date::date)
+          ELSE NULL
+        END AS sale_gap_days
+      FROM launch_rows
+      ORDER BY launch_date DESC NULLS LAST, product_id DESC
+      LIMIT $1
+      `,
+      [limit],
+    );
+
+    const devices = (result.rows || []).map((row) => ({
+      id: Number(row.product_id),
+      product_id: Number(row.product_id),
+      product_type: row.product_type || "smartphone",
+      brand_name: row.brand_name || null,
+      category: row.category || "Uncategorized",
+      name: row.product_name || "Device",
+      product_name: row.product_name || "Device",
+      launch_date: row.launch_date ? String(row.launch_date).slice(0, 10) : null,
+      sale_start_date: row.sale_start_date
+        ? String(row.sale_start_date).slice(0, 10)
+        : null,
+      sale_gap_days:
+        row.sale_gap_days !== null && row.sale_gap_days !== undefined
+          ? Number(row.sale_gap_days)
+          : null,
+      image_url: row.image_url || null,
+      best_price: row.best_price !== null ? Number(row.best_price) : null,
+      trending_score: Number(row.trending_score) || 0,
+      views_7d: Number(row.views_7d) || 0,
+      compares_7d: Number(row.compares_7d) || 0,
+      views_prev_7d: Number(row.views_prev_7d) || 0,
+      velocity: Number(row.velocity) || 0,
+      manual_boost: Boolean(row.manual_boost),
+      manual_priority: Number(row.manual_priority) || 0,
+      manual_badge: row.manual_badge || null,
+      trending_calculated_at: row.trending_calculated_at || null,
+      buyer_intent: Number(row.buyer_intent) || 0,
+      hook_score: Number(row.hook_score) || 0,
+      trend_velocity: Number(row.trend_velocity) || 0,
+      freshness: Number(row.freshness) || 0,
+      dynamic_calculated_at: row.dynamic_calculated_at || null,
+    }));
+
+    return res.json({
+      generated_at: new Date().toISOString(),
+      devices,
+      data: devices,
+    });
+  } catch (err) {
+    console.error("GET /api/reports/launch-timing error:", err);
+    return res.status(500).json({ message: "Failed to load launch timing report" });
+  }
+});
+
 // Record a product view (public)
 
 app.post("/api/public/product/:id/view", async (req, res) => {
@@ -16629,7 +16808,10 @@ const buildComparePagePayload = (items = [], options = {}) => {
     meta_description:
       String(options.metaDescription || "").trim() ||
       buildComparePageDescription({ items: normalizedItems, segmentLabel }),
-    status: "published",
+    status:
+      String(options.status || "published").trim().toLowerCase() === "draft"
+        ? "draft"
+        : "published",
     source: String(options.source || "automatic").trim().toLowerCase(),
     generation_reason:
       String(options.generationReason || "User Comparison Trend").trim(),
@@ -17033,6 +17215,820 @@ app.get("/api/admin/search-popularity", authenticate, async (req, res) => {
   } catch (err) {
     console.error("GET /api/admin/search-popularity error:", err);
     return res.status(500).json({ message: "Failed to load search popularity" });
+  }
+});
+
+const parseComparePageItems = (items) => {
+  if (Array.isArray(items)) return items;
+  if (typeof items === "string") {
+    try {
+      const parsed = JSON.parse(items);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+};
+
+const normalizeComparePageItem = (item, positionFallback = 1) => {
+  if (!item || typeof item !== "object") return null;
+
+  const productId = Number(item?.product_id ?? item?.productId ?? item?.id);
+  if (!Number.isInteger(productId) || productId <= 0) return null;
+
+  const productType =
+    normalizePopularityProductType(item?.product_type ?? item?.productType) ||
+    "smartphone";
+  const productName = String(
+    item?.product_name || item?.name || item?.title || "Device",
+  ).trim();
+
+  return {
+    product_id: productId,
+    product_name: productName,
+    product_type: productType,
+    brand_name: String(item?.brand_name || item?.brand || "").trim(),
+    best_price: toSafeNumeric(item?.best_price ?? item?.bestPrice ?? item?.price),
+    image_url: String(item?.image_url || item?.image || "").trim() || null,
+    detail_path:
+      String(item?.detail_path || item?.detailPath || "").trim() ||
+      buildPublicProductDetailPath(productType, productName, productId),
+    position: Number(item?.position) || positionFallback,
+  };
+};
+
+const normalizeComparePageRecord = (row) => {
+  if (!row) return null;
+  const items = parseComparePageItems(row.items)
+    .map((item, index) => normalizeComparePageItem(item, index + 1))
+    .filter(Boolean);
+
+  const primaryProductId =
+    Number(row.primary_product_id ?? row.primaryProductId) ||
+    items[0]?.product_id ||
+    null;
+
+  return {
+    id: Number(row.id) || null,
+    items,
+    primary_product_id: primaryProductId,
+    compare_key: String(row.compare_key || row.compareKey || "").trim(),
+    segment_label: String(row.segment_label || row.segmentLabel || "").trim(),
+    smartphone_type_label: String(
+      row.smartphone_type_label || row.smartphoneTypeLabel || "",
+    ).trim(),
+    slug: String(row.slug || "").trim(),
+    title: String(row.title || "").trim(),
+    meta_description: String(row.meta_description || row.metaDescription || "").trim(),
+    status:
+      String(row.status || "published").trim().toLowerCase() === "draft"
+        ? "draft"
+        : "published",
+    source:
+      String(row.source || "manual").trim().toLowerCase() === "automatic"
+        ? "automatic"
+        : "manual",
+    generation_reason: String(
+      row.generation_reason || row.generationReason || "",
+    ).trim(),
+    system_score: toSafeNumeric(row.system_score ?? row.systemScore) || 0,
+    manual_compare_count:
+      Number(row.manual_compare_count ?? row.manualCompareCount) || 0,
+    last_compared_at: row.last_compared_at ?? row.lastComparedAt ?? null,
+    generated_at: row.generated_at ?? row.generatedAt ?? null,
+    route_path: String(row.route_path || row.routePath || "").trim() ||
+      (row.slug ? `/compare/${String(row.slug).trim()}` : "/compare"),
+    updated_at: row.updated_at ?? row.updatedAt ?? null,
+    published_at: row.published_at ?? row.publishedAt ?? null,
+  };
+};
+
+const fetchComparePageProductsByIds = async (productIds = []) => {
+  const ids = Array.from(
+    new Set(
+      (Array.isArray(productIds) ? productIds : [])
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  );
+
+  if (!ids.length) return [];
+
+  const result = await db.query(
+    `
+    SELECT
+      p.id AS product_id,
+      p.name AS product_name,
+      p.product_type,
+      b.name AS brand_name,
+      COALESCE(
+        (
+          SELECT MIN(sp.price)::numeric
+          FROM product_variants pv
+          INNER JOIN variant_store_prices sp
+            ON sp.variant_id = pv.id
+          WHERE pv.product_id = p.id
+            AND sp.price IS NOT NULL
+        ),
+        (
+          SELECT MIN(pv.base_price)::numeric
+          FROM product_variants pv
+          WHERE pv.product_id = p.id
+            AND pv.base_price IS NOT NULL
+        )
+      ) AS best_price,
+      (
+        SELECT pi.image_url
+        FROM product_images pi
+        WHERE pi.product_id = p.id
+        ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+        LIMIT 1
+      ) AS image_url
+    FROM products p
+    INNER JOIN product_publish pub
+      ON pub.product_id = p.id
+     AND pub.is_published = true
+    LEFT JOIN brands b
+      ON b.id = p.brand_id
+    WHERE p.product_type = 'smartphone'
+      AND p.id = ANY($1::int[])
+    ORDER BY array_position($1::int[], p.id)
+    `,
+    [ids],
+  );
+
+  return (result.rows || []).map((row) => ({
+    product_id: Number(row.product_id),
+    product_name: row.product_name || "Device",
+    product_type: row.product_type || "smartphone",
+    brand_name: row.brand_name || null,
+    best_price: toSafeNumeric(row.best_price),
+    image_url: row.image_url || null,
+  }));
+};
+
+const fetchAutomaticComparePageCandidates = async ({
+  days = 180,
+  limit = 100,
+} = {}) => {
+  const safeDays = Number.isFinite(Number(days))
+    ? Math.min(365, Math.max(7, Math.floor(Number(days))))
+    : 180;
+  const safeLimit = Number.isFinite(Number(limit))
+    ? Math.min(300, Math.max(1, Math.floor(Number(limit))))
+    : 100;
+
+  const result = await db.query(
+    `
+    WITH pair_counts AS (
+      SELECT
+        LEAST(pc.product_id, pc.compared_with) AS left_product_id,
+        GREATEST(pc.product_id, pc.compared_with) AS right_product_id,
+        COUNT(*)::int AS compare_count,
+        MAX(pc.compared_at) AS last_compared_at
+      FROM product_comparisons pc
+      WHERE pc.compared_at >= now() - make_interval(days => $1::int)
+      GROUP BY 1, 2
+    )
+    SELECT
+      pair_counts.left_product_id,
+      pair_counts.right_product_id,
+      pair_counts.compare_count,
+      pair_counts.last_compared_at,
+      p1.name AS left_product_name,
+      p1.product_type AS left_product_type,
+      b1.name AS left_brand_name,
+      p2.name AS right_product_name,
+      p2.product_type AS right_product_type,
+      b2.name AS right_brand_name,
+      COALESCE(
+        (
+          SELECT MIN(sp.price)::numeric
+          FROM product_variants pv
+          INNER JOIN variant_store_prices sp
+            ON sp.variant_id = pv.id
+          WHERE pv.product_id = p1.id
+            AND sp.price IS NOT NULL
+        ),
+        (
+          SELECT MIN(pv.base_price)::numeric
+          FROM product_variants pv
+          WHERE pv.product_id = p1.id
+            AND pv.base_price IS NOT NULL
+        )
+      ) AS left_best_price,
+      COALESCE(
+        (
+          SELECT MIN(sp.price)::numeric
+          FROM product_variants pv
+          INNER JOIN variant_store_prices sp
+            ON sp.variant_id = pv.id
+          WHERE pv.product_id = p2.id
+            AND sp.price IS NOT NULL
+        ),
+        (
+          SELECT MIN(pv.base_price)::numeric
+          FROM product_variants pv
+          WHERE pv.product_id = p2.id
+            AND pv.base_price IS NOT NULL
+        )
+      ) AS right_best_price,
+      (
+        SELECT pi.image_url
+        FROM product_images pi
+        WHERE pi.product_id = p1.id
+        ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+        LIMIT 1
+      ) AS left_image_url,
+      (
+        SELECT pi.image_url
+        FROM product_images pi
+        WHERE pi.product_id = p2.id
+        ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+        LIMIT 1
+      ) AS right_image_url
+    FROM pair_counts
+    INNER JOIN products p1
+      ON p1.id = pair_counts.left_product_id
+    INNER JOIN products p2
+      ON p2.id = pair_counts.right_product_id
+    INNER JOIN product_publish pub1
+      ON pub1.product_id = p1.id
+     AND pub1.is_published = true
+    INNER JOIN product_publish pub2
+      ON pub2.product_id = p2.id
+     AND pub2.is_published = true
+    LEFT JOIN brands b1
+      ON b1.id = p1.brand_id
+    LEFT JOIN brands b2
+      ON b2.id = p2.brand_id
+    WHERE p1.product_type = 'smartphone'
+      AND p2.product_type = 'smartphone'
+    ORDER BY
+      pair_counts.compare_count DESC,
+      pair_counts.last_compared_at DESC,
+      p1.id DESC,
+      p2.id DESC
+    LIMIT $2
+    `,
+    [safeDays, safeLimit],
+  );
+
+  return (result.rows || [])
+    .map((row) =>
+      buildComparePagePayload(
+        [
+          {
+            product_id: row.left_product_id,
+            product_name: row.left_product_name,
+            product_type: row.left_product_type,
+            brand_name: row.left_brand_name,
+            best_price: row.left_best_price,
+            image_url: row.left_image_url,
+          },
+          {
+            product_id: row.right_product_id,
+            product_name: row.right_product_name,
+            product_type: row.right_product_type,
+            brand_name: row.right_brand_name,
+            best_price: row.right_best_price,
+            image_url: row.right_image_url,
+          },
+        ],
+        {
+          source: "automatic",
+          generationReason: "User Comparison Trend",
+          manualCompareCount: row.compare_count,
+          lastComparedAt: row.last_compared_at,
+          generatedAt: new Date().toISOString(),
+          updatedAt: row.last_compared_at,
+          publishedAt: row.last_compared_at,
+          systemScore: row.compare_count,
+        },
+      ),
+    )
+    .filter(Boolean)
+    .slice(0, safeLimit);
+};
+
+const toComparePageDbValues = (page, nowIso = new Date().toISOString()) => [
+  String(page.compare_key || "").trim(),
+  Number.isInteger(Number(page.primary_product_id))
+    ? Number(page.primary_product_id)
+    : null,
+  JSON.stringify(Array.isArray(page.items) ? page.items : []),
+  String(page.segment_label || "").trim() || null,
+  String(page.smartphone_type_label || "").trim() || null,
+  String(page.slug || "").trim() || null,
+  String(page.title || "").trim() || null,
+  String(page.meta_description || "").trim() || null,
+  String(page.status || "published").trim().toLowerCase() === "draft"
+    ? "draft"
+    : "published",
+  String(page.source || "manual").trim().toLowerCase() === "automatic"
+    ? "automatic"
+    : "manual",
+  String(page.generation_reason || "").trim() || null,
+  Number.isFinite(Number(page.system_score)) ? Number(page.system_score) : 0,
+  Number.isFinite(Number(page.manual_compare_count))
+    ? Number(page.manual_compare_count)
+    : 0,
+  page.last_compared_at || null,
+  page.generated_at || nowIso,
+  page.route_path ||
+    (page.slug ? `/compare/${String(page.slug).trim()}` : "/compare"),
+  page.updated_at || nowIso,
+  page.published_at || page.updated_at || page.generated_at || nowIso,
+];
+
+const persistComparePageRecord = async (page) => {
+  if (!page || !page.compare_key) return null;
+
+  const nowIso = new Date().toISOString();
+  const values = toComparePageDbValues(page, nowIso);
+  const pageId = Number(page.id);
+
+  if (Number.isInteger(pageId) && pageId > 0) {
+    const updateResult = await db.query(
+      `
+      UPDATE compare_pages
+      SET
+        compare_key = $2,
+        primary_product_id = $3,
+        items = $4::jsonb,
+        segment_label = $5,
+        smartphone_type_label = $6,
+        slug = $7,
+        title = $8,
+        meta_description = $9,
+        status = $10,
+        source = $11,
+        generation_reason = $12,
+        system_score = $13,
+        manual_compare_count = $14,
+        last_compared_at = $15,
+        generated_at = $16,
+        route_path = $17,
+        updated_at = $18,
+        published_at = $19
+      WHERE id = $1
+      RETURNING *;
+      `,
+      [pageId, ...values],
+    );
+
+    if (updateResult.rows?.[0]) return normalizeComparePageRecord(updateResult.rows[0]);
+  }
+
+  const result = await db.query(
+    `
+    INSERT INTO compare_pages (
+      compare_key,
+      primary_product_id,
+      items,
+      segment_label,
+      smartphone_type_label,
+      slug,
+      title,
+      meta_description,
+      status,
+      source,
+      generation_reason,
+      system_score,
+      manual_compare_count,
+      last_compared_at,
+      generated_at,
+      route_path,
+      updated_at,
+      published_at
+    ) VALUES (
+      $1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18
+    )
+    ON CONFLICT (compare_key) DO UPDATE SET
+      primary_product_id = EXCLUDED.primary_product_id,
+      items = EXCLUDED.items,
+      segment_label = EXCLUDED.segment_label,
+      smartphone_type_label = EXCLUDED.smartphone_type_label,
+      slug = EXCLUDED.slug,
+      title = EXCLUDED.title,
+      meta_description = EXCLUDED.meta_description,
+      status = EXCLUDED.status,
+      source = EXCLUDED.source,
+      generation_reason = EXCLUDED.generation_reason,
+      system_score = EXCLUDED.system_score,
+      manual_compare_count = EXCLUDED.manual_compare_count,
+      last_compared_at = EXCLUDED.last_compared_at,
+      generated_at = EXCLUDED.generated_at,
+      route_path = EXCLUDED.route_path,
+      updated_at = EXCLUDED.updated_at,
+      published_at = EXCLUDED.published_at
+    WHERE compare_pages.source <> 'manual' OR EXCLUDED.source = 'manual'
+    RETURNING *;
+    `,
+    values,
+  );
+
+  if (result.rows?.[0]) return normalizeComparePageRecord(result.rows[0]);
+
+  const fallback = await db.query(
+    `SELECT * FROM compare_pages WHERE compare_key = $1 LIMIT 1`,
+    [values[0]],
+  );
+  return normalizeComparePageRecord(fallback.rows?.[0] || null);
+};
+
+const syncAutomaticComparePages = async ({
+  days = 180,
+  limit = 100,
+} = {}) => {
+  const pages = await fetchAutomaticComparePageCandidates({ days, limit });
+  const generatedKeys = pages.map((page) => String(page.compare_key || "").trim()).filter(Boolean);
+
+  for (const page of pages) {
+    // Automatic pages stay fresh, but manual edits always win because the
+    // upsert skips rows whose stored source is already manual.
+    await persistComparePageRecord(page);
+  }
+
+  if (generatedKeys.length) {
+    await db.query(
+      `
+      DELETE FROM compare_pages
+      WHERE source = 'automatic'
+        AND NOT (compare_key = ANY($1::text[]))
+      `,
+      [generatedKeys],
+    );
+  } else {
+    await db.query(`DELETE FROM compare_pages WHERE source = 'automatic'`);
+  }
+
+  return {
+    generated: pages.length,
+    keys: generatedKeys,
+  };
+};
+
+const requireAdminAccess = (req, res) => {
+  if (req.user?.role !== "admin") {
+    res.status(403).json({ message: "Admin access required" });
+    return false;
+  }
+  return true;
+};
+
+const extractComparePageProductIds = (body = {}) => {
+  const sourceItems = Array.isArray(body.items) ? body.items : [];
+  const rawIds = Array.isArray(body.product_ids)
+    ? body.product_ids
+    : Array.isArray(body.productIds)
+      ? body.productIds
+      : sourceItems.map(
+          (item) => item?.product_id ?? item?.productId ?? item?.id,
+        );
+
+  return Array.from(
+    new Set(
+      rawIds
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  );
+};
+
+const fetchComparePageRecordById = async (pageId) => {
+  const id = Number(pageId);
+  if (!Number.isInteger(id) || id <= 0) return null;
+
+  const result = await db.query(`SELECT * FROM compare_pages WHERE id = $1 LIMIT 1`, [
+    id,
+  ]);
+  return normalizeComparePageRecord(result.rows?.[0] || null);
+};
+
+const fetchComparePageRecordByProductId = async (productId) => {
+  const id = Number(productId);
+  if (!Number.isInteger(id) || id <= 0) return null;
+
+  const result = await db.query(
+    `
+    SELECT *
+    FROM compare_pages
+    WHERE primary_product_id = $1
+       OR EXISTS (
+         SELECT 1
+         FROM jsonb_array_elements(COALESCE(items, '[]'::jsonb)) item
+         WHERE item->>'product_id' = $1::text
+       )
+    ORDER BY
+      CASE WHEN primary_product_id = $1 THEN 0 ELSE 1 END,
+      CASE WHEN source = 'manual' THEN 0 ELSE 1 END,
+      updated_at DESC NULLS LAST,
+      id DESC
+    LIMIT 1
+    `,
+    [id],
+  );
+
+  return normalizeComparePageRecord(result.rows?.[0] || null);
+};
+
+const buildComparePageFromBody = async (body = {}, existingPage = null) => {
+  const existingItemIds = Array.isArray(existingPage?.items)
+    ? existingPage.items
+        .map((item) => Number(item?.product_id ?? item?.productId ?? item?.id))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    : [];
+  const productIds = extractComparePageProductIds(body);
+  const selectedIds = productIds.length ? productIds : existingItemIds;
+  const products = await fetchComparePageProductsByIds(selectedIds);
+
+  if (products.length < 2) return null;
+
+  const nowIso = new Date().toISOString();
+  return buildComparePagePayload(products, {
+    id: existingPage?.id ?? null,
+    primaryProductId:
+      body.primary_product_id ??
+      body.primaryProductId ??
+      existingPage?.primary_product_id ??
+      null,
+    segmentLabel:
+      body.segment_label || body.segmentLabel || existingPage?.segment_label || "",
+    smartphoneTypeLabel:
+      body.smartphone_type_label ||
+      body.smartphoneTypeLabel ||
+      existingPage?.smartphone_type_label ||
+      "",
+    slug: body.slug || existingPage?.slug || "",
+    title: body.title || existingPage?.title || "",
+    metaDescription:
+      body.meta_description || body.metaDescription || existingPage?.meta_description || "",
+    status: body.status || existingPage?.status || "published",
+    source: body.source || existingPage?.source || "manual",
+    generationReason:
+      body.generation_reason ||
+      body.generationReason ||
+      existingPage?.generation_reason ||
+      "",
+    systemScore:
+      body.system_score ?? body.systemScore ?? existingPage?.system_score ?? 0,
+    manualCompareCount:
+      body.manual_compare_count ??
+      body.manualCompareCount ??
+      existingPage?.manual_compare_count ??
+      0,
+    lastComparedAt:
+      body.last_compared_at ?? body.lastComparedAt ?? existingPage?.last_compared_at ?? null,
+    generatedAt: body.generated_at ?? body.generatedAt ?? existingPage?.generated_at ?? nowIso,
+    updatedAt: nowIso,
+    publishedAt:
+      body.published_at ?? body.publishedAt ?? existingPage?.published_at ?? nowIso,
+  });
+};
+
+const fetchComparePageSuggestionsForProduct = async ({
+  productId,
+  days = 180,
+  limit = 5,
+} = {}) => {
+  const id = Number(productId);
+  if (!Number.isInteger(id) || id <= 0) {
+    return { existingPage: null, suggestions: [] };
+  }
+
+  const safeDays = Number.isFinite(Number(days))
+    ? Math.min(365, Math.max(7, Math.floor(Number(days))))
+    : 180;
+  const safeLimit = Number.isFinite(Number(limit))
+    ? Math.min(10, Math.max(1, Math.floor(Number(limit))))
+    : 5;
+
+  const pairs = await db.query(
+    `
+    WITH pair_counts AS (
+      SELECT
+        CASE
+          WHEN pc.product_id = $1 THEN pc.compared_with
+          ELSE pc.product_id
+        END AS other_product_id,
+        COUNT(*)::int AS compare_count,
+        MAX(pc.compared_at) AS last_compared_at
+      FROM product_comparisons pc
+      WHERE (pc.product_id = $1 OR pc.compared_with = $1)
+        AND pc.compared_at >= now() - make_interval(days => $2::int)
+      GROUP BY 1
+    )
+    SELECT other_product_id, compare_count, last_compared_at
+    FROM pair_counts
+    WHERE other_product_id IS NOT NULL
+      AND other_product_id <> $1
+    ORDER BY compare_count DESC, last_compared_at DESC, other_product_id DESC
+    LIMIT $3
+    `,
+    [id, safeDays, safeLimit],
+  );
+
+  const candidateIds = (pairs.rows || [])
+    .map((row) => Number(row.other_product_id))
+    .filter((value) => Number.isInteger(value) && value > 0);
+  const suggestions = await fetchComparePageProductsByIds(candidateIds);
+  const existingPage = await fetchComparePageRecordByProductId(id);
+
+  return { existingPage, suggestions };
+};
+
+app.get("/api/admin/compare-pages", authenticate, async (req, res) => {
+  try {
+    if (!requireAdminAccess(req, res)) return;
+
+    const limitRaw = Number(req.query?.limit ?? 100);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(500, Math.max(1, Math.floor(limitRaw)))
+      : 100;
+
+    const result = await db.query(
+      `
+      SELECT *
+      FROM compare_pages
+      ORDER BY updated_at DESC NULLS LAST, id DESC
+      LIMIT $1
+      `,
+      [limit],
+    );
+
+    const pages = (result.rows || [])
+      .map((row) => normalizeComparePageRecord(row))
+      .filter(Boolean);
+
+    return res.json({
+      generated_at: new Date().toISOString(),
+      pages,
+      data: pages,
+    });
+  } catch (err) {
+    console.error("GET /api/admin/compare-pages error:", err);
+    return res.status(500).json({ message: "Failed to load compare pages" });
+  }
+});
+
+app.get("/api/admin/compare-pages/suggestions/:productId", authenticate, async (req, res) => {
+  try {
+    if (!requireAdminAccess(req, res)) return;
+
+    const productId = Number(req.params.productId);
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ message: "Invalid product id" });
+    }
+
+    const daysRaw = Number(req.query?.days ?? 180);
+    const limitRaw = Number(req.query?.limit ?? 5);
+    const { existingPage, suggestions } = await fetchComparePageSuggestionsForProduct({
+      productId,
+      days: Number.isFinite(daysRaw) ? daysRaw : 180,
+      limit: Number.isFinite(limitRaw) ? limitRaw : 5,
+    });
+
+    return res.json({
+      product_id: productId,
+      existing_page: existingPage,
+      suggestions,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("GET /api/admin/compare-pages/suggestions/:productId error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to load compare page suggestions" });
+  }
+});
+
+app.post("/api/admin/compare-pages/auto-sync", authenticate, async (req, res) => {
+  try {
+    if (!requireAdminAccess(req, res)) return;
+
+    const daysRaw = Number(req.body?.days ?? req.query?.days ?? 180);
+    const limitRaw = Number(req.body?.limit ?? req.query?.limit ?? 100);
+    const result = await syncAutomaticComparePages({
+      days: Number.isFinite(daysRaw) ? daysRaw : 180,
+      limit: Number.isFinite(limitRaw) ? limitRaw : 100,
+    });
+
+    return res.json({
+      ok: true,
+      generated_at: new Date().toISOString(),
+      result,
+    });
+  } catch (err) {
+    console.error("POST /api/admin/compare-pages/auto-sync error:", err);
+    return res.status(500).json({ message: "Failed to sync compare pages" });
+  }
+});
+
+app.get("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
+  try {
+    if (!requireAdminAccess(req, res)) return;
+
+    const page = await fetchComparePageRecordById(req.params.id);
+    if (!page) {
+      return res.status(404).json({ message: "Compare page not found" });
+    }
+
+    return res.json({
+      page,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("GET /api/admin/compare-pages/:id error:", err);
+    return res.status(500).json({ message: "Failed to load compare page" });
+  }
+});
+
+app.post("/api/admin/compare-pages", authenticate, async (req, res) => {
+  try {
+    if (!requireAdminAccess(req, res)) return;
+
+    const page = await buildComparePageFromBody(req.body || {});
+    if (!page) {
+      return res
+        .status(400)
+        .json({ message: "Select at least 2 published smartphones." });
+    }
+
+    const savedPage = await persistComparePageRecord(page);
+    if (!savedPage) {
+      return res.status(500).json({ message: "Failed to save compare page" });
+    }
+
+    return res.status(201).json({
+      page: savedPage,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("POST /api/admin/compare-pages error:", err);
+    return res.status(500).json({ message: "Failed to save compare page" });
+  }
+});
+
+app.put("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
+  try {
+    if (!requireAdminAccess(req, res)) return;
+
+    const existingPage = await fetchComparePageRecordById(req.params.id);
+    if (!existingPage) {
+      return res.status(404).json({ message: "Compare page not found" });
+    }
+
+    const page = await buildComparePageFromBody(req.body || {}, existingPage);
+    if (!page) {
+      return res
+        .status(400)
+        .json({ message: "Select at least 2 published smartphones." });
+    }
+
+    page.id = existingPage.id;
+    const savedPage = await persistComparePageRecord(page);
+    if (!savedPage) {
+      return res.status(500).json({ message: "Failed to update compare page" });
+    }
+
+    return res.json({
+      page: savedPage,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("PUT /api/admin/compare-pages/:id error:", err);
+    return res.status(500).json({ message: "Failed to update compare page" });
+  }
+});
+
+app.delete("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
+  try {
+    if (!requireAdminAccess(req, res)) return;
+
+    const pageId = Number(req.params.id);
+    if (!Number.isInteger(pageId) || pageId <= 0) {
+      return res.status(400).json({ message: "Invalid compare page id" });
+    }
+
+    const result = await db.query(
+      `DELETE FROM compare_pages WHERE id = $1 RETURNING id`,
+      [pageId],
+    );
+
+    if (!result.rows?.length) {
+      return res.status(404).json({ message: "Compare page not found" });
+    }
+
+    return res.json({
+      ok: true,
+      deleted_id: pageId,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("DELETE /api/admin/compare-pages/:id error:", err);
+    return res.status(500).json({ message: "Failed to delete compare page" });
   }
 });
 
