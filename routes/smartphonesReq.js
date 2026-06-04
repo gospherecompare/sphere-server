@@ -7,6 +7,18 @@ const router = express.Router();
 const hasOwn = (obj, key) =>
   Object.prototype.hasOwnProperty.call(obj || {}, key);
 
+const isPlainObject = (value) =>
+  value && typeof value === "object" && !Array.isArray(value);
+
+const pickFirstPresent = (...values) => {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === "string" && !value.trim()) continue;
+    return value;
+  }
+  return null;
+};
+
 function safeJSONParse(raw) {
   if (raw === null || raw === undefined || raw === "") return null;
   if (typeof raw === "object") return raw;
@@ -67,6 +79,56 @@ function parseDateForImport(val) {
   return d.toISOString().split("T")[0];
 }
 
+function toArrayValue(raw) {
+  if (raw === null || raw === undefined || raw === "") return [];
+  if (Array.isArray(raw)) return raw;
+  const parsed = safeJSONParse(raw);
+  if (Array.isArray(parsed)) return parsed;
+  if (typeof raw === "string") {
+    return raw
+      .split(/[|,;]+/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function pickSectionObject(body, ...keys) {
+  for (const key of keys) {
+    const parsed = safeJSONParse(body?.[key]);
+    if (isPlainObject(parsed)) return parsed;
+  }
+  return {};
+}
+
+function normalizeSingleSmartphoneBody(rawBody) {
+  const base = isPlainObject(rawBody) ? { ...rawBody } : {};
+  const collection = Array.isArray(base.smartphones)
+    ? base.smartphones.filter(isPlainObject)
+    : [];
+
+  if (collection.length > 1) {
+    return {
+      body: null,
+      error:
+        "Send one smartphone object only. Do not post the full smartphones array.",
+    };
+  }
+
+  if (collection.length === 1) {
+    const { smartphones: _smartphones, ...rest } = base;
+    return {
+      body: {
+        ...rest,
+        ...collection[0],
+      },
+      error: null,
+    };
+  }
+
+  return { body: base, error: null };
+}
+
 const LAUNCH_STATUS_VALUES = new Set(["upcoming", "preorder", "released"]);
 function normalizeLaunchStatusOverride(value) {
   const raw = String(value || "").trim().toLowerCase();
@@ -74,16 +136,42 @@ function normalizeLaunchStatusOverride(value) {
 }
 
 router.post("/req", authenticate, async (req, res) => {
-  const b = req.body || {};
+  const normalizedRequest = normalizeSingleSmartphoneBody(req.body || {});
+  if (normalizedRequest.error) {
+    return res.status(400).json({ message: normalizedRequest.error });
+  }
 
-  const product_name = (b.product_name || b.name || "").trim();
-  const brand_name = (b.brand_name || b.brand || "").trim();
-  const model = (b.model || "").trim();
+  const b = normalizedRequest.body || {};
+  const product = isPlainObject(b.product) ? b.product : {};
+  const basicInfo = pickSectionObject(b, "basic_info_json");
+
+  const product_name = String(
+    pickFirstPresent(
+      b.product_name,
+      b.name,
+      product.name,
+      basicInfo.product_name,
+      basicInfo.model_name,
+    ) || "",
+  ).trim();
+  const brand_name = String(
+    pickFirstPresent(
+      b.brand_name,
+      b.brand,
+      product.brand_name,
+      product.brand,
+      basicInfo.brand_name,
+      basicInfo.brand,
+    ) || "",
+  ).trim();
+  const model = String(
+    pickFirstPresent(b.model, basicInfo.model, basicInfo.model_number) || "",
+  ).trim();
 
   if (!product_name || !brand_name || !model) {
     return res
       .status(400)
-      .json({ message: "product_name, brand_name and model are required" });
+      .json({ message: "name, brand_name and model are required" });
   }
 
   const client = await db.connect();
@@ -124,26 +212,27 @@ router.post("/req", authenticate, async (req, res) => {
 
     // prepare JSON fields
     const images =
-      safeJSONParse(b.images_json) || safeJSONParse(b.images) || [];
-    const build_design = safeJSONParse(b.build_design_json) || {};
-    const display = safeJSONParse(b.display_json) || {};
-    const performance = safeJSONParse(b.performance_json) || {};
-    const camera = safeJSONParse(b.camera_json) || {};
-    const battery = safeJSONParse(b.battery_json) || {};
+      toArrayValue(pickFirstPresent(b.images, b.images_json)) || [];
+    const build_design = pickSectionObject(b, "build_design", "build_design_json");
+    const display = pickSectionObject(b, "display", "display_json");
+    const performance = pickSectionObject(b, "performance", "performance_json");
+    const camera = pickSectionObject(b, "camera", "camera_json");
+    const battery = pickSectionObject(b, "battery", "battery_json");
     const connectivity = mergeSectionObjects(
+      pickSectionObject(b, "connectivity"),
       safeJSONParse(b.connectivity_json),
       safeJSONParse(b.network_connectivity_json),
       safeJSONParse(b.connectivity),
     );
     const network = mergeSectionObjects(
+      pickSectionObject(b, "network"),
       safeJSONParse(b.network_json),
       safeJSONParse(b.navigation_json),
       safeJSONParse(b.network),
     );
-    const ports =
-      safeJSONParse(b.port_json) || safeJSONParse(b.ports_json) || {};
-    const audio = safeJSONParse(b.audio_json) || {};
-    const multimedia = safeJSONParse(b.multimedia_json) || {};
+    const ports = pickSectionObject(b, "ports", "ports_json", "port_json");
+    const audio = pickSectionObject(b, "audio", "audio_json");
+    const multimedia = pickSectionObject(b, "multimedia", "multimedia_json");
     const sensorsJson = safeJSONParse(b.sensors_json);
     const sensorsInput =
       b.sensors ??
@@ -151,14 +240,34 @@ router.post("/req", authenticate, async (req, res) => {
         ? sensorsJson.sensors
         : sensorsJson || null);
     const sensors = parseSensors(sensorsInput);
+    const colors = toArrayValue(
+      pickFirstPresent(
+        b.colors,
+        build_design.colors,
+        safeJSONParse(b.colors_json),
+      ),
+    );
+    const officialPreorderUrl =
+      pickFirstPresent(
+        b.official_preorder_url,
+        b.officialPreorderUrl,
+        basicInfo.official_preorder_url,
+      ) || null;
     const launchStatusOverride = normalizeLaunchStatusOverride(
-      b.launch_status_override || b.launchStatusOverride,
+      pickFirstPresent(
+        b.launch_status_override,
+        b.launchStatusOverride,
+        b.launch_status,
+        b.launchStatus,
+      ),
     );
 
     const publish = hasOwn(b, "publish")
       ? Boolean(b.publish)
       : hasOwn(b, "published")
         ? Boolean(b.published)
+        : hasOwn(b, "is_published")
+          ? Boolean(b.is_published)
         : false;
 
     // prevent duplicates
@@ -174,16 +283,18 @@ router.post("/req", authenticate, async (req, res) => {
 
     await client.query(
       `INSERT INTO smartphones
-         (product_id, category, brand, model, launch_date, launch_status_override, images, build_design, display, performance, camera, battery, connectivity, network, ports, audio, multimedia, sensors)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+         (product_id, category, brand, model, launch_date, official_preorder_url, launch_status_override, images, colors, build_design, display, performance, camera, battery, connectivity, network, ports, audio, multimedia, sensors)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
       [
         productId,
         b.category || null,
         brand_name,
         model,
         parseDateForImport(b.launch_date),
+        officialPreorderUrl,
         launchStatusOverride,
         JSON.stringify(images),
+        JSON.stringify(colors),
         JSON.stringify(build_design),
         JSON.stringify(display),
         JSON.stringify(performance),
@@ -293,14 +404,15 @@ router.post("/req", authenticate, async (req, res) => {
                   sp.storeName ||
                   "Store";
                 await client.query(
-                  `INSERT INTO variant_store_prices (variant_id, store_name, price, url, offer_text, delivery_info)
-                   VALUES ($1,$2,$3,$4,$5,$6)
+                  `INSERT INTO variant_store_prices (variant_id, store_name, price, url, offer_text, delivery_info, sale_start_date)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7)
                    ON CONFLICT (variant_id, store_name)
                    DO UPDATE SET
                      price = EXCLUDED.price,
                      url = EXCLUDED.url,
                      offer_text = EXCLUDED.offer_text,
-                     delivery_info = EXCLUDED.delivery_info`,
+                     delivery_info = EXCLUDED.delivery_info,
+                     sale_start_date = EXCLUDED.sale_start_date`,
                   [
                     variantId,
                     storeName,
@@ -308,6 +420,9 @@ router.post("/req", authenticate, async (req, res) => {
                     sp.url ?? null,
                     sp.offer_text ?? sp.offerText ?? null,
                     sp.delivery_info ?? sp.deliveryInfo ?? null,
+                    parseDateForImport(
+                      sp.sale_start_date ?? sp.sale_date ?? sp.saleStartDate ?? null,
+                    ),
                   ],
                 );
               } catch (spErr) {

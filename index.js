@@ -3229,6 +3229,132 @@ const resolveUniqueBlogSlug = async (
   }
 };
 
+const normalizePositiveIntegerList = (values = []) =>
+  Array.from(
+    new Set(
+      (Array.isArray(values) ? values : [values])
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  );
+
+const readBlogLinkedProductIds = async (
+  clientOrDb,
+  blogId,
+  fallbackProductId = null,
+) => {
+  const normalizedBlogId = Number(blogId);
+  if (!Number.isInteger(normalizedBlogId) || normalizedBlogId <= 0) return [];
+
+  const result = await clientOrDb.query(
+    `
+    SELECT product_id
+    FROM blog_product_links
+    WHERE blog_id = $1
+    ORDER BY position ASC, product_id ASC
+  `,
+    [normalizedBlogId],
+  );
+
+  const linkedIds = normalizePositiveIntegerList(
+    (result.rows || []).map((row) => row.product_id),
+  );
+  if (linkedIds.length) return linkedIds;
+  return normalizePositiveIntegerList([fallbackProductId]);
+};
+
+const syncBlogProductLinks = async (clientOrDb, blogId, productIds = []) => {
+  const normalizedBlogId = Number(blogId);
+  if (!Number.isInteger(normalizedBlogId) || normalizedBlogId <= 0) return [];
+
+  const normalizedIds = normalizePositiveIntegerList(productIds);
+  if (!normalizedIds.length) {
+    await clientOrDb.query(
+      `DELETE FROM blog_product_links WHERE blog_id = $1`,
+      [normalizedBlogId],
+    );
+    await clientOrDb.query(
+      `
+      UPDATE blogs
+      SET product_id = NULL,
+          blog_eligible = false
+      WHERE id = $1
+    `,
+      [normalizedBlogId],
+    );
+    return [];
+  }
+
+  await clientOrDb.query(
+    `
+    DELETE FROM blog_product_links
+    WHERE blog_id = $1
+      AND NOT (product_id = ANY($2::int[]))
+  `,
+    [normalizedBlogId, normalizedIds],
+  );
+
+  await clientOrDb.query(
+    `UPDATE blog_product_links SET is_primary = false WHERE blog_id = $1`,
+    [normalizedBlogId],
+  );
+
+  for (const [index, productId] of normalizedIds.entries()) {
+    await clientOrDb.query(
+      `
+      INSERT INTO blog_product_links (
+        blog_id,
+        product_id,
+        position,
+        is_primary
+      ) VALUES ($1, $2, $3, $4)
+      ON CONFLICT (blog_id, product_id)
+      DO UPDATE SET
+        position = EXCLUDED.position,
+        is_primary = EXCLUDED.is_primary
+    `,
+      [normalizedBlogId, productId, index, index === 0],
+    );
+  }
+
+  await clientOrDb.query(
+    `
+    UPDATE blogs
+    SET product_id = $2,
+        blog_eligible = true
+    WHERE id = $1
+  `,
+    [normalizedBlogId, normalizedIds[0]],
+  );
+
+  return normalizedIds;
+};
+
+const readBlogPrimaryProductId = async (clientOrDb, blogId) => {
+  const result = await clientOrDb.query(
+    `SELECT product_id FROM blogs WHERE id = $1 LIMIT 1`,
+    [blogId],
+  );
+  return Number(result.rows[0]?.product_id) || null;
+};
+
+const mapBlogLinkRows = (rows = []) =>
+  (rows || []).map((row) => ({
+    id: Number(row.id) || null,
+    title: String(row.title || "").trim(),
+    slug: String(row.slug || "").trim(),
+    excerpt: String(row.excerpt || "").trim(),
+    status: String(row.status || "draft").trim().toLowerCase(),
+    published_at: row.published_at || null,
+    updated_at: row.updated_at || null,
+    primary_product_id: Number(row.primary_product_id) || null,
+    primary_product_name: String(row.primary_product_name || "").trim(),
+    primary_product_type: String(row.primary_product_type || "").trim(),
+    primary_brand_name: String(row.primary_brand_name || "").trim(),
+    linked_product_count: Number(row.linked_product_count) || 0,
+    is_linked: Boolean(row.is_linked),
+  }));
+
 /* -----------------------
   Migrations (all tables with   suffix)
 ------------------------*/
@@ -4090,6 +4216,39 @@ async function runMigrations() {
     await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_blogs_product
       ON blogs (product_id);
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS blog_product_links (
+        blog_id INT NOT NULL REFERENCES blogs(id) ON DELETE CASCADE,
+        product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        position INT NOT NULL DEFAULT 0,
+        is_primary BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMP DEFAULT now(),
+        PRIMARY KEY (blog_id, product_id)
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_blog_product_links_product
+      ON blog_product_links (product_id, position ASC, blog_id DESC);
+    `);
+
+    await safeQuery(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_blog_product_links_primary_blog
+      ON blog_product_links (blog_id)
+      WHERE is_primary = true;
+    `);
+
+    await safeQuery(`
+      INSERT INTO blog_product_links (blog_id, product_id, position, is_primary)
+      SELECT id, product_id, 0, true
+      FROM blogs
+      WHERE product_id IS NOT NULL
+      ON CONFLICT (blog_id, product_id)
+      DO UPDATE SET
+        position = EXCLUDED.position,
+        is_primary = EXCLUDED.is_primary;
     `);
 
     // Marketing banners (campaigns / promotions)
@@ -7117,7 +7276,21 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
     if (!ensureBlogManagerAccess(req, res)) return;
 
     const rawBlogId = Number(req.body?.blog_id);
-    const rawProductId = Number(req.body?.product_id);
+    const requestedProductIds = normalizePositiveIntegerList(
+      Array.isArray(req.body?.product_ids)
+        ? req.body.product_ids
+        : Array.isArray(req.body?.productIds)
+          ? req.body.productIds
+          : [],
+    );
+    const requestedPrimaryProductId = Number(
+      req.body?.primary_product_id ?? req.body?.product_id,
+    );
+    const orderedProductIds = normalizePositiveIntegerList([
+      requestedPrimaryProductId,
+      ...requestedProductIds,
+    ]);
+    const rawProductId = orderedProductIds[0] || 0;
     const hasBlogId = Number.isInteger(rawBlogId) && rawBlogId > 0;
     const hasProductId = Number.isInteger(rawProductId) && rawProductId > 0;
     let targetBlogId = hasBlogId ? rawBlogId : null;
@@ -7324,6 +7497,16 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       );
     }
 
+    if (writeResult.rows[0]?.id) {
+      const syncedProductIds = await syncBlogProductLinks(
+        db,
+        writeResult.rows[0].id,
+        orderedProductIds,
+      );
+      writeResult.rows[0].product_ids = syncedProductIds;
+      writeResult.rows[0].primary_product_id = syncedProductIds[0] || null;
+    }
+
     return res.status(201).json({
       message: "Blog saved successfully",
       blog: writeResult.rows[0],
@@ -7406,6 +7589,382 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
   } catch (err) {
     console.error("GET /api/admin/blogs error:", err);
     return res.status(500).json({ message: "Failed to fetch blogs" });
+  }
+});
+
+app.get("/api/admin/news-articles/search", authenticate, async (req, res) => {
+  try {
+    const limit = Math.min(25, toPositiveInt(req.query.limit, 12));
+    const query = String(req.query.query || req.query.q || "").trim();
+    const selectedBlogIds = normalizePositiveIntegerList(
+      Array.isArray(req.query.selected_ids)
+        ? req.query.selected_ids
+        : Array.isArray(req.query.selectedIds)
+          ? req.query.selectedIds
+          : String(req.query.selected_ids || req.query.selectedIds || "")
+              .split(",")
+              .map((value) => value.trim())
+              .filter(Boolean),
+    );
+
+    const searchParams = [selectedBlogIds];
+    let searchFilterSql = "";
+
+    if (query) {
+      searchParams.push(`%${query}%`);
+      searchFilterSql = `
+        AND (
+          bl.title ILIKE $2
+          OR bl.slug ILIKE $2
+          OR COALESCE(primary_product.name, '') ILIKE $2
+          OR COALESCE(primary_brand.name, '') ILIKE $2
+        )
+      `;
+    }
+
+    searchParams.push(limit);
+    const limitIndex = searchParams.length;
+
+    const searchRes = await db.query(
+      `
+      SELECT
+        bl.id,
+        bl.title,
+        bl.slug,
+        bl.excerpt,
+        bl.status,
+        bl.published_at,
+        bl.updated_at,
+        bl.product_id AS primary_product_id,
+        primary_product.name AS primary_product_name,
+        primary_product.product_type AS primary_product_type,
+        primary_brand.name AS primary_brand_name,
+        COALESCE(link_counts.total_links, 0) AS linked_product_count,
+        bl.id = ANY($1::int[]) AS is_linked
+      FROM blogs bl
+      LEFT JOIN products primary_product
+        ON primary_product.id = bl.product_id
+      LEFT JOIN brands primary_brand
+        ON primary_brand.id = primary_product.brand_id
+      LEFT JOIN (
+        SELECT blog_id, COUNT(*)::int AS total_links
+        FROM blog_product_links
+        GROUP BY blog_id
+      ) link_counts
+        ON link_counts.blog_id = bl.id
+      WHERE bl.status IN ('draft', 'published')
+      ${searchFilterSql}
+      ORDER BY
+        CASE WHEN bl.id = ANY($1::int[]) THEN 0 ELSE 1 END,
+        bl.updated_at DESC,
+        bl.id DESC
+      LIMIT $${limitIndex}
+    `,
+      searchParams,
+    );
+
+    return res.json({
+      query,
+      limit,
+      rows: mapBlogLinkRows(searchRes.rows),
+      selected_blog_ids: selectedBlogIds,
+    });
+  } catch (err) {
+    console.error("GET /api/admin/news-articles/search error:", err);
+    return res.status(500).json({ message: "Failed to search news articles" });
+  }
+});
+
+app.get("/api/admin/products/:productId/linked-news", authenticate, async (req, res) => {
+  try {
+    const productId = Number(req.params.productId);
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ message: "Invalid product id" });
+    }
+
+    const limit = Math.min(25, toPositiveInt(req.query.limit, 12));
+    const query = String(req.query.query || req.query.q || "").trim();
+
+    const productRes = await db.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name,
+        p.product_type,
+        b.name AS brand_name
+      FROM products p
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      WHERE p.id = $1
+      LIMIT 1
+    `,
+      [productId],
+    );
+
+    if (!productRes.rows.length) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    const linkedRes = await db.query(
+      `
+      SELECT
+        bl.id,
+        bl.title,
+        bl.slug,
+        bl.excerpt,
+        bl.status,
+        bl.published_at,
+        bl.updated_at,
+        bl.product_id AS primary_product_id,
+        primary_product.name AS primary_product_name,
+        primary_product.product_type AS primary_product_type,
+        primary_brand.name AS primary_brand_name,
+        link_counts.total_links AS linked_product_count,
+        true AS is_linked
+      FROM blog_product_links bpl
+      INNER JOIN blogs bl
+        ON bl.id = bpl.blog_id
+      LEFT JOIN products primary_product
+        ON primary_product.id = bl.product_id
+      LEFT JOIN brands primary_brand
+        ON primary_brand.id = primary_product.brand_id
+      LEFT JOIN (
+        SELECT blog_id, COUNT(*)::int AS total_links
+        FROM blog_product_links
+        GROUP BY blog_id
+      ) link_counts
+        ON link_counts.blog_id = bl.id
+      WHERE bpl.product_id = $1
+      ORDER BY bl.updated_at DESC, bl.id DESC
+    `,
+      [productId],
+    );
+
+    const searchParams = [productId];
+    let searchFilterSql = "";
+    if (query) {
+      searchParams.push(`%${query}%`);
+      searchFilterSql = `
+        AND (
+          bl.title ILIKE $2
+          OR bl.slug ILIKE $2
+          OR COALESCE(primary_product.name, '') ILIKE $2
+          OR COALESCE(primary_brand.name, '') ILIKE $2
+        )
+      `;
+    }
+    searchParams.push(limit);
+    const limitIndex = searchParams.length;
+
+    const searchRes = await db.query(
+      `
+      SELECT
+        bl.id,
+        bl.title,
+        bl.slug,
+        bl.excerpt,
+        bl.status,
+        bl.published_at,
+        bl.updated_at,
+        bl.product_id AS primary_product_id,
+        primary_product.name AS primary_product_name,
+        primary_product.product_type AS primary_product_type,
+        primary_brand.name AS primary_brand_name,
+        COALESCE(link_counts.total_links, 0) AS linked_product_count,
+        EXISTS (
+          SELECT 1
+          FROM blog_product_links bpl_match
+          WHERE bpl_match.blog_id = bl.id
+            AND bpl_match.product_id = $1
+        ) AS is_linked
+      FROM blogs bl
+      LEFT JOIN products primary_product
+        ON primary_product.id = bl.product_id
+      LEFT JOIN brands primary_brand
+        ON primary_brand.id = primary_product.brand_id
+      LEFT JOIN (
+        SELECT blog_id, COUNT(*)::int AS total_links
+        FROM blog_product_links
+        GROUP BY blog_id
+      ) link_counts
+        ON link_counts.blog_id = bl.id
+      WHERE bl.status IN ('draft', 'published')
+      ${searchFilterSql}
+      ORDER BY
+        CASE
+          WHEN EXISTS (
+            SELECT 1
+            FROM blog_product_links bpl_match
+            WHERE bpl_match.blog_id = bl.id
+              AND bpl_match.product_id = $1
+          ) THEN 0
+          ELSE 1
+        END,
+        bl.updated_at DESC,
+        bl.id DESC
+      LIMIT $${limitIndex}
+    `,
+      searchParams,
+    );
+
+    return res.json({
+      product: productRes.rows[0],
+      linked_articles: mapBlogLinkRows(linkedRes.rows),
+      search_results: mapBlogLinkRows(searchRes.rows),
+      query,
+      limit,
+    });
+  } catch (err) {
+    console.error("GET /api/admin/products/:productId/linked-news error:", err);
+    return res.status(500).json({ message: "Failed to fetch linked news" });
+  }
+});
+
+app.put("/api/admin/products/:productId/linked-news", authenticate, async (req, res) => {
+  const connection = await db.connect();
+
+  try {
+    const productId = Number(req.params.productId);
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ message: "Invalid product id" });
+    }
+
+    const requestedBlogIds = normalizePositiveIntegerList(
+      Array.isArray(req.body?.blog_ids)
+        ? req.body.blog_ids
+        : Array.isArray(req.body?.blogIds)
+          ? req.body.blogIds
+          : [],
+    );
+
+    const productRes = await connection.query(
+      `SELECT id FROM products WHERE id = $1 LIMIT 1`,
+      [productId],
+    );
+    if (!productRes.rows.length) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    if (requestedBlogIds.length) {
+      const existingBlogsRes = await connection.query(
+        `SELECT id FROM blogs WHERE id = ANY($1::int[])`,
+        [requestedBlogIds],
+      );
+      const existingBlogIds = normalizePositiveIntegerList(
+        (existingBlogsRes.rows || []).map((row) => row.id),
+      );
+      if (existingBlogIds.length !== requestedBlogIds.length) {
+        return res
+          .status(400)
+          .json({ message: "One or more selected news articles were not found" });
+      }
+    }
+
+    await connection.query("BEGIN");
+
+    const currentLinksRes = await connection.query(
+      `
+      SELECT blog_id
+      FROM blog_product_links
+      WHERE product_id = $1
+      ORDER BY blog_id ASC
+    `,
+      [productId],
+    );
+    const currentBlogIds = normalizePositiveIntegerList(
+      (currentLinksRes.rows || []).map((row) => row.blog_id),
+    );
+
+    const blogIdsToRemove = currentBlogIds.filter(
+      (blogId) => !requestedBlogIds.includes(blogId),
+    );
+    const blogIdsToAdd = requestedBlogIds.filter(
+      (blogId) => !currentBlogIds.includes(blogId),
+    );
+
+    for (const blogId of blogIdsToAdd) {
+      const fallbackPrimaryProductId = await readBlogPrimaryProductId(
+        connection,
+        blogId,
+      );
+      const existingProductIds = await readBlogLinkedProductIds(
+        connection,
+        blogId,
+        fallbackPrimaryProductId,
+      );
+      await syncBlogProductLinks(connection, blogId, [
+        ...existingProductIds,
+        productId,
+      ]);
+    }
+
+    for (const blogId of blogIdsToRemove) {
+      const fallbackPrimaryProductId = await readBlogPrimaryProductId(
+        connection,
+        blogId,
+      );
+      const existingProductIds = await readBlogLinkedProductIds(
+        connection,
+        blogId,
+        fallbackPrimaryProductId,
+      );
+      await syncBlogProductLinks(
+        connection,
+        blogId,
+        existingProductIds.filter((linkedProductId) => linkedProductId !== productId),
+      );
+    }
+
+    await connection.query("COMMIT");
+
+    const refreshedLinks = await db.query(
+      `
+      SELECT
+        bl.id,
+        bl.title,
+        bl.slug,
+        bl.excerpt,
+        bl.status,
+        bl.published_at,
+        bl.updated_at,
+        bl.product_id AS primary_product_id,
+        primary_product.name AS primary_product_name,
+        primary_product.product_type AS primary_product_type,
+        primary_brand.name AS primary_brand_name,
+        link_counts.total_links AS linked_product_count,
+        true AS is_linked
+      FROM blog_product_links bpl
+      INNER JOIN blogs bl
+        ON bl.id = bpl.blog_id
+      LEFT JOIN products primary_product
+        ON primary_product.id = bl.product_id
+      LEFT JOIN brands primary_brand
+        ON primary_brand.id = primary_product.brand_id
+      LEFT JOIN (
+        SELECT blog_id, COUNT(*)::int AS total_links
+        FROM blog_product_links
+        GROUP BY blog_id
+      ) link_counts
+        ON link_counts.blog_id = bl.id
+      WHERE bpl.product_id = $1
+      ORDER BY bl.updated_at DESC, bl.id DESC
+    `,
+      [productId],
+    );
+
+    return res.json({
+      message: "Linked news updated successfully",
+      linked_articles: mapBlogLinkRows(refreshedLinks.rows),
+      blog_ids: requestedBlogIds,
+    });
+  } catch (err) {
+    try {
+      await connection.query("ROLLBACK");
+    } catch {}
+    console.error("PUT /api/admin/products/:productId/linked-news error:", err);
+    return res.status(500).json({ message: "Failed to update linked news" });
+  } finally {
+    connection.release();
   }
 });
 
