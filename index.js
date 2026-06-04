@@ -14331,6 +14331,231 @@ const handleTrendingSmartphones = async (req, res) => {
 // Trending Smartphones (grouped by product, combined RAM/ROM)
 app.get("/api/public/trending/smartphones", handleTrendingSmartphones);
 
+// Upcoming Smartphones - server-filtered public feed
+app.get("/api/public/upcoming/smartphones", async (req, res) => {
+  try {
+    const profileConfig = await readDeviceFieldProfilesConfig();
+    const result = await db.query(`
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        p.name AS name,
+        p.product_type,
+
+        b.name AS brand,
+        b.name AS brand_name,
+        b.logo AS brand_logo,
+        MAX(to_jsonb(b)->>'website') AS brand_website,
+
+        s.category,
+        s.model,
+        s.launch_date,
+        s.official_preorder_url,
+        s.launch_status_override,
+        s.colors,
+        s.build_design,
+        s.display,
+        s.performance,
+        s.camera,
+        s.battery,
+        s.connectivity,
+        s.network,
+        s.ports,
+        s.audio,
+        s.multimedia,
+        s.sensors,
+        s.created_at,
+
+        MAX(ds.hook_score) AS hook_score,
+        MAX(ds.buyer_intent) AS buyer_intent,
+        MAX(ds.trend_velocity) AS trend_velocity,
+        MAX(ds.freshness) AS freshness,
+        MAX(ds.calculated_at) AS hook_calculated_at,
+
+        COALESCE(
+          (
+            SELECT json_agg(pi.image_url ORDER BY pi.position ASC NULLS LAST, pi.id ASC)
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+          ),
+          '[]'::json
+        ) AS images,
+
+        COALESCE(
+          json_agg(
+            DISTINCT jsonb_build_object(
+              'variant_id', v.id,
+              'variant_key', v.variant_key,
+              'ram', v.attributes->>'ram',
+              'storage', v.attributes->>'storage',
+              'base_price', v.base_price,
+              'store_prices', (
+                SELECT COALESCE(
+                  json_agg(
+                    jsonb_build_object(
+                      'id', sp.id,
+                      'store_name', sp.store_name,
+                      'price', sp.price,
+                      'url', sp.url,
+                      'offer_text', sp.offer_text,
+                      'delivery_info', sp.delivery_info,
+                      'sale_start_date', sp.sale_start_date
+                    )
+                    ORDER BY sp.price ASC NULLS LAST, sp.id ASC
+                  ),
+                  '[]'::json
+                )
+                FROM variant_store_prices sp
+                WHERE sp.variant_id = v.id
+              )
+            )
+          ) FILTER (WHERE v.id IS NOT NULL),
+          '[]'::json
+        ) AS variants
+
+      FROM products p
+
+      INNER JOIN smartphones s
+        ON s.product_id = p.id
+
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+
+      LEFT JOIN product_variants v
+        ON v.product_id = p.id
+
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
+
+      WHERE p.product_type = 'smartphone'
+
+      GROUP BY
+        p.id, p.name, p.product_type, p.brand_id, b.name, b.logo, b.id,
+        s.category, s.model, s.launch_date, s.official_preorder_url, s.launch_status_override,
+        s.colors, s.build_design, s.display, s.performance,
+        s.camera, s.battery, s.connectivity, s.network,
+        s.ports, s.audio, s.multimedia, s.sensors, s.created_at;
+    `);
+
+    const toFiniteNumber = (value, fallback = 0) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    };
+    const toDateMillis = (value) => {
+      if (!value) return null;
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
+    };
+    const computeFallbackHookScore = (row) =>
+      Number(
+        (
+          toFiniteNumber(row?.buyer_intent) * 0.6 +
+          toFiniteNumber(row?.trend_velocity) * 0.25 +
+          toFiniteNumber(row?.freshness) * 0.15
+        ).toFixed(2),
+      );
+
+    const todayIndia = getIndiaDateOnly();
+    const scoredRows = applySpecScoreToRows(
+      "smartphone",
+      (result.rows || []).map((row) => {
+        const item = { ...(row || {}) };
+        const variants = (
+          Array.isArray(item.variants) ? item.variants : []
+        ).map((variant) => ({
+          ...toPlainObject(variant),
+          store_prices: decorateStorePriceList(
+            toPlainObject(variant).store_prices || [],
+            todayIndia,
+          ),
+        }));
+
+        const hookScore = Number.isFinite(Number(item.hook_score))
+          ? Number(item.hook_score)
+          : null;
+        item.variants = variants;
+        item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
+        item.price = resolveEffectiveSmartphonePrice(variants, item.price);
+        item.starting_price = item.price;
+        item.launch_status = resolveSmartphoneLaunchStage(item, todayIndia);
+        item.launchStatus = item.launch_status;
+        item.is_prebooking = item.launch_status === "upcoming";
+        applySmartphoneLaunchPolicy(item, item.launch_status);
+
+        item.hook_score =
+          hookScore !== null ? hookScore : computeFallbackHookScore(item);
+        item.buyer_intent = toFiniteNumber(item.buyer_intent);
+        item.trend_velocity = toFiniteNumber(item.trend_velocity);
+        item.freshness = toFiniteNumber(item.freshness);
+        item.hook_rank_score = item.hook_score;
+
+        return stripScoreRecursively(item);
+      }),
+      profileConfig.profiles,
+    );
+
+    const stageRank = (stage) => {
+      if (stage === "upcoming") return 0;
+      if (stage === "announced") return 1;
+      if (stage === "rumored") return 2;
+      return 3;
+    };
+
+    const upcoming = scoredRows
+      .filter((item) =>
+        ["upcoming", "announced", "rumored"].includes(item?.launch_status),
+      )
+      .sort((left, right) => {
+        const leftDate = toDateMillis(left.sale_start_date || left.launch_date);
+        const rightDate = toDateMillis(
+          right.sale_start_date || right.launch_date,
+        );
+
+        if (leftDate !== null && rightDate !== null && leftDate !== rightDate) {
+          return leftDate - rightDate;
+        }
+        if (leftDate !== null) return -1;
+        if (rightDate !== null) return 1;
+
+        const stageDelta = stageRank(left.launch_status) - stageRank(right.launch_status);
+        if (stageDelta !== 0) return stageDelta;
+
+        const hookDelta =
+          toFiniteNumber(right.hook_score) - toFiniteNumber(left.hook_score);
+        if (hookDelta !== 0) return hookDelta;
+
+        const buyerDelta =
+          toFiniteNumber(right.buyer_intent) -
+          toFiniteNumber(left.buyer_intent);
+        if (buyerDelta !== 0) return buyerDelta;
+
+        const velocityDelta =
+          toFiniteNumber(right.trend_velocity) -
+          toFiniteNumber(left.trend_velocity);
+        if (velocityDelta !== 0) return velocityDelta;
+
+        return (
+          toFiniteNumber(right.product_id) - toFiniteNumber(left.product_id)
+        );
+      })
+      .map((item) => toPublicSmartphoneResponse(item));
+
+    return res.json({
+      success: true,
+      generated_at: new Date().toISOString(),
+      upcoming,
+      smartphones: upcoming,
+    });
+  } catch (err) {
+    console.error("GET /api/public/upcoming/smartphones error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/public/smartphones/highlights", async (req, res) => {
   try {
     const limitRaw = Number(req.query?.limit ?? 5);
