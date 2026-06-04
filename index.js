@@ -416,7 +416,11 @@ const resolveSmartphoneLaunchStage = (
     return "upcoming";
   }
 
-  if (explicitStatus === "available" || explicitStatus === "released") {
+  if (explicitStatus === "available") {
+    return "available";
+  }
+
+  if (explicitStatus === "released") {
     return "released";
   }
 
@@ -869,18 +873,286 @@ const getSmartphoneFeedStartDate = (device) =>
       null,
   );
 
+const SMARTPHONE_AVAILABILITY_FORECAST_TTL_MS = 10 * 60 * 1000;
+let smartphoneAvailabilityForecastCache = {
+  loadedAt: 0,
+  byBrand: new Map(),
+  globalMedianDays: 30,
+};
+let smartphoneAvailabilityForecastPromise = null;
+
+const normalizeAvailabilityBrandKey = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase();
+
+const addDaysToDateOnly = (value, days) => {
+  const normalized = normalizeDateOnlyInput(value);
+  const numericDays = Number(days);
+  if (!normalized || !Number.isFinite(numericDays)) return null;
+
+  const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+
+  const date = new Date(
+    Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])),
+  );
+  if (Number.isNaN(date.getTime())) return null;
+
+  date.setUTCDate(date.getUTCDate() + Math.max(0, Math.round(numericDays)));
+  return date.toISOString().slice(0, 10);
+};
+
+const fetchSmartphoneAvailabilityForecast = async () => {
+  const now = Date.now();
+  if (
+    smartphoneAvailabilityForecastCache.loadedAt &&
+    now - smartphoneAvailabilityForecastCache.loadedAt <
+      SMARTPHONE_AVAILABILITY_FORECAST_TTL_MS
+  ) {
+    return smartphoneAvailabilityForecastCache;
+  }
+
+  if (smartphoneAvailabilityForecastPromise) {
+    return smartphoneAvailabilityForecastPromise;
+  }
+
+  smartphoneAvailabilityForecastPromise = (async () => {
+    const brandResult = await db.query(
+      `
+      WITH sale_rows AS (
+        SELECT
+          COALESCE(NULLIF(BTRIM(b.name), ''), 'Unknown') AS brand_name,
+          s.launch_date::date AS launch_date,
+          (
+            SELECT MIN(sp.sale_start_date)
+            FROM product_variants pv
+            INNER JOIN variant_store_prices sp
+              ON sp.variant_id = pv.id
+            WHERE pv.product_id = p.id
+              AND sp.sale_start_date IS NOT NULL
+          ) AS sale_start_date
+        FROM products p
+        INNER JOIN product_publish pub
+          ON pub.product_id = p.id
+         AND pub.is_published = true
+        INNER JOIN smartphones s
+          ON s.product_id = p.id
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        WHERE p.product_type = 'smartphone'
+          AND s.launch_date IS NOT NULL
+      ),
+      gap_rows AS (
+        SELECT
+          brand_name,
+          (sale_start_date::date - launch_date::date)::int AS gap_days
+        FROM sale_rows
+        WHERE sale_start_date IS NOT NULL
+          AND launch_date IS NOT NULL
+      )
+      SELECT
+        brand_name,
+        COUNT(*)::int AS sample_size,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY gap_days)::numeric AS median_gap_days
+      FROM gap_rows
+      GROUP BY brand_name
+      `,
+    );
+
+    const globalResult = await db.query(
+      `
+      WITH sale_rows AS (
+        SELECT
+          s.launch_date::date AS launch_date,
+          (
+            SELECT MIN(sp.sale_start_date)
+            FROM product_variants pv
+            INNER JOIN variant_store_prices sp
+              ON sp.variant_id = pv.id
+            WHERE pv.product_id = p.id
+              AND sp.sale_start_date IS NOT NULL
+          ) AS sale_start_date
+        FROM products p
+        INNER JOIN product_publish pub
+          ON pub.product_id = p.id
+         AND pub.is_published = true
+        INNER JOIN smartphones s
+          ON s.product_id = p.id
+        WHERE p.product_type = 'smartphone'
+          AND s.launch_date IS NOT NULL
+      )
+      SELECT
+        COUNT(*)::int AS sample_size,
+        percentile_cont(0.5) WITHIN GROUP (
+          ORDER BY (sale_start_date::date - launch_date::date)::int
+        )::numeric AS median_gap_days
+      FROM sale_rows
+      WHERE sale_start_date IS NOT NULL
+        AND launch_date IS NOT NULL
+      `,
+    );
+
+    const byBrand = new Map();
+    for (const row of brandResult.rows || []) {
+      const key = normalizeAvailabilityBrandKey(row?.brand_name);
+      const median = Number(row?.median_gap_days);
+      if (!key || !Number.isFinite(median)) continue;
+      byBrand.set(key, Math.max(0, Math.round(median)));
+    }
+
+    const globalMedianRaw = Number(globalResult.rows?.[0]?.median_gap_days);
+    const globalMedianDays = Number.isFinite(globalMedianRaw)
+      ? Math.max(0, Math.round(globalMedianRaw))
+      : 30;
+
+    smartphoneAvailabilityForecastCache = {
+      loadedAt: Date.now(),
+      byBrand,
+      globalMedianDays,
+    };
+
+    return smartphoneAvailabilityForecastCache;
+  })().finally(() => {
+    smartphoneAvailabilityForecastPromise = null;
+  });
+
+  return smartphoneAvailabilityForecastPromise;
+};
+
+const resolveSmartphoneAvailabilityFields = (
+  device = {},
+  forecast = smartphoneAvailabilityForecastCache,
+  todayIndia = getIndiaDateOnly(),
+) => {
+  const launchDate = normalizeDateOnlyInput(
+    device.launch_date ??
+      device.launchDate ??
+      device.created_at ??
+      device.createdAt ??
+      null,
+  );
+  const saleStartDate = normalizeDateOnlyInput(
+    device.sale_start_date ??
+      device.saleStartDate ??
+      getSmartphoneFeedStartDate(device) ??
+      null,
+  );
+  const brandName = String(
+    device.brand_name || device.brand || device.brandName || "",
+  ).trim();
+  const brandKey = normalizeAvailabilityBrandKey(brandName);
+  const fallbackGapDays =
+    forecast?.byBrand?.get(brandKey) ?? forecast?.globalMedianDays ?? 30;
+  const predictedAvailableDate =
+    !saleStartDate && launchDate
+      ? addDaysToDateOnly(launchDate, fallbackGapDays)
+      : null;
+  const availableDate = saleStartDate || predictedAvailableDate || null;
+  const availableDateSource = saleStartDate
+    ? "sale_start_date"
+    : predictedAvailableDate
+      ? "predicted_available_date"
+      : null;
+  const availableDateLabel = saleStartDate
+    ? saleStartDate <= todayIndia
+      ? "Available"
+      : "Expected"
+    : predictedAvailableDate
+      ? "Predicted"
+      : "Not set";
+
+  return {
+    brand_logo_url:
+      device.brand_logo_url || device.brand_logo || device.brandLogo || null,
+    brand_logo:
+      device.brand_logo || device.brand_logo_url || device.brandLogo || null,
+    best_price: toSafeNumeric(
+      device.best_price ?? device.price ?? device.starting_price ?? null,
+    ),
+    bestPrice: toSafeNumeric(
+      device.best_price ?? device.price ?? device.starting_price ?? null,
+    ),
+    available_date: availableDate,
+    availableDate: availableDate,
+    predicted_available_date: predictedAvailableDate,
+    predictedAvailableDate: predictedAvailableDate,
+    available_date_source: availableDateSource,
+    availableDateSource: availableDateSource,
+    available_date_label: availableDateLabel,
+    availableDateLabel: availableDateLabel,
+  };
+};
+
+const resolveSmartphoneStoreStage = (
+  device = {},
+  todayIndia = getIndiaDateOnly(),
+) => {
+  const storeRows = collectSmartphoneStoreRows(device);
+  if (storeRows.some((store) => hasSmartphoneLiveStoreSignal(store, todayIndia))) {
+    return "live";
+  }
+  if (storeRows.some((store) => isSmartphonePrebookingStore(store, todayIndia))) {
+    return "prebooking";
+  }
+  if (storeRows.length > 0) {
+    return "listed";
+  }
+  return "none";
+};
+
+const applySmartphoneAvailabilityDetails = (
+  item,
+  forecast = smartphoneAvailabilityForecastCache,
+  todayIndia = getIndiaDateOnly(),
+) => {
+  if (!item || typeof item !== "object") return item;
+
+  const availabilityFields = resolveSmartphoneAvailabilityFields(
+    item,
+    forecast,
+    todayIndia,
+  );
+  Object.assign(item, availabilityFields);
+
+  const saleStage = resolveSmartphoneSaleStage(item, todayIndia);
+  item.sale_status = saleStage;
+  item.saleStatus = saleStage;
+  item.store_stage = resolveSmartphoneStoreStage(item, todayIndia);
+  item.storeStage = item.store_stage;
+
+  return item;
+};
+
 const isSmartphoneUpcomingFeedItem = (
   device,
   todayIndia = getIndiaDateOnly(),
 ) => {
   if (!device) return false;
   const saleStartDate = getSmartphoneFeedStartDate(device);
+  const storeRows = collectSmartphoneStoreRows(device);
+  const hasLiveStores = storeRows.some((store) =>
+    hasSmartphoneLiveStoreSignal(store, todayIndia),
+  );
+  const hasStoreSignals = storeRows.length > 0;
   if (saleStartDate) {
     return saleStartDate > todayIndia;
   }
 
   const launchStage = resolveSmartphoneLaunchStage(device, todayIndia);
-  return ["rumored", "announced", "upcoming"].includes(launchStage);
+  if (["rumored", "announced", "upcoming"].includes(launchStage)) {
+    return true;
+  }
+
+  if (launchStage === "available") {
+    return false;
+  }
+
+  if (launchStage === "released") {
+    return !hasLiveStores && hasStoreSignals ? true : !hasLiveStores;
+  }
+
+  return !hasLiveStores && !hasStoreSignals;
 };
 
 const isSmartphoneLatestFeedItem = (
@@ -889,12 +1161,18 @@ const isSmartphoneLatestFeedItem = (
 ) => {
   if (!device) return false;
   const saleStartDate = getSmartphoneFeedStartDate(device);
+  const storeRows = collectSmartphoneStoreRows(device);
+  const hasLiveStores = storeRows.some((store) =>
+    hasSmartphoneLiveStoreSignal(store, todayIndia),
+  );
   if (saleStartDate) {
     return saleStartDate <= todayIndia;
   }
 
   const launchStage = resolveSmartphoneLaunchStage(device, todayIndia);
-  return !["rumored", "announced", "upcoming"].includes(launchStage);
+  if (launchStage === "available") return true;
+  if (launchStage === "released") return hasLiveStores;
+  return ["available"].includes(launchStage);
 };
 
 const hasOwn = (obj, key) =>
@@ -9092,6 +9370,7 @@ app.get("/api/smartphones", async (req, res) => {
       );
     };
 
+    const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
     const todayIndia = getIndiaDateOnly();
     const smartphones = applySpecScoreToRows(
       "smartphone",
@@ -9117,6 +9396,11 @@ app.get("/api/smartphones", async (req, res) => {
         item.price = resolveEffectiveSmartphonePrice(
           variants,
           item.price ?? null,
+        );
+        applySmartphoneAvailabilityDetails(
+          item,
+          availabilityForecast,
+          todayIndia,
         );
         const launchStage = resolveSmartphoneLaunchStage(item, todayIndia);
         item.launch_status = launchStage;
@@ -9289,6 +9573,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
     `);
 
     const todayIndia = getIndiaDateOnly();
+    const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
     const smartphones = applySpecScoreToRows(
       "smartphone",
       (result.rows || []).map((row) => {
@@ -9306,6 +9591,11 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         item.price = resolveEffectiveSmartphonePrice(
           variants,
           item.price ?? null,
+        );
+        applySmartphoneAvailabilityDetails(
+          item,
+          availabilityForecast,
+          todayIndia,
         );
         const launchStage = resolveSmartphoneLaunchStage(item, todayIndia);
         item.launch_status = launchStage;
@@ -9446,6 +9736,13 @@ app.get("/api/smartphone/:id", async (req, res) => {
     sanitized.brand_website = productBrandWebsite || null;
     sanitized.launch_date = smartphone.launch_date || null;
     sanitized.created_at = smartphone.created_at || null;
+    sanitized.price = resolveEffectiveSmartphonePrice(variants, sanitized.price);
+    const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
+    applySmartphoneAvailabilityDetails(
+      sanitized,
+      availabilityForecast,
+      todayIndia,
+    );
     const launchStage = resolveSmartphoneLaunchStage(
       { ...sanitized, variants },
       todayIndia,
@@ -13586,6 +13883,7 @@ app.get("/api/reports/launch-timing", authenticate, async (req, res) => {
       ? Math.min(5000, Math.max(1, Math.floor(limitRaw)))
       : 1000;
 
+    const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
     const result = await db.query(
       `
       WITH launch_rows AS (
@@ -13594,6 +13892,7 @@ app.get("/api/reports/launch-timing", authenticate, async (req, res) => {
           p.name AS product_name,
           p.product_type,
           b.name AS brand_name,
+          b.logo AS brand_logo,
           COALESCE(
             NULLIF(s.category, ''),
             NULLIF(t.category, ''),
@@ -13675,39 +13974,48 @@ app.get("/api/reports/launch-timing", authenticate, async (req, res) => {
       [limit],
     );
 
-    const devices = (result.rows || []).map((row) => ({
-      id: Number(row.product_id),
-      product_id: Number(row.product_id),
-      product_type: row.product_type || "smartphone",
-      brand_name: row.brand_name || null,
-      category: row.category || "Uncategorized",
-      name: row.product_name || "Device",
-      product_name: row.product_name || "Device",
-      launch_date: row.launch_date ? String(row.launch_date).slice(0, 10) : null,
-      sale_start_date: row.sale_start_date
-        ? String(row.sale_start_date).slice(0, 10)
-        : null,
-      sale_gap_days:
-        row.sale_gap_days !== null && row.sale_gap_days !== undefined
-          ? Number(row.sale_gap_days)
+    const devices = (result.rows || []).map((row) => {
+      const base = {
+        id: Number(row.product_id),
+        product_id: Number(row.product_id),
+        product_type: row.product_type || "smartphone",
+        brand_name: row.brand_name || null,
+        brand_logo_url: row.brand_logo || null,
+        brand_logo: row.brand_logo || null,
+        category: row.category || "Uncategorized",
+        name: row.product_name || "Device",
+        product_name: row.product_name || "Device",
+        launch_date: row.launch_date ? String(row.launch_date).slice(0, 10) : null,
+        sale_start_date: row.sale_start_date
+          ? String(row.sale_start_date).slice(0, 10)
           : null,
-      image_url: row.image_url || null,
-      best_price: row.best_price !== null ? Number(row.best_price) : null,
-      trending_score: Number(row.trending_score) || 0,
-      views_7d: Number(row.views_7d) || 0,
-      compares_7d: Number(row.compares_7d) || 0,
-      views_prev_7d: Number(row.views_prev_7d) || 0,
-      velocity: Number(row.velocity) || 0,
-      manual_boost: Boolean(row.manual_boost),
-      manual_priority: Number(row.manual_priority) || 0,
-      manual_badge: row.manual_badge || null,
-      trending_calculated_at: row.trending_calculated_at || null,
-      buyer_intent: Number(row.buyer_intent) || 0,
-      hook_score: Number(row.hook_score) || 0,
-      trend_velocity: Number(row.trend_velocity) || 0,
-      freshness: Number(row.freshness) || 0,
-      dynamic_calculated_at: row.dynamic_calculated_at || null,
-    }));
+        sale_gap_days:
+          row.sale_gap_days !== null && row.sale_gap_days !== undefined
+            ? Number(row.sale_gap_days)
+            : null,
+        image_url: row.image_url || null,
+        best_price: row.best_price !== null ? Number(row.best_price) : null,
+        trending_score: Number(row.trending_score) || 0,
+        views_7d: Number(row.views_7d) || 0,
+        compares_7d: Number(row.compares_7d) || 0,
+        views_prev_7d: Number(row.views_prev_7d) || 0,
+        velocity: Number(row.velocity) || 0,
+        manual_boost: Boolean(row.manual_boost),
+        manual_priority: Number(row.manual_priority) || 0,
+        manual_badge: row.manual_badge || null,
+        trending_calculated_at: row.trending_calculated_at || null,
+        buyer_intent: Number(row.buyer_intent) || 0,
+        hook_score: Number(row.hook_score) || 0,
+        trend_velocity: Number(row.trend_velocity) || 0,
+        freshness: Number(row.freshness) || 0,
+        dynamic_calculated_at: row.dynamic_calculated_at || null,
+      };
+      return applySmartphoneAvailabilityDetails(
+        base,
+        availabilityForecast,
+        todayIndia,
+      );
+    });
 
     return res.json({
       generated_at: new Date().toISOString(),
@@ -14663,6 +14971,7 @@ const handleTrendingSmartphones = async (req, res) => {
     );
 
     const todayIndia = getIndiaDateOnly();
+    const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
     for (const item of trending) {
       const variantsRes = await db.query(
         `SELECT id, variant_key, attributes->>'ram' AS ram, attributes->>'storage' AS storage, base_price
@@ -14693,6 +15002,7 @@ const handleTrendingSmartphones = async (req, res) => {
       item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
       item.price = effectivePrice;
       item.starting_price = effectivePrice;
+      applySmartphoneAvailabilityDetails(item, availabilityForecast, todayIndia);
       const launchStage = resolveSmartphoneLaunchStage(item, todayIndia);
       const saleStage = resolveSmartphoneSaleStage(item, todayIndia);
       item.launch_status = launchStage;
@@ -14856,6 +15166,7 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
       );
 
     const todayIndia = getIndiaDateOnly();
+    const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
     const scoredRows = applySpecScoreToRows(
       "smartphone",
       (result.rows || []).map((row) => {
@@ -14877,6 +15188,7 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
         item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
         item.price = resolveEffectiveSmartphonePrice(variants, item.price);
         item.starting_price = item.price;
+        applySmartphoneAvailabilityDetails(item, availabilityForecast, todayIndia);
         item.launch_status = resolveSmartphoneLaunchStage(item, todayIndia);
         item.launchStatus = item.launch_status;
         item.sale_status = resolveSmartphoneSaleStage(item, todayIndia);
@@ -14908,8 +15220,12 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
     const upcoming = scoredRows
       .filter((item) => isSmartphoneUpcomingFeedItem(item, todayIndia))
       .sort((left, right) => {
-        const leftDate = toDateMillis(left.sale_start_date || null);
-        const rightDate = toDateMillis(right.sale_start_date || null);
+        const leftDate = toDateMillis(
+          left.available_date || left.sale_start_date || null,
+        );
+        const rightDate = toDateMillis(
+          right.available_date || right.sale_start_date || null,
+        );
 
         if (leftDate !== null && rightDate !== null && leftDate !== rightDate) {
           return leftDate - rightDate;
@@ -14975,6 +15291,8 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
       SELECT
         p.id AS product_id,
         p.name,
+        b.name AS brand_name,
+        b.logo AS brand_logo,
         s.model,
         s.launch_date,
         s.launch_status_override,
@@ -14987,6 +15305,14 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
           WHERE v.product_id = p.id
             AND sp.sale_start_date IS NOT NULL
         ) AS sale_start_date,
+        (
+          SELECT MIN(sp.price)::numeric
+          FROM product_variants v
+          INNER JOIN variant_store_prices sp
+            ON sp.variant_id = v.id
+          WHERE v.product_id = p.id
+            AND sp.price IS NOT NULL
+        ) AS best_price,
         COALESCE(MAX(ds.hook_score), 0) AS hook_score,
         COALESCE(MAX(ds.buyer_intent), 0) AS buyer_intent,
         COALESCE(MAX(ds.trend_velocity), 0) AS trend_velocity,
@@ -15012,12 +15338,16 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
       INNER JOIN product_publish pub
         ON pub.product_id = p.id
        AND pub.is_published = true
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
       LEFT JOIN product_dynamic_score ds
         ON ds.product_id = p.id
       WHERE p.product_type = 'smartphone'
       GROUP BY
         p.id,
         p.name,
+        b.name,
+        b.logo,
         s.model,
         s.launch_date,
         s.launch_status_override,
@@ -15035,6 +15365,7 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
       return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
     };
     const todayIndia = getIndiaDateOnly();
+    const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
     const rows = (result.rows || []).map((row) => {
       const launchStage = resolveSmartphoneLaunchStage(
         {
@@ -15060,10 +15391,17 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
         name: row.name || row.model || "Smartphone",
         model: row.model || row.name || "Smartphone",
         launch_date: row.launch_date || null,
+        brand_name: row.brand_name || null,
+        brand_logo: row.brand_logo || null,
+        brand_logo_url: row.brand_logo || null,
         launch_status: launchStage,
         launch_status_override: row.launch_status_override || null,
         official_preorder_url: row.official_preorder_url || null,
         sale_start_date: row.sale_start_date || null,
+        best_price:
+          row.best_price !== null && row.best_price !== undefined
+            ? Number(row.best_price)
+            : null,
         sale_status: saleStage,
         is_prebooking: saleStage === "preorder" || saleStage === "sale_scheduled",
         hook_score: toFiniteNumber(row.hook_score),
@@ -15072,6 +15410,12 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
         freshness: toFiniteNumber(row.freshness),
         has_purchase_signal: Boolean(row.has_purchase_signal),
       };
+
+      return applySmartphoneAvailabilityDetails(
+        base,
+        availabilityForecast,
+        todayIndia,
+      );
     });
 
     const compareDescendingSignals =
@@ -15091,13 +15435,21 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
           product_id: item.product_id,
           name: item.name,
           model: item.model,
+          brand_name: item.brand_name,
+          brand_logo: item.brand_logo,
+          brand_logo_url: item.brand_logo_url,
           launch_date: item.launch_date,
           launch_status: item.launch_status,
           launch_status_override: item.launch_status_override,
           official_preorder_url: item.official_preorder_url,
           sale_start_date: item.sale_start_date,
+          best_price: item.best_price,
           sale_status: item.sale_status,
+          store_stage: item.store_stage,
           is_prebooking: item.is_prebooking,
+          available_date: item.available_date,
+          predicted_available_date: item.predicted_available_date,
+          available_date_label: item.available_date_label,
         }),
       );
 
@@ -15767,6 +16119,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
     );
 
     const todayIndia = getIndiaDateOnly();
+    const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
     for (const item of launches) {
       const variantsRes = await db.query(
         `SELECT id, variant_key, attributes->>'ram' AS ram, attributes->>'storage' AS storage, base_price
@@ -15797,6 +16150,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
       item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
       item.price = effectivePrice;
       item.starting_price = effectivePrice;
+      applySmartphoneAvailabilityDetails(item, availabilityForecast, todayIndia);
       const launchStage = resolveSmartphoneLaunchStage(item, todayIndia);
       item.launch_status = launchStage;
       item.launchStatus = launchStage;
