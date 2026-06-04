@@ -1129,26 +1129,31 @@ const isSmartphoneUpcomingFeedItem = (
   todayIndia = getIndiaDateOnly(),
 ) => {
   if (!device) return false;
-  if (device?.is_prebooking === true || device?.isPrebooking === true) {
-    return true;
-  }
-
   const saleStartDate = getSmartphoneFeedStartDate(device);
+  const storeRows = collectSmartphoneStoreRows(device);
+  const hasLiveStores = storeRows.some((store) =>
+    hasSmartphoneLiveStoreSignal(store, todayIndia),
+  );
+  const hasStoreSignals = storeRows.length > 0;
   const launchStage = resolveSmartphoneLaunchStage(device, todayIndia);
-
-  if (["rumored", "announced", "upcoming"].includes(launchStage)) {
-    return true;
-  }
-
-  if (launchStage === "available" || launchStage === "released") {
-    return false;
-  }
 
   if (saleStartDate) {
     return saleStartDate > todayIndia;
   }
 
-  return false;
+  if (["rumored", "announced", "upcoming"].includes(launchStage)) {
+    return true;
+  }
+
+  if (launchStage === "available") {
+    return false;
+  }
+
+  if (launchStage === "released") {
+    return !hasLiveStores && hasStoreSignals ? true : !hasLiveStores;
+  }
+
+  return !hasLiveStores && !hasStoreSignals;
 };
 
 const isSmartphoneLatestFeedItem = (
@@ -15545,6 +15550,21 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
       {
         label: "Upcoming Phones",
         phones: sanitizePhones(upcomingPhones),
+      },
+      {
+        label: "Highest Hook Scores",
+        phones: sanitizePhones(
+          [...rows]
+            .filter((item) => item.hook_score > 0)
+            .sort(
+              compareDescendingSignals(
+                (item) => item.hook_score,
+                (item) => item.buyer_intent,
+                (item) => item.trend_velocity,
+                (item) => item.freshness,
+              ),
+            ),
+        ),
       },
     ].filter((row) => row.phones.length > 0);
 
