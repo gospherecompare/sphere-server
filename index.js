@@ -397,22 +397,6 @@ const resolveSmartphoneLaunchStage = (
   todayIndia = getIndiaDateOnly(),
 ) => {
   if (!device) return null;
-  const saleStartDirect = normalizeDateOnlyInput(
-    device.sale_start_date ??
-      device.saleStartDate ??
-      device.sale_date ??
-      device.saleDate ??
-      null,
-  );
-  const saleStart =
-    saleStartDirect ||
-    getEarliestSaleStartDateFromVariants(device.variants || []);
-  const launchDate = normalizeDateOnlyInput(
-    device.launch_date || device.launchDate || null,
-  );
-  const preorderSignal = Boolean(
-    device.official_preorder_url || device.officialPreorderUrl,
-  );
   const override = normalizeLaunchStatusOverride(
     device.launch_status_override ||
       device.launchStatusOverride ||
@@ -428,18 +412,7 @@ const resolveSmartphoneLaunchStage = (
     return explicitStatus;
   }
 
-  if (saleStart) {
-    if (todayIndia && saleStart <= todayIndia) return "available";
-    return "upcoming";
-  }
-
-  if (launchDate) {
-    if (todayIndia && launchDate > todayIndia) return "upcoming";
-    if (explicitStatus === "upcoming" || preorderSignal) return "upcoming";
-    return "released";
-  }
-
-  if (preorderSignal || explicitStatus === "upcoming") {
+  if (explicitStatus === "upcoming") {
     return "upcoming";
   }
 
@@ -859,9 +832,6 @@ function resolveSmartphoneSaleStage(device, todayIndia = getIndiaDateOnly()) {
       null,
   );
   const storeRows = collectSmartphoneStoreRows(device);
-  const preorderSignal =
-    Boolean(device.official_preorder_url || device.officialPreorderUrl) ||
-    storeRows.some((store) => isSmartphonePrebookingStore(store, todayIndia));
   const liveStores = storeRows.some((store) =>
     hasSmartphoneLiveStoreSignal(store, todayIndia),
   );
@@ -870,7 +840,9 @@ function resolveSmartphoneSaleStage(device, todayIndia = getIndiaDateOnly()) {
 
   if (saleStartDate) {
     if (saleStartDate > todayIndia) {
-      return preorderSignal ? "preorder" : "sale_scheduled";
+      return storeRows.some((store) => isSmartphonePrebookingStore(store, todayIndia))
+        ? "preorder"
+        : "sale_scheduled";
     }
     return liveStores ? "on_sale" : "sale_started";
   }
@@ -884,11 +856,46 @@ function resolveSmartphoneSaleStage(device, todayIndia = getIndiaDateOnly()) {
       "",
   );
   if (normalizedStatus === "available") return "on_sale";
-  if (preorderSignal) return "preorder";
   if (liveStores) return "on_sale";
   if (launchStage === "released" && hasStoreSignals) return "store_pending";
   return "sale_tbd";
 }
+
+const getSmartphoneFeedStartDate = (device) =>
+  normalizeDateOnlyInput(
+    device?.sale_start_date ??
+      device?.saleStartDate ??
+      getEarliestSaleStartDateFromVariants(device?.variants || []) ??
+      null,
+  );
+
+const isSmartphoneUpcomingFeedItem = (
+  device,
+  todayIndia = getIndiaDateOnly(),
+) => {
+  if (!device) return false;
+  const saleStartDate = getSmartphoneFeedStartDate(device);
+  if (saleStartDate) {
+    return saleStartDate > todayIndia;
+  }
+
+  const launchStage = resolveSmartphoneLaunchStage(device, todayIndia);
+  return ["rumored", "announced", "upcoming"].includes(launchStage);
+};
+
+const isSmartphoneLatestFeedItem = (
+  device,
+  todayIndia = getIndiaDateOnly(),
+) => {
+  if (!device) return false;
+  const saleStartDate = getSmartphoneFeedStartDate(device);
+  if (saleStartDate) {
+    return saleStartDate <= todayIndia;
+  }
+
+  const launchStage = resolveSmartphoneLaunchStage(device, todayIndia);
+  return !["rumored", "announced", "upcoming"].includes(launchStage);
+};
 
 const hasOwn = (obj, key) =>
   Object.prototype.hasOwnProperty.call(obj || {}, key);
@@ -14508,8 +14515,11 @@ const handleTrendingSmartphones = async (req, res) => {
       item.price = effectivePrice;
       item.starting_price = effectivePrice;
       const launchStage = resolveSmartphoneLaunchStage(item, todayIndia);
+      const saleStage = resolveSmartphoneSaleStage(item, todayIndia);
       item.launch_status = launchStage;
       item.launchStatus = launchStage;
+      item.sale_status = saleStage;
+      item.saleStatus = saleStage;
       applySmartphoneLaunchPolicy(item, launchStage);
     }
 
@@ -14690,7 +14700,11 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
         item.starting_price = item.price;
         item.launch_status = resolveSmartphoneLaunchStage(item, todayIndia);
         item.launchStatus = item.launch_status;
-        item.is_prebooking = item.launch_status === "upcoming";
+        item.sale_status = resolveSmartphoneSaleStage(item, todayIndia);
+        item.saleStatus = item.sale_status;
+        item.is_prebooking =
+          item.sale_status === "preorder" ||
+          item.sale_status === "sale_scheduled";
         applySmartphoneLaunchPolicy(item, item.launch_status);
 
         item.hook_score =
@@ -14713,20 +14727,28 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
     };
 
     const upcoming = scoredRows
-      .filter((item) =>
-        ["upcoming", "announced", "rumored"].includes(item?.launch_status),
-      )
+      .filter((item) => isSmartphoneUpcomingFeedItem(item, todayIndia))
       .sort((left, right) => {
-        const leftDate = toDateMillis(left.sale_start_date || left.launch_date);
-        const rightDate = toDateMillis(
-          right.sale_start_date || right.launch_date,
-        );
+        const leftDate = toDateMillis(left.sale_start_date || null);
+        const rightDate = toDateMillis(right.sale_start_date || null);
 
         if (leftDate !== null && rightDate !== null && leftDate !== rightDate) {
           return leftDate - rightDate;
         }
         if (leftDate !== null) return -1;
         if (rightDate !== null) return 1;
+
+        const leftLaunchDate = toDateMillis(left.launch_date || null);
+        const rightLaunchDate = toDateMillis(right.launch_date || null);
+        if (
+          leftLaunchDate !== null &&
+          rightLaunchDate !== null &&
+          leftLaunchDate !== rightLaunchDate
+        ) {
+          return leftLaunchDate - rightLaunchDate;
+        }
+        if (leftLaunchDate !== null) return -1;
+        if (rightLaunchDate !== null) return 1;
 
         const stageDelta = stageRank(left.launch_status) - stageRank(right.launch_status);
         if (stageDelta !== 0) return stageDelta;
@@ -14843,11 +14865,15 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
         },
         todayIndia,
       );
-
-      const isUpcoming =
-        launchStage === "rumored" ||
-        launchStage === "announced" ||
-        launchStage === "upcoming";
+      const saleStage = resolveSmartphoneSaleStage(
+        {
+          launch_status_override: row?.launch_status_override ?? null,
+          launch_date: row?.launch_date ?? null,
+          sale_start_date: row?.sale_start_date ?? null,
+          variants: [],
+        },
+        todayIndia,
+      );
 
       return {
         product_id: Number(row.product_id),
@@ -14859,7 +14885,8 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
         launch_status_override: row.launch_status_override || null,
         official_preorder_url: row.official_preorder_url || null,
         sale_start_date: row.sale_start_date || null,
-        is_prebooking: launchStage === "upcoming",
+        sale_status: saleStage,
+        is_prebooking: saleStage === "preorder" || saleStage === "sale_scheduled",
         hook_score: toFiniteNumber(row.hook_score),
         buyer_intent: toFiniteNumber(row.buyer_intent),
         trend_velocity: toFiniteNumber(row.trend_velocity),
@@ -14890,6 +14917,7 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
           launch_status_override: item.launch_status_override,
           official_preorder_url: item.official_preorder_url,
           sale_start_date: item.sale_start_date,
+          sale_status: item.sale_status,
           is_prebooking: item.is_prebooking,
         }),
       );
@@ -14904,17 +14932,14 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
     const latestPhones = [...rows]
       .map((item) => ({
         item,
-        dateMs: toDateMs(item.sale_start_date || item.launch_date),
+        dateMs: toDateMs(item.sale_start_date || item.launch_date || null),
       }))
       .filter(
         (entry) =>
           entry.dateMs != null &&
           entry.dateMs >= latestWindowStartMs &&
           entry.dateMs <= latestWindowEndMs &&
-          entry.item.has_purchase_signal &&
-          !["upcoming", "announced", "rumored"].includes(
-            entry.item.launch_status,
-          ),
+          isSmartphoneLatestFeedItem(entry.item, todayIndia),
       )
       .sort((left, right) => {
         if (left.dateMs !== right.dateMs) {
@@ -14927,17 +14952,26 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
       .map((entry) => entry.item);
 
     const upcomingPhones = [...rows]
-      .filter((item) =>
-        ["upcoming", "announced", "rumored"].includes(item.launch_status),
-      )
+      .filter((item) => isSmartphoneUpcomingFeedItem(item, todayIndia))
       .sort((left, right) => {
-        const leftDate = toDateMs(left.sale_start_date || left.launch_date);
-        const rightDate = toDateMs(right.sale_start_date || right.launch_date);
+        const leftDate = toDateMs(left.sale_start_date || null);
+        const rightDate = toDateMs(right.sale_start_date || null);
         if (leftDate != null && rightDate != null && leftDate !== rightDate) {
           return leftDate - rightDate;
         }
         if (leftDate != null) return -1;
         if (rightDate != null) return 1;
+        const leftLaunchDate = toDateMs(left.launch_date || null);
+        const rightLaunchDate = toDateMs(right.launch_date || null);
+        if (
+          leftLaunchDate != null &&
+          rightLaunchDate != null &&
+          leftLaunchDate !== rightLaunchDate
+        ) {
+          return leftLaunchDate - rightLaunchDate;
+        }
+        if (leftLaunchDate != null) return -1;
+        if (rightLaunchDate != null) return 1;
         return compareDescendingSignals(
           (item) => item.buyer_intent,
           (item) => item.hook_score,
@@ -15605,14 +15639,10 @@ app.get("/api/public/new/smartphones", async (req, res) => {
         const releaseDateMs = parseDateMs(
           item.sale_start_date ?? item.launch_date ?? null,
         );
-        const hasLiveStores = (Array.isArray(item.variants) ? item.variants : [])
-          .flatMap((variant) => variant?.store_prices || [])
-          .some((store) => store?.is_live === true);
 
         return {
           item,
           releaseDateMs,
-          hasLiveStores,
         };
       })
       .filter(
@@ -15620,10 +15650,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
           entry.releaseDateMs != null &&
           entry.releaseDateMs >= latestWindowMinMs &&
           entry.releaseDateMs <= latestWindowMaxMs &&
-          entry.hasLiveStores &&
-          !["upcoming", "announced", "rumored"].includes(
-            entry.item.launch_status,
-          ),
+          isSmartphoneLatestFeedItem(entry.item, todayIndia),
       )
       .sort((left, right) => {
         if (left.releaseDateMs !== right.releaseDateMs) {
