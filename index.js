@@ -397,19 +397,6 @@ const resolveSmartphoneLaunchStage = (
   todayIndia = getIndiaDateOnly(),
 ) => {
   if (!device) return null;
-  const override = normalizeLaunchStatusOverride(
-    device.launch_status_override ||
-      device.launchStatusOverride ||
-      device.launch_status ||
-      device.launchStatus,
-  );
-  if (override) return override;
-
-  const statusHint = normalizeLaunchStatusOverride(
-    device.status || device.availability || device.badge || device.status_text,
-  );
-  if (statusHint) return statusHint;
-
   const saleStartDirect = normalizeDateOnlyInput(
     device.sale_start_date ??
       device.saleStartDate ??
@@ -420,16 +407,43 @@ const resolveSmartphoneLaunchStage = (
   const saleStart =
     saleStartDirect ||
     getEarliestSaleStartDateFromVariants(device.variants || []);
+  const launchDate = normalizeDateOnlyInput(
+    device.launch_date || device.launchDate || null,
+  );
+  const preorderSignal = Boolean(
+    device.official_preorder_url || device.officialPreorderUrl,
+  );
+  const override = normalizeLaunchStatusOverride(
+    device.launch_status_override ||
+      device.launchStatusOverride ||
+      device.launch_status ||
+      device.launchStatus,
+  );
+  const statusHint = normalizeLaunchStatusOverride(
+    device.status || device.availability || device.badge || device.status_text,
+  );
+  const explicitStatus = override || statusHint;
+
+  if (explicitStatus === "rumored" || explicitStatus === "announced") {
+    return explicitStatus;
+  }
+
   if (saleStart) {
     if (todayIndia && saleStart <= todayIndia) return "available";
     return "upcoming";
   }
 
-  const launchDate = normalizeDateOnlyInput(
-    device.launch_date || device.launchDate || null,
-  );
   if (launchDate) {
     if (todayIndia && launchDate > todayIndia) return "upcoming";
+    if (explicitStatus === "upcoming" || preorderSignal) return "upcoming";
+    return "released";
+  }
+
+  if (preorderSignal || explicitStatus === "upcoming") {
+    return "upcoming";
+  }
+
+  if (explicitStatus === "available" || explicitStatus === "released") {
     return "released";
   }
 
@@ -646,6 +660,71 @@ const toOfferPriceNumber = (value) => {
   return Number.isFinite(numeric) ? numeric : null;
 };
 
+const SMARTPHONE_PREBOOKING_PATTERN =
+  /(pre[-\s]?order|pre[-\s]?book|prebooking|presale|coming\s*soon|not[\s_-]*started)/i;
+
+const hasSmartphonePurchaseSignal = (storePrice) => {
+  const item = toPlainObject(storePrice);
+  const price = toOfferPriceNumber(
+    item.price ??
+      item.current_price ??
+      item.sale_price ??
+      item.offer_price ??
+      item.base_price,
+  );
+  const purchaseUrl = String(
+    item.url ??
+      item.link ??
+      item.affiliate_link ??
+      item.affiliateUrl ??
+      "",
+  ).trim();
+
+  return Boolean(price || purchaseUrl);
+};
+
+const isSmartphonePrebookingStore = (
+  storePrice,
+  todayIndia = getIndiaDateOnly(),
+) => {
+  const item = toPlainObject(storePrice);
+  if (item.is_prebooking === true || item.isPrebooking === true) return true;
+
+  const availabilityText = [
+    item.availability_status,
+    item.availabilityStatus,
+    item.sale_status,
+    item.saleStatus,
+    item.cta_label,
+    item.ctaLabel,
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .join(" ");
+
+  if (SMARTPHONE_PREBOOKING_PATTERN.test(availabilityText)) return true;
+
+  const saleStartDate = normalizeDateOnlyInput(
+    item.sale_start_date ??
+      item.saleStartDate ??
+      item.sale_date ??
+      item.saleDate ??
+      item.available_from ??
+      item.availableFrom ??
+      null,
+  );
+  return Boolean(saleStartDate && todayIndia && saleStartDate > todayIndia);
+};
+
+const hasSmartphoneLiveStoreSignal = (
+  storePrice,
+  todayIndia = getIndiaDateOnly(),
+) => {
+  if (!storePrice || typeof storePrice !== "object") return false;
+  if (isSmartphonePrebookingStore(storePrice, todayIndia)) return false;
+  return hasSmartphonePurchaseSignal(storePrice);
+};
+
 const decorateStorePriceAvailability = (
   storePrice,
   todayIndia = getIndiaDateOnly(),
@@ -658,17 +737,24 @@ const decorateStorePriceAvailability = (
       item.saleDate ??
       null,
   );
-  const isPrebooking = Boolean(
-    saleStartDate && todayIndia && saleStartDate > todayIndia,
-  );
+  const isPrebooking = isSmartphonePrebookingStore(item, todayIndia);
+  const isLive = !isPrebooking && hasSmartphonePurchaseSignal(item);
 
   return {
     ...item,
     sale_start_date: saleStartDate,
-    availability_status: isPrebooking ? "prebooking" : "live",
+    availability_status: isPrebooking
+      ? "prebooking"
+      : isLive
+        ? "live"
+        : "listed",
     is_prebooking: isPrebooking,
-    is_live: !isPrebooking,
-    cta_label: isPrebooking ? "Coming Soon" : "Buy Now",
+    is_live: isLive,
+    cta_label: isPrebooking
+      ? "Coming Soon"
+      : isLive
+        ? "Buy Now"
+        : "View Details",
   };
 };
 
@@ -743,6 +829,66 @@ const resolveEffectiveSmartphonePrice = (variants, fallbackPrice = null) => {
 
   return toOfferPriceNumber(fallbackPrice);
 };
+
+function collectSmartphoneStoreRows(device = {}) {
+  const rows = [];
+
+  if (Array.isArray(device?.store_prices)) rows.push(...device.store_prices);
+  if (Array.isArray(device?.storePrices)) rows.push(...device.storePrices);
+
+  for (const variant of Array.isArray(device?.variants) ? device.variants : []) {
+    const variantObj = toPlainObject(variant);
+    if (Array.isArray(variantObj.store_prices)) {
+      rows.push(...variantObj.store_prices);
+    }
+    if (Array.isArray(variantObj.storePrices)) {
+      rows.push(...variantObj.storePrices);
+    }
+  }
+
+  return rows.filter(Boolean);
+}
+
+function resolveSmartphoneSaleStage(device, todayIndia = getIndiaDateOnly()) {
+  if (!device) return "sale_tbd";
+
+  const saleStartDate = normalizeDateOnlyInput(
+    device.sale_start_date ??
+      device.saleStartDate ??
+      getEarliestSaleStartDateFromVariants(device.variants || []) ??
+      null,
+  );
+  const storeRows = collectSmartphoneStoreRows(device);
+  const preorderSignal =
+    Boolean(device.official_preorder_url || device.officialPreorderUrl) ||
+    storeRows.some((store) => isSmartphonePrebookingStore(store, todayIndia));
+  const liveStores = storeRows.some((store) =>
+    hasSmartphoneLiveStoreSignal(store, todayIndia),
+  );
+  const hasStoreSignals = storeRows.length > 0;
+  const launchStage = resolveSmartphoneLaunchStage(device, todayIndia);
+
+  if (saleStartDate) {
+    if (saleStartDate > todayIndia) {
+      return preorderSignal ? "preorder" : "sale_scheduled";
+    }
+    return liveStores ? "on_sale" : "sale_started";
+  }
+
+  const normalizedStatus = normalizeLaunchStatusOverride(
+    device.launch_status_override ||
+      device.launchStatusOverride ||
+      device.launch_status ||
+      device.launchStatus ||
+      device.status ||
+      "",
+  );
+  if (normalizedStatus === "available") return "on_sale";
+  if (preorderSignal) return "preorder";
+  if (liveStores) return "on_sale";
+  if (launchStage === "released" && hasStoreSignals) return "store_pending";
+  return "sale_tbd";
+}
 
 const hasOwn = (obj, key) =>
   Object.prototype.hasOwnProperty.call(obj || {}, key);
@@ -14631,6 +14777,7 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
         s.model,
         s.launch_date,
         s.launch_status_override,
+        s.official_preorder_url,
         (
           SELECT MIN(sp.sale_start_date)
           FROM product_variants v
@@ -14642,7 +14789,22 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
         COALESCE(MAX(ds.hook_score), 0) AS hook_score,
         COALESCE(MAX(ds.buyer_intent), 0) AS buyer_intent,
         COALESCE(MAX(ds.trend_velocity), 0) AS trend_velocity,
-        COALESCE(MAX(ds.freshness), 0) AS freshness
+        COALESCE(MAX(ds.freshness), 0) AS freshness,
+        EXISTS(
+          SELECT 1
+          FROM product_variants v
+          INNER JOIN variant_store_prices sp
+            ON sp.variant_id = v.id
+          WHERE v.product_id = p.id
+            AND (
+              COALESCE(sp.price, 0) > 0
+              OR NULLIF(BTRIM(COALESCE(sp.url, '')), '') IS NOT NULL
+            )
+            AND (
+              sp.sale_start_date IS NULL
+              OR sp.sale_start_date <= CURRENT_DATE
+            )
+        ) AS has_purchase_signal
       FROM products p
       INNER JOIN smartphones s
         ON s.product_id = p.id
@@ -14657,7 +14819,8 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
         p.name,
         s.model,
         s.launch_date,
-        s.launch_status_override
+        s.launch_status_override,
+        s.official_preorder_url
       ORDER BY p.id DESC;
     `);
 
@@ -14694,12 +14857,14 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
         launch_date: row.launch_date || null,
         launch_status: launchStage,
         launch_status_override: row.launch_status_override || null,
+        official_preorder_url: row.official_preorder_url || null,
         sale_start_date: row.sale_start_date || null,
         is_prebooking: launchStage === "upcoming",
         hook_score: toFiniteNumber(row.hook_score),
         buyer_intent: toFiniteNumber(row.buyer_intent),
         trend_velocity: toFiniteNumber(row.trend_velocity),
         freshness: toFiniteNumber(row.freshness),
+        has_purchase_signal: Boolean(row.has_purchase_signal),
       };
     });
 
@@ -14723,19 +14888,48 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
           launch_date: item.launch_date,
           launch_status: item.launch_status,
           launch_status_override: item.launch_status_override,
+          official_preorder_url: item.official_preorder_url,
           sale_start_date: item.sale_start_date,
           is_prebooking: item.is_prebooking,
         }),
       );
 
+    const latestWindowStart = new Date(todayIndia);
+    latestWindowStart.setDate(latestWindowStart.getDate() - 90);
+    const latestWindowEnd = new Date(todayIndia);
+    latestWindowEnd.setDate(latestWindowEnd.getDate() - 15);
+    const latestWindowStartMs = latestWindowStart.getTime();
+    const latestWindowEndMs = latestWindowEnd.getTime();
+
     const latestPhones = [...rows]
-      .map((item) => ({ item, dateMs: toDateMs(item.launch_date) }))
-      .filter((entry) => entry.dateMs != null && !entry.item.is_prebooking)
-      .sort((left, right) => right.dateMs - left.dateMs)
+      .map((item) => ({
+        item,
+        dateMs: toDateMs(item.sale_start_date || item.launch_date),
+      }))
+      .filter(
+        (entry) =>
+          entry.dateMs != null &&
+          entry.dateMs >= latestWindowStartMs &&
+          entry.dateMs <= latestWindowEndMs &&
+          entry.item.has_purchase_signal &&
+          !["upcoming", "announced", "rumored"].includes(
+            entry.item.launch_status,
+          ),
+      )
+      .sort((left, right) => {
+        if (left.dateMs !== right.dateMs) {
+          return right.dateMs - left.dateMs;
+        }
+        return String(right.item.name || "").localeCompare(
+          String(left.item.name || ""),
+        );
+      })
       .map((entry) => entry.item);
 
     const upcomingPhones = [...rows]
-      .filter((item) => item.is_prebooking || item.launch_status !== "released")
+      .filter((item) =>
+        ["upcoming", "announced", "rumored"].includes(item.launch_status),
+      )
       .sort((left, right) => {
         const leftDate = toDateMs(left.sale_start_date || left.launch_date);
         const rightDate = toDateMs(right.sale_start_date || right.launch_date);
@@ -15346,7 +15540,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
       INNER JOIN product_publish pub ON pub.product_id = p.id AND pub.is_published = true
       WHERE p.product_type = 'smartphone'
       ORDER BY COALESCE(s.launch_date, p.created_at) DESC
-      LIMIT 20;
+      LIMIT 60;
     `);
 
     const launches = applySpecScoreToRows(
@@ -15396,9 +15590,52 @@ app.get("/api/public/new/smartphones", async (req, res) => {
       applySmartphoneLaunchPolicy(item, launchStage);
     }
 
-    const publicLaunches = launches.map((item) =>
+    const parseDateMs = (value) => {
+      if (!value) return null;
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
+    };
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const latestWindowMinMs = today.getTime() - 90 * 24 * 60 * 60 * 1000;
+    const latestWindowMaxMs = today.getTime() - 15 * 24 * 60 * 60 * 1000;
+
+    const publicLaunches = launches
+      .map((item) => {
+        const releaseDateMs = parseDateMs(
+          item.sale_start_date ?? item.launch_date ?? null,
+        );
+        const hasLiveStores = (Array.isArray(item.variants) ? item.variants : [])
+          .flatMap((variant) => variant?.store_prices || [])
+          .some((store) => store?.is_live === true);
+
+        return {
+          item,
+          releaseDateMs,
+          hasLiveStores,
+        };
+      })
+      .filter(
+        (entry) =>
+          entry.releaseDateMs != null &&
+          entry.releaseDateMs >= latestWindowMinMs &&
+          entry.releaseDateMs <= latestWindowMaxMs &&
+          entry.hasLiveStores &&
+          !["upcoming", "announced", "rumored"].includes(
+            entry.item.launch_status,
+          ),
+      )
+      .sort((left, right) => {
+        if (left.releaseDateMs !== right.releaseDateMs) {
+          return right.releaseDateMs - left.releaseDateMs;
+        }
+        return Number(right.item.product_id || 0) - Number(left.item.product_id || 0);
+      })
+      .slice(0, 20)
+      .map((entry) => entry.item)
+      .map((item) =>
       toPublicSmartphoneResponse(item),
-    );
+      );
 
     return res.json({ new: publicLaunches });
   } catch (err) {
