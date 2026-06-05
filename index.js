@@ -15553,21 +15553,6 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
 
     const highlightRows = [
       {
-        label: "Popular Phones",
-        phones: sanitizePhones(
-          [...rows]
-            .filter((item) => item.buyer_intent > 0)
-            .sort(
-              compareDescendingSignals(
-                (item) => item.buyer_intent,
-                (item) => item.trend_velocity,
-                (item) => item.hook_score,
-                (item) => item.freshness,
-              ),
-            ),
-        ),
-      },
-      {
         label: "Trending Phones",
         phones: sanitizePhones(
           [...rows]
