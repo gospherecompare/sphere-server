@@ -10046,6 +10046,8 @@ app.get("/api/smartphone/:id", async (req, res) => {
     };
 
     const sanitized = sanitize(smartphone, variants);
+    sanitized.id = productId;
+    sanitized.product_id = productId;
     sanitized.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
     sanitized.name = productName;
     sanitized.brand_logo = productBrandLogo || null;
