@@ -8668,9 +8668,59 @@ app.put("/api/admin/products/:productId/linked-news", authenticate, async (req, 
 app.get("/api/public/blogs", async (req, res) => {
   try {
     const limit = Math.min(50, toPositiveInt(req.query.limit, 12));
+    const requestedProductId = Number(
+      req.query.productId ?? req.query.product_id,
+    );
+    const hasProductFilter =
+      Number.isInteger(requestedProductId) && requestedProductId > 0;
+    const productType = String(req.query.productType || req.query.product_type || "")
+      .trim()
+      .toLowerCase();
+    const whereClauses = ["bl.status = 'published'"];
+    const queryParams = [];
+
+    if (hasProductFilter) {
+      queryParams.push(requestedProductId);
+      const index = queryParams.length;
+      whereClauses.push(`
+        (
+          bl.product_id = $${index}
+          OR EXISTS (
+            SELECT 1
+            FROM blog_product_links bpl_filter
+            WHERE bpl_filter.blog_id = bl.id
+              AND bpl_filter.product_id = $${index}
+          )
+        )
+      `);
+    }
+
+    if (productType) {
+      queryParams.push(productType);
+      const index = queryParams.length;
+      whereClauses.push(`
+        (
+          p.product_type = $${index}
+          OR EXISTS (
+            SELECT 1
+            FROM blog_product_links bpl_type
+            INNER JOIN products p_type
+              ON p_type.id = bpl_type.product_id
+            WHERE bpl_type.blog_id = bl.id
+              AND p_type.product_type = $${index}
+          )
+        )
+      `);
+    }
+
+    queryParams.push(limit);
+    const limitParamIndex = queryParams.length;
+
     const result = await db.query(
       `
       SELECT
+        bl.id,
+        bl.product_id,
         bl.slug,
         bl.title,
         bl.excerpt,
@@ -8685,23 +8735,68 @@ app.get("/api/public/blogs", async (req, res) => {
           )
         ) AS hero_image,
         bl.published_at,
+        bl.updated_at,
         p.name AS product_name,
         p.product_type,
-        b.name AS brand_name
+        b.name AS brand_name,
+        COALESCE(
+          linked.product_ids,
+          CASE
+            WHEN bl.product_id IS NOT NULL THEN ARRAY[bl.product_id]::int[]
+            ELSE ARRAY[]::int[]
+          END
+        ) AS product_ids,
+        COALESCE(
+          linked.products,
+          CASE
+            WHEN bl.product_id IS NOT NULL THEN json_build_array(
+              json_build_object(
+                'product_id', bl.product_id,
+                'id', bl.product_id,
+                'name', p.name,
+                'product_type', p.product_type,
+                'brand_name', b.name
+              )
+            )
+            ELSE '[]'::json
+          END
+        ) AS products
       FROM blogs bl
       LEFT JOIN products p
         ON p.id = bl.product_id
       LEFT JOIN brands b
         ON b.id = p.brand_id
-      WHERE bl.status = 'published'
+      LEFT JOIN LATERAL (
+        SELECT
+          array_agg(linked_product.id ORDER BY bpl.position ASC, linked_product.id ASC) AS product_ids,
+          json_agg(
+            json_build_object(
+              'product_id', linked_product.id,
+              'id', linked_product.id,
+              'name', linked_product.name,
+              'product_type', linked_product.product_type,
+              'brand_name', linked_brand.name
+            )
+            ORDER BY bpl.position ASC, linked_product.id ASC
+          ) AS products
+        FROM blog_product_links bpl
+        INNER JOIN products linked_product
+          ON linked_product.id = bpl.product_id
+        LEFT JOIN brands linked_brand
+          ON linked_brand.id = linked_product.brand_id
+        WHERE bpl.blog_id = bl.id
+      ) linked ON true
+      WHERE ${whereClauses.join("\n        AND ")}
       ORDER BY bl.published_at DESC NULLS LAST, bl.updated_at DESC
-      LIMIT $1
+      LIMIT $${limitParamIndex}
     `,
-      [limit],
+      queryParams,
     );
 
     return res.json({
       limit,
+      product_id: hasProductFilter ? requestedProductId : null,
+      product_type: productType || null,
       blogs: result.rows || [],
     });
   } catch (err) {
@@ -8739,14 +8834,57 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
           )
         ) AS hero_image,
         bl.published_at,
+        bl.updated_at,
         p.name AS product_name,
         p.product_type,
-        b.name AS brand_name
+        b.name AS brand_name,
+        COALESCE(
+          linked.product_ids,
+          CASE
+            WHEN bl.product_id IS NOT NULL THEN ARRAY[bl.product_id]::int[]
+            ELSE ARRAY[]::int[]
+          END
+        ) AS product_ids,
+        COALESCE(
+          linked.products,
+          CASE
+            WHEN bl.product_id IS NOT NULL THEN json_build_array(
+              json_build_object(
+                'product_id', bl.product_id,
+                'id', bl.product_id,
+                'name', p.name,
+                'product_type', p.product_type,
+                'brand_name', b.name
+              )
+            )
+            ELSE '[]'::json
+          END
+        ) AS products
       FROM blogs bl
       LEFT JOIN products p
         ON p.id = bl.product_id
       LEFT JOIN brands b
         ON b.id = p.brand_id
+      LEFT JOIN LATERAL (
+        SELECT
+          array_agg(linked_product.id ORDER BY bpl.position ASC, linked_product.id ASC) AS product_ids,
+          json_agg(
+            json_build_object(
+              'product_id', linked_product.id,
+              'id', linked_product.id,
+              'name', linked_product.name,
+              'product_type', linked_product.product_type,
+              'brand_name', linked_brand.name
+            )
+            ORDER BY bpl.position ASC, linked_product.id ASC
+          ) AS products
+        FROM blog_product_links bpl
+        INNER JOIN products linked_product
+          ON linked_product.id = bpl.product_id
+        LEFT JOIN brands linked_brand
+          ON linked_brand.id = linked_product.brand_id
+        WHERE bpl.blog_id = bl.id
+      ) linked ON true
       WHERE bl.slug = $1
         AND bl.status = 'published'
       LIMIT $2
