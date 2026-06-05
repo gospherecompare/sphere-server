@@ -8129,6 +8129,166 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
   }
 });
 
+app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
+  try {
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const blogId = Number(req.params.id);
+    if (!Number.isInteger(blogId) || blogId <= 0) {
+      return res.status(400).json({ message: "Invalid blog id" });
+    }
+
+    const blogRes = await db.query(
+      `
+      SELECT
+        bl.id,
+        bl.product_id,
+        bl.title,
+        bl.slug,
+        bl.excerpt,
+        bl.content_template,
+        bl.content_rendered,
+        bl.status,
+        bl.blog_eligible,
+        bl.eligibility_snapshot,
+        bl.token_snapshot,
+        bl.meta_title,
+        bl.meta_description,
+        COALESCE(
+          bl.hero_image,
+          (
+            SELECT pi.image_url
+            FROM product_images pi
+            WHERE pi.product_id = bl.product_id
+            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+            LIMIT 1
+          )
+        ) AS hero_image,
+        bl.published_at,
+        bl.created_at,
+        bl.updated_at,
+        p.name AS product_name,
+        p.product_type,
+        b.name AS brand_name
+      FROM blogs bl
+      LEFT JOIN products p
+        ON p.id = bl.product_id
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      WHERE bl.id = $1
+      LIMIT 1
+    `,
+      [blogId],
+    );
+
+    const blog = blogRes.rows[0] || null;
+    if (!blog) {
+      return res.status(404).json({ message: "Blog not found" });
+    }
+
+    const productIds = await readBlogLinkedProductIds(
+      db,
+      blog.id,
+      blog.product_id,
+    );
+
+    let products = [];
+    if (productIds.length) {
+      const productsRes = await db.query(
+        `
+        SELECT
+          p.id AS product_id,
+          p.name,
+          p.product_type,
+          b.name AS brand_name,
+          (
+            SELECT pi.image_url
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+            ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+            LIMIT 1
+          ) AS image
+        FROM products p
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        WHERE p.id = ANY($1::int[])
+        ORDER BY array_position($1::int[], p.id)
+      `,
+        [productIds],
+      );
+      products = (productsRes.rows || []).map((row) => ({
+        product_id: Number(row.product_id),
+        id: Number(row.product_id),
+        name: row.name || "",
+        product_type: row.product_type || "",
+        brand_name: row.brand_name || "",
+        image: row.image || null,
+        hero_image: row.image || null,
+      }));
+    }
+
+    const tokenMap = toPlainObject(blog.token_snapshot);
+    const firstProduct = products[0] || null;
+
+    return res.json({
+      blog: {
+        ...blog,
+        product_ids: productIds,
+        primary_product_id: productIds[0] || Number(blog.product_id) || null,
+        products,
+        token_map: tokenMap,
+        token_keys: Object.keys(tokenMap).sort(),
+        product_type: blog.product_type || firstProduct?.product_type || null,
+        category: null,
+        author_name: "",
+        author_user_id: null,
+        hero_image_source: null,
+        hero_image_alt: "",
+        hero_image_caption: "",
+        tags: [],
+        featured: false,
+        trending: false,
+        pinned: false,
+      },
+    });
+  } catch (err) {
+    console.error("GET /api/admin/blogs/:id error:", err);
+    return res.status(500).json({ message: "Failed to fetch blog" });
+  }
+});
+
+app.delete("/api/admin/blogs/:id", authenticate, async (req, res) => {
+  try {
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const blogId = Number(req.params.id);
+    if (!Number.isInteger(blogId) || blogId <= 0) {
+      return res.status(400).json({ message: "Invalid blog id" });
+    }
+
+    const deleteRes = await db.query(
+      `
+      DELETE FROM blogs
+      WHERE id = $1
+      RETURNING id, product_id, title, slug
+    `,
+      [blogId],
+    );
+
+    if (!deleteRes.rows.length) {
+      return res.status(404).json({ message: "Blog not found" });
+    }
+
+    return res.json({
+      message: "Blog deleted successfully",
+      blog: deleteRes.rows[0],
+    });
+  } catch (err) {
+    console.error("DELETE /api/admin/blogs/:id error:", err);
+    return res.status(500).json({ message: "Failed to delete blog" });
+  }
+});
+
 app.get("/api/admin/news-articles/search", authenticate, async (req, res) => {
   try {
     const limit = Math.min(25, toPositiveInt(req.query.limit, 12));
