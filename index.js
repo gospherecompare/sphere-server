@@ -3382,6 +3382,14 @@ const collectTemplateTokens = (content) => {
   return Array.from(tokens);
 };
 
+const escapeBlogHtml = (value) =>
+  String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
 const renderBlogTemplateWithTokens = (
   content,
   tokenMap,
@@ -3394,7 +3402,7 @@ const renderBlogTemplateWithTokens = (
     if (!normalizedKey) return preserveUnknown ? full : "";
     const value = normalizedTokens[normalizedKey];
     if (!profileHasValue(value)) return preserveUnknown ? full : "";
-    return String(value);
+    return escapeBlogHtml(value);
   });
 };
 
@@ -7871,6 +7879,15 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
         preserveUnknown: true,
       },
     );
+    const unresolvedTokens = collectTemplateTokens(contentRendered);
+    if (status === "published" && unresolvedTokens.length) {
+      return res.status(400).json({
+        message: `Resolve content placeholders before publishing: ${unresolvedTokens
+          .map((token) => `{{${token}}}`)
+          .join(", ")}`,
+        unresolved_tokens: unresolvedTokens,
+      });
+    }
     const slug = await resolveUniqueBlogSlug(
       requestedSlug || title || snapshot?.core?.name,
       productId,
@@ -8030,7 +8047,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
     return res.status(201).json({
       message: "Blog saved successfully",
       blog: writeResult.rows[0],
-      unresolved_tokens: collectTemplateTokens(contentRendered),
+      unresolved_tokens: unresolvedTokens,
     });
   } catch (err) {
     console.error("POST /api/admin/blogs error:", err);
