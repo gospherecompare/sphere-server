@@ -7963,6 +7963,65 @@ app.post("/api/admin/careers/:id/notify", authenticate, async (req, res) => {
 });
 
 /* ---- Blogs (Eligibility + Suggestions + Editor) ---- */
+app.get("/api/rbac/users", authenticate, async (req, res) => {
+  try {
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const result = await db.query(
+      `
+      SELECT
+        id,
+        user_name,
+        first_name,
+        last_name,
+        email,
+        role,
+        created_at
+      FROM "user"
+      ORDER BY
+        COALESCE(first_name, '') ASC,
+        COALESCE(user_name, '') ASC,
+        id ASC
+      LIMIT 500
+    `,
+    );
+
+    const users = (result.rows || []).map((user) => {
+      const fullName = [user.first_name, user.last_name]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+        .join(" ");
+      const displayName =
+        fullName ||
+        String(user.user_name || "").trim() ||
+        String(user.email || "").trim() ||
+        `User ${user.id}`;
+
+      return {
+        id: Number(user.id),
+        user_name: user.user_name || "",
+        username: user.user_name || "",
+        first_name: user.first_name || "",
+        last_name: user.last_name || "",
+        full_name: fullName,
+        display_name: displayName,
+        author_name: displayName,
+        email: user.email || "",
+        role: user.role || "viewer",
+        role_title: user.role || "viewer",
+        is_active: true,
+        active: true,
+        created_at: user.created_at || null,
+      };
+    });
+
+    return res.json(users);
+  } catch (err) {
+    console.error("GET /api/rbac/users error:", err);
+    return res.status(500).json({ message: "Failed to load users" });
+  }
+});
+
 app.get("/api/admin/blogs/candidates", authenticate, async (req, res) => {
   try {
     if (!ensureBlogManagerAccess(req, res)) return;
@@ -8113,6 +8172,161 @@ app.get(
     }
   },
 );
+
+app.post("/api/admin/blogs/context", authenticate, async (req, res) => {
+  try {
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const requestedProductIds = normalizePositiveIntegerList(
+      Array.isArray(req.body?.product_ids)
+        ? req.body.product_ids
+        : Array.isArray(req.body?.productIds)
+          ? req.body.productIds
+          : [req.body?.product_id],
+    );
+    const requestedPrimaryProductId = Number(
+      req.body?.primary_product_id ?? req.body?.product_id,
+    );
+    const orderedProductIds = normalizePositiveIntegerList([
+      requestedPrimaryProductId,
+      ...requestedProductIds,
+    ]);
+
+    if (!orderedProductIds.length) {
+      return res
+        .status(400)
+        .json({ message: "Select at least one product first" });
+    }
+
+    const profileConfig = await readDeviceFieldProfilesConfig();
+    const snapshots = await Promise.all(
+      orderedProductIds.map((productId) =>
+        fetchBlogProductSnapshot(productId, profileConfig.profiles),
+      ),
+    );
+
+    const missingProductId = orderedProductIds.find(
+      (_productId, index) => !snapshots[index],
+    );
+    if (missingProductId) {
+      return res.status(404).json({
+        message: `Product not found or unsupported: ${missingProductId}`,
+      });
+    }
+
+    const products = snapshots.map((snapshot) => ({
+      product_id: snapshot.product_id,
+      id: snapshot.product_id,
+      product_type: snapshot.product_type,
+      name: snapshot.core?.name || "",
+      brand_name: snapshot.core?.brand_name || "",
+      spec_score: snapshot.scored?.spec_score ?? 0,
+      price: formatBlogPrice(snapshot.lowest_price) || null,
+      image: snapshot.hero_image || null,
+      image_url: snapshot.hero_image || null,
+      hero_image: snapshot.hero_image || null,
+      images: Array.isArray(snapshot.images) ? snapshot.images : [],
+    }));
+
+    const primarySnapshot = snapshots[0];
+    const tokenMap = buildBlogTokenMap(primarySnapshot);
+    const tokenKeys = Object.keys(tokenMap).sort();
+    const suggestions = buildBlogSuggestions(primarySnapshot, tokenMap);
+
+    let existingBlog = null;
+    const shouldMatchExisting =
+      req.body?.match_existing === true || req.body?.matchExisting === true;
+    if (shouldMatchExisting) {
+      const existing = await db.query(
+        `
+        SELECT
+          bl.id,
+          bl.product_id,
+          bl.title,
+          bl.slug,
+          bl.excerpt,
+          bl.content_template,
+          bl.content_rendered,
+          bl.status,
+          bl.blog_eligible,
+          bl.eligibility_snapshot,
+          bl.token_snapshot,
+          bl.meta_title,
+          bl.meta_description,
+          COALESCE(
+            bl.hero_image,
+            (
+              SELECT pi.image_url
+              FROM product_images pi
+              WHERE pi.product_id = bl.product_id
+              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+              LIMIT 1
+            )
+          ) AS hero_image,
+          bl.published_at,
+          bl.created_at,
+          bl.updated_at
+        FROM blogs bl
+        WHERE bl.product_id = $1
+           OR EXISTS (
+             SELECT 1
+             FROM blog_product_links bpl
+             WHERE bpl.blog_id = bl.id
+               AND bpl.product_id = $1
+           )
+        ORDER BY
+          CASE WHEN bl.product_id = $1 THEN 0 ELSE 1 END,
+          bl.updated_at DESC,
+          bl.id DESC
+        LIMIT 1
+      `,
+        [orderedProductIds[0]],
+      );
+
+      if (existing.rows[0]) {
+        const row = existing.rows[0];
+        const existingProductIds = await readBlogLinkedProductIds(
+          db,
+          row.id,
+          row.product_id,
+        );
+        const existingTokenMap = toPlainObject(row.token_snapshot);
+        existingBlog = {
+          ...row,
+          product_ids: existingProductIds,
+          primary_product_id:
+            existingProductIds[0] || Number(row.product_id) || null,
+          token_map: existingTokenMap,
+          token_keys: Object.keys(existingTokenMap).sort(),
+          category: null,
+          author_name: "",
+          author_user_id: null,
+          hero_image_source: null,
+          hero_image_alt: "",
+          hero_image_caption: "",
+          tags: [],
+          featured: false,
+          trending: false,
+          pinned: false,
+        };
+      }
+    }
+
+    return res.json({
+      product_ids: orderedProductIds,
+      primary_product_id: orderedProductIds[0],
+      products,
+      product: products[0] || null,
+      token_map: tokenMap,
+      token_keys: tokenKeys,
+      suggestions,
+      existing_blog: existingBlog,
+    });
+  } catch (err) {
+    console.error("POST /api/admin/blogs/context error:", err);
+    return res.status(500).json({ message: "Failed to load blog context" });
+  }
+});
 
 app.post("/api/admin/blogs/preview", authenticate, async (req, res) => {
   try {
@@ -14721,6 +14935,7 @@ app.get("/api/reports/launch-timing", authenticate, async (req, res) => {
       [limit],
     );
 
+    const todayIndia = getIndiaDateOnly();
     const devices = (result.rows || []).map((row) => {
       const base = {
         id: Number(row.product_id),
