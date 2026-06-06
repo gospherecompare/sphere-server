@@ -4306,6 +4306,70 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
+      CREATE TABLE IF NOT EXISTS auth_data_delete_pin (
+        id INT PRIMARY KEY CHECK (id = 1),
+        pin_hash TEXT NOT NULL,
+        updated_by INT REFERENCES "user"(id) ON DELETE SET NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS admin_delete_audit (
+        id SERIAL PRIMARY KEY,
+        action TEXT NOT NULL DEFAULT 'delete',
+        target_route TEXT NOT NULL,
+        target_table TEXT,
+        target_id TEXT,
+        target_name TEXT,
+        target_type TEXT,
+        reason TEXT NOT NULL,
+        deleted_by INT REFERENCES "user"(id) ON DELETE SET NULL,
+        deleted_by_email TEXT,
+        deleted_by_role TEXT,
+        request_ip TEXT,
+        user_agent TEXT,
+        http_status INT,
+        outcome TEXT,
+        request_context JSONB NOT NULL DEFAULT '{}'::jsonb,
+        target_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_admin_delete_audit_created_at
+      ON admin_delete_audit (created_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_admin_delete_audit_target
+      ON admin_delete_audit (target_table, target_id);
+    `);
+
+    const initialDataDeletePin = String(
+      process.env.DATA_DELETE_PIN || process.env.DELETE_APPROVAL_PIN || "",
+    ).trim();
+    if (DATA_DELETE_PIN_PATTERN.test(initialDataDeletePin)) {
+      const existingDeletePin = await db.query(
+        `SELECT id FROM auth_data_delete_pin WHERE id = 1 LIMIT 1`,
+      );
+      if (!existingDeletePin.rows?.length) {
+        const pinHash = await bcrypt.hash(
+          initialDataDeletePin,
+          DATA_DELETE_PIN_HASH_ROUNDS,
+        );
+        await db.query(
+          `INSERT INTO auth_data_delete_pin (id, pin_hash, updated_at)
+           VALUES (1, $1, now())
+           ON CONFLICT (id) DO NOTHING`,
+          [pinHash],
+        );
+      }
+    }
+
+    await safeQuery(`
       CREATE TABLE IF NOT EXISTS auth_webauthn_credentials (
         id SERIAL PRIMARY KEY,
         user_id INT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
@@ -4869,6 +4933,8 @@ async function runMigrations() {
 
 const OTP_CHALLENGE_TABLE = "auth_login_challenges";
 const ORGANIZATION_PIN_TABLE = "auth_organization_pin";
+const DATA_DELETE_PIN_TABLE = "auth_data_delete_pin";
+const DATA_DELETE_AUDIT_TABLE = "admin_delete_audit";
 const WEBAUTHN_CREDENTIAL_TABLE = "auth_webauthn_credentials";
 const WEBAUTHN_CHALLENGE_TABLE = "auth_webauthn_challenges";
 const OTP_CODE_LENGTH = 6;
@@ -4878,6 +4944,10 @@ const OTP_MAX_ATTEMPTS = 5;
 const OTP_HASH_ROUNDS = 10;
 const ORGANIZATION_PIN_HASH_ROUNDS = 10;
 const ORGANIZATION_PIN_LENGTH = 7;
+const DATA_DELETE_PIN_HASH_ROUNDS = 10;
+const DATA_DELETE_PIN_LENGTH = 4;
+const DATA_DELETE_REASON_MIN_LENGTH = 5;
+const DATA_DELETE_REASON_MAX_LENGTH = 1000;
 const OTP_REVERIFY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const ACCESS_TOKEN_TTL = "1h";
 const PENDING_LOGIN_TOKEN_PURPOSE = "admin_pending_login";
@@ -4896,6 +4966,9 @@ const WEBAUTHN_ALLOWED_ORIGINS = new Set([
 ]);
 const ORGANIZATION_PIN_PATTERN = new RegExp(
   `^\\d{${ORGANIZATION_PIN_LENGTH}}$`,
+);
+const DATA_DELETE_PIN_PATTERN = new RegExp(
+  `^\\d{${DATA_DELETE_PIN_LENGTH}}$`,
 );
 
 const loginInitiateLimiter = rateLimit({
@@ -4938,6 +5011,16 @@ const loginPinVerifyLimiter = rateLimit({
   },
 });
 
+const dataDeletePinVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message: "Too many delete PIN attempts. Please try again later.",
+  },
+});
+
 const normalizeLoginEmail = (value) =>
   String(value || "")
     .trim()
@@ -4950,6 +5033,20 @@ const normalizeOrganizationPinInput = (value) =>
 
 const isValidOrganizationPin = (value) =>
   ORGANIZATION_PIN_PATTERN.test(String(value || ""));
+
+const normalizeDataDeletePinInput = (value) =>
+  String(value || "")
+    .replace(/\D/g, "")
+    .slice(0, DATA_DELETE_PIN_LENGTH);
+
+const isValidDataDeletePin = (value) =>
+  DATA_DELETE_PIN_PATTERN.test(String(value || ""));
+
+const normalizeDeleteReasonInput = (value) =>
+  String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, DATA_DELETE_REASON_MAX_LENGTH);
 
 const parseBooleanInput = (value) => {
   if (typeof value === "boolean") return value;
@@ -5204,6 +5301,187 @@ async function getOrganizationPinStatus() {
     updated_at: record?.updated_at || null,
     updated_by: record?.updated_by || null,
   };
+}
+
+async function readDataDeletePinRecord() {
+  const result = await db.query(
+    `SELECT id, pin_hash, updated_by, updated_at
+     FROM ${DATA_DELETE_PIN_TABLE}
+     WHERE id = 1
+     LIMIT 1`,
+  );
+  return result.rows[0] || null;
+}
+
+async function updateDataDeletePin(pin, updatedBy) {
+  const pinHash = await bcrypt.hash(pin, DATA_DELETE_PIN_HASH_ROUNDS);
+  const result = await db.query(
+    `INSERT INTO ${DATA_DELETE_PIN_TABLE} (id, pin_hash, updated_by, updated_at)
+     VALUES (1, $1, $2, now())
+     ON CONFLICT (id) DO UPDATE
+       SET pin_hash = EXCLUDED.pin_hash,
+           updated_by = EXCLUDED.updated_by,
+           updated_at = EXCLUDED.updated_at
+     RETURNING updated_by, updated_at`,
+    [pinHash, updatedBy],
+  );
+  return result.rows[0] || null;
+}
+
+async function getDataDeletePinStatus() {
+  const record = await readDataDeletePinRecord();
+  return {
+    isConfigured: Boolean(record?.pin_hash),
+    updated_at: record?.updated_at || null,
+    updated_by: record?.updated_by || null,
+  };
+}
+
+const resolveRequestIp = (req) =>
+  String(req.headers?.["x-forwarded-for"] || "")
+    .split(",")[0]
+    .trim() ||
+  req.ip ||
+  null;
+
+const getDeleteApprovalInput = (req) => {
+  const body = req.body || {};
+  const rawPin =
+    body.delete_pin ??
+    body.deletePin ??
+    body.pin ??
+    body.confirm_pin ??
+    body.confirmPin ??
+    "";
+  const rawReason =
+    body.delete_reason ??
+    body.deleteReason ??
+    body.reason ??
+    body.confirm_reason ??
+    body.confirmReason ??
+    "";
+
+  return {
+    pin: normalizeDataDeletePinInput(rawPin),
+    reason: normalizeDeleteReasonInput(rawReason),
+  };
+};
+
+const resolveDeleteAuditTarget = (req) => {
+  const target = req.deleteAuditTarget || {};
+  const params = req.params || {};
+  const targetId =
+    target.target_id ??
+    target.targetId ??
+    target.product_id ??
+    target.productId ??
+    params.id ??
+    params.productId ??
+    params.smartphoneId ??
+    null;
+
+  return {
+    target_table: target.target_table || target.targetTable || null,
+    target_id:
+      targetId !== null && targetId !== undefined ? String(targetId) : null,
+    target_name: target.target_name || target.targetName || target.name || null,
+    target_type:
+      target.target_type ||
+      target.targetType ||
+      target.product_type ||
+      target.productType ||
+      null,
+    target_snapshot:
+      target.target_snapshot ||
+      target.targetSnapshot ||
+      target.snapshot ||
+      {},
+  };
+};
+
+async function writeDeleteAuditRecord(req, res) {
+  if (!req?.deleteApproval) return;
+
+  const target = resolveDeleteAuditTarget(req);
+  const context = {
+    params: req.params || {},
+    query: req.query || {},
+  };
+  const status = Number(res?.statusCode) || null;
+  const outcome =
+    status !== null && status >= 200 && status < 300 ? "deleted" : "failed";
+
+  await db.query(
+    `INSERT INTO ${DATA_DELETE_AUDIT_TABLE}
+       (action, target_route, target_table, target_id, target_name, target_type,
+        reason, deleted_by, deleted_by_email, deleted_by_role, request_ip,
+        user_agent, http_status, outcome, request_context, target_snapshot)
+     VALUES
+       ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16::jsonb)`,
+    [
+      "delete",
+      req.originalUrl || req.url || "",
+      target.target_table,
+      target.target_id,
+      target.target_name,
+      target.target_type,
+      req.deleteApproval.reason,
+      req.user?.id || null,
+      req.user?.email || null,
+      req.user?.role || null,
+      resolveRequestIp(req),
+      req.headers?.["user-agent"] || null,
+      status,
+      outcome,
+      JSON.stringify(context),
+      JSON.stringify(target.target_snapshot || {}),
+    ],
+  );
+}
+
+async function requireDataDeleteApproval(req, res, next) {
+  try {
+    const { pin, reason } = getDeleteApprovalInput(req);
+
+    if (!isValidDataDeletePin(pin)) {
+      return res.status(400).json({
+        message: `Delete PIN must be exactly ${DATA_DELETE_PIN_LENGTH} digits.`,
+      });
+    }
+
+    if (reason.length < DATA_DELETE_REASON_MIN_LENGTH) {
+      return res.status(400).json({
+        message: `Delete reason must be at least ${DATA_DELETE_REASON_MIN_LENGTH} characters.`,
+      });
+    }
+
+    const pinRecord = await readDataDeletePinRecord();
+    if (!pinRecord?.pin_hash) {
+      return res.status(409).json({
+        message:
+          "Delete PIN is not configured. Set DATA_DELETE_PIN or configure it from admin settings before deleting data.",
+      });
+    }
+
+    const matches = await bcrypt.compare(pin, pinRecord.pin_hash);
+    if (!matches) {
+      return res.status(401).json({ message: "Invalid delete PIN." });
+    }
+
+    req.deleteApproval = { reason };
+    res.on("finish", () => {
+      void writeDeleteAuditRecord(req, res).catch((error) => {
+        console.error("Delete audit write failed:", error);
+      });
+    });
+
+    return next();
+  } catch (err) {
+    console.error("Delete approval verification failed:", err);
+    return res.status(500).json({
+      message: "Unable to verify delete approval. Please try again.",
+    });
+  }
 }
 
 const hashLoginTicket = (loginTicket) =>
@@ -6411,6 +6689,83 @@ app.put("/api/auth/organization-pin", authenticate, async (req, res) => {
     console.error("Update organization PIN error:", err);
     return res.status(500).json({
       message: "Unable to update the organization PIN. Please try again.",
+    });
+  }
+});
+
+app.get("/api/auth/data-delete-pin/status", authenticate, async (req, res) => {
+  try {
+    const pinStatus = await getDataDeletePinStatus();
+    return res.json({
+      success: true,
+      isConfigured: pinStatus.isConfigured,
+      updated_at: pinStatus.updated_at,
+      updated_by: pinStatus.updated_by,
+    });
+  } catch (err) {
+    console.error("Get data delete PIN status error:", err);
+    return res.status(500).json({
+      message: "Unable to load delete PIN status.",
+    });
+  }
+});
+
+app.put("/api/auth/data-delete-pin", authenticate, async (req, res) => {
+  try {
+    const currentPin = normalizeDataDeletePinInput(req.body?.currentPin);
+    const newPin = normalizeDataDeletePinInput(req.body?.newPin);
+    const pinStatus = await getDataDeletePinStatus();
+
+    if (!isValidDataDeletePin(newPin)) {
+      return res.status(400).json({
+        message: `Delete PIN must be exactly ${DATA_DELETE_PIN_LENGTH} digits.`,
+      });
+    }
+
+    if (pinStatus.isConfigured) {
+      if (!currentPin) {
+        return res
+          .status(400)
+          .json({ message: "Current delete PIN is required" });
+      }
+
+      if (!isValidDataDeletePin(currentPin)) {
+        return res.status(400).json({
+          message: `Delete PIN must be exactly ${DATA_DELETE_PIN_LENGTH} digits.`,
+        });
+      }
+
+      if (currentPin === newPin) {
+        return res.status(400).json({
+          message: "New delete PIN must be different from current PIN",
+        });
+      }
+
+      const deletePin = await readDataDeletePinRecord();
+      const matches =
+        deletePin?.pin_hash &&
+        (await bcrypt.compare(currentPin, deletePin.pin_hash));
+      if (!matches) {
+        return res
+          .status(401)
+          .json({ message: "Current delete PIN is incorrect" });
+      }
+    }
+
+    const updated = await updateDataDeletePin(newPin, req.user.id);
+    return res.json({
+      success: true,
+      message: pinStatus.isConfigured
+        ? "Delete PIN updated successfully"
+        : "Delete PIN created successfully",
+      isConfigured: true,
+      updated_at: updated?.updated_at || null,
+      updated_by: updated?.updated_by ?? req.user.id,
+    });
+  } catch (err) {
+    console.error("Update data delete PIN error:", err);
+    return res.status(500).json({
+      message: "Unable to update the delete PIN. Please try again.",
     });
   }
 });
@@ -8257,7 +8612,7 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/api/admin/blogs/:id", authenticate, async (req, res) => {
+app.delete("/api/admin/blogs/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     if (!ensureBlogManagerAccess(req, res)) return;
 
@@ -9007,7 +9362,7 @@ app.put("/api/admin/customers/:id", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/api/admin/customers/:id", authenticate, async (req, res) => {
+app.delete("/api/admin/customers/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     const customerId = req.params.id;
 
@@ -9252,6 +9607,8 @@ app.put(
 app.delete(
   "/api/private/smartphone/:smartphoneId/rating",
   authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
   async (req, res) => {
     try {
       const smartphoneId = Number(req.params.smartphoneId);
@@ -12316,7 +12673,7 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
 });
 
 // Delete smartphone
-app.delete("/api/smartphone/:id", authenticate, async (req, res) => {
+app.delete("/api/smartphone/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   const client = await db.connect();
   console.log(req.params.id);
   try {
@@ -12345,6 +12702,30 @@ app.delete("/api/smartphone/:id", authenticate, async (req, res) => {
     }
 
     const productId = sres.rows[0].product_id;
+    const productMetaRes = await client.query(
+      `SELECT
+         p.id,
+         p.name,
+         p.product_type,
+         b.name AS brand_name,
+         COALESCE(pub.is_published, false) AS is_published
+       FROM products p
+       LEFT JOIN brands b
+         ON b.id = p.brand_id
+       LEFT JOIN product_publish pub
+         ON pub.product_id = p.id
+       WHERE p.id = $1
+       LIMIT 1`,
+      [productId],
+    );
+    const productMeta = productMetaRes.rows[0] || {};
+    req.deleteAuditTarget = {
+      target_table: "products",
+      target_id: productId,
+      target_name: productMeta.name || `Smartphone ${productId}`,
+      target_type: productMeta.product_type || "smartphone",
+      target_snapshot: productMeta,
+    };
 
     // check publish status from product_publish table
     const pub = await client.query(
@@ -12393,7 +12774,7 @@ app.delete("/api/smartphone/:id", authenticate, async (req, res) => {
 });
 
 // Delete laptop
-app.delete("/api/laptop/:id", authenticate, async (req, res) => {
+app.delete("/api/laptop/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   const client = await db.connect();
   try {
     const lid = Number(req.params.id);
@@ -12420,6 +12801,30 @@ app.delete("/api/laptop/:id", authenticate, async (req, res) => {
     }
 
     const productId = lres.rows[0].product_id;
+    const productMetaRes = await client.query(
+      `SELECT
+         p.id,
+         p.name,
+         p.product_type,
+         b.name AS brand_name,
+         COALESCE(pub.is_published, false) AS is_published
+       FROM products p
+       LEFT JOIN brands b
+         ON b.id = p.brand_id
+       LEFT JOIN product_publish pub
+         ON pub.product_id = p.id
+       WHERE p.id = $1
+       LIMIT 1`,
+      [productId],
+    );
+    const productMeta = productMetaRes.rows[0] || {};
+    req.deleteAuditTarget = {
+      target_table: "products",
+      target_id: productId,
+      target_name: productMeta.name || `Laptop ${productId}`,
+      target_type: productMeta.product_type || "laptop",
+      target_snapshot: productMeta,
+    };
 
     // Prevent deleting published laptops
     const pub = await client.query(
@@ -12460,7 +12865,7 @@ app.delete("/api/laptop/:id", authenticate, async (req, res) => {
 });
 
 // Delete TV
-app.delete("/api/tvs/:id", authenticate, async (req, res) => {
+app.delete("/api/tvs/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   const client = await db.connect();
   try {
     const tid = Number(req.params.id);
@@ -12480,6 +12885,30 @@ app.delete("/api/tvs/:id", authenticate, async (req, res) => {
     }
 
     const productId = tvRes.rows[0].product_id;
+    const productMetaRes = await client.query(
+      `SELECT
+         p.id,
+         p.name,
+         p.product_type,
+         b.name AS brand_name,
+         COALESCE(pub.is_published, false) AS is_published
+       FROM products p
+       LEFT JOIN brands b
+         ON b.id = p.brand_id
+       LEFT JOIN product_publish pub
+         ON pub.product_id = p.id
+       WHERE p.id = $1
+       LIMIT 1`,
+      [productId],
+    );
+    const productMeta = productMetaRes.rows[0] || {};
+    req.deleteAuditTarget = {
+      target_table: "products",
+      target_id: productId,
+      target_name: productMeta.name || `TV ${productId}`,
+      target_type: productMeta.product_type || "tv",
+      target_snapshot: productMeta,
+    };
 
     const pubRes = await client.query(
       "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
@@ -13150,7 +13579,7 @@ app.put("/api/ram-storage-config/:id", authenticate, async (req, res) => {
 });
 
 // Delete a spec entry (authenticated) - path expected by client
-app.delete("/api/ram-storage-config/:id", authenticate, async (req, res) => {
+app.delete("/api/ram-storage-config/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!id || Number.isNaN(id))
@@ -13260,7 +13689,7 @@ app.put("/api/categories/:id", authenticate, async (req, res) => {
 });
 
 // Delete category (authenticated)
-app.delete("/api/categories/:id", authenticate, async (req, res) => {
+app.delete("/api/categories/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!id || Number.isNaN(id))
@@ -13344,7 +13773,7 @@ app.put("/api/online-stores/:id", authenticate, async (req, res) => {
 });
 
 // Delete an online store (authenticated)
-app.delete("/api/online-stores/:id", authenticate, async (req, res) => {
+app.delete("/api/online-stores/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!id || Number.isNaN(id))
@@ -13382,7 +13811,7 @@ app.patch("/api/online-stores/:id/status", authenticate, async (req, res) => {
 });
 
 // Delete a spec entry (authenticated)
-app.delete("/api/specs/:id", authenticate, async (req, res) => {
+app.delete("/api/specs/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!id || Number.isNaN(id))
@@ -13401,7 +13830,7 @@ app.delete("/api/specs/:id", authenticate, async (req, res) => {
 });
 
 // Delete a variant by id (will cascade-delete store prices via FK)
-app.delete("/api/variant/:id", authenticate, async (req, res) => {
+app.delete("/api/variant/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     const vid = Number(req.params.id);
     if (!vid || Number.isNaN(vid))
@@ -13425,7 +13854,7 @@ app.delete("/api/variant/:id", authenticate, async (req, res) => {
 });
 
 // Delete a store price entry by id
-app.delete("/api/storeprice/:id", authenticate, async (req, res) => {
+app.delete("/api/storeprice/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     const pid = Number(req.params.id);
     if (!pid || Number.isNaN(pid))
@@ -13788,7 +14217,7 @@ app.put("/api/brands/:id", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/api/brands/:id", authenticate, async (req, res) => {
+app.delete("/api/brands/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ message: "Invalid brand id" });
@@ -14030,7 +14459,7 @@ app.put("/api/admin/banners/:id", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/api/admin/banners/:id", authenticate, async (req, res) => {
+app.delete("/api/admin/banners/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ message: "Invalid banner id" });
@@ -18684,7 +19113,7 @@ app.put("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
+app.delete("/api/admin/compare-pages/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     if (!requireAdminAccess(req, res)) return;
 
@@ -20373,7 +20802,7 @@ app.put("/api/ram-storage-config/:id", authenticate, async (req, res) => {
 });
 
 // Delete config
-app.delete("/api/ram-storage-config/:id", authenticate, async (req, res) => {
+app.delete("/api/ram-storage-config/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
   try {
     const id = req.params.id;
     await db.query(`DELETE FROM ram_storage_long WHERE id = $1`, [id]);
