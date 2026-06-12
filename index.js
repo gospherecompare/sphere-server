@@ -39,6 +39,15 @@ const {
 const {
   recomputeSmartphoneCompetitorAnalysis,
 } = require("./utils/competitorAnalysis");
+const {
+  ROLE_PRESETS: RBAC_ROLE_PRESETS,
+  expandPermissionSet: expandRbacPermissionSet,
+  getDefaultPermissionsForRole,
+  getPermissionMatrix: getRbacPermissionMatrix,
+  hasPermissionSet: hasRbacPermissionSet,
+  normalizePermissionToken: normalizeRbacPermissionToken,
+  normalizeRole: normalizeRbacRole,
+} = require("./utils/rbacCatalog");
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
@@ -84,10 +93,7 @@ const ALLOWED_ORIGINS = new Set(
     .filter(Boolean),
 );
 
-const ALLOWED_ORIGIN_HOST_SUFFIXES = [
-  ".tryhook.shop",
-  ".hooks.in",
-];
+const ALLOWED_ORIGIN_HOST_SUFFIXES = [".tryhook.shop", ".hooks.in"];
 
 const isAllowedOriginHost = (hostname) => {
   const normalizedHost = String(hostname || "")
@@ -650,11 +656,7 @@ const hasSmartphonePurchaseSignal = (storePrice) => {
       item.base_price,
   );
   const purchaseUrl = String(
-    item.url ??
-      item.link ??
-      item.affiliate_link ??
-      item.affiliateUrl ??
-      "",
+    item.url ?? item.link ?? item.affiliate_link ?? item.affiliateUrl ?? "",
   ).trim();
 
   return Boolean(price || purchaseUrl);
@@ -813,7 +815,9 @@ function collectSmartphoneStoreRows(device = {}) {
   if (Array.isArray(device?.store_prices)) rows.push(...device.store_prices);
   if (Array.isArray(device?.storePrices)) rows.push(...device.storePrices);
 
-  for (const variant of Array.isArray(device?.variants) ? device.variants : []) {
+  for (const variant of Array.isArray(device?.variants)
+    ? device.variants
+    : []) {
     const variantObj = toPlainObject(variant);
     if (Array.isArray(variantObj.store_prices)) {
       rows.push(...variantObj.store_prices);
@@ -844,7 +848,9 @@ function resolveSmartphoneSaleStage(device, todayIndia = getIndiaDateOnly()) {
 
   if (saleStartDate) {
     if (saleStartDate > todayIndia) {
-      return storeRows.some((store) => isSmartphonePrebookingStore(store, todayIndia))
+      return storeRows.some((store) =>
+        isSmartphonePrebookingStore(store, todayIndia),
+      )
         ? "preorder"
         : "sale_scheduled";
     }
@@ -1089,10 +1095,14 @@ const resolveSmartphoneStoreStage = (
   todayIndia = getIndiaDateOnly(),
 ) => {
   const storeRows = collectSmartphoneStoreRows(device);
-  if (storeRows.some((store) => hasSmartphoneLiveStoreSignal(store, todayIndia))) {
+  if (
+    storeRows.some((store) => hasSmartphoneLiveStoreSignal(store, todayIndia))
+  ) {
     return "live";
   }
-  if (storeRows.some((store) => isSmartphonePrebookingStore(store, todayIndia))) {
+  if (
+    storeRows.some((store) => isSmartphonePrebookingStore(store, todayIndia))
+  ) {
     return "prebooking";
   }
   if (storeRows.length > 0) {
@@ -3407,10 +3417,14 @@ const renderBlogTemplateWithTokens = (
 };
 
 const ensureBlogManagerAccess = (req, res) => {
-  const role = String(req?.user?.role || "")
-    .trim()
-    .toLowerCase();
-  if (role === "admin" || role === "editor") return true;
+  const role = normalizeRbacRole(req?.user?.role || "");
+  if (
+    role === "admin" ||
+    role === "ceo" ||
+    role === "editor" ||
+    role === "content_admin"
+  )
+    return true;
   res.status(403).json({ message: "Admin or editor access required" });
   return false;
 };
@@ -3838,7 +3852,9 @@ const mapBlogLinkRows = (rows = []) =>
     title: String(row.title || "").trim(),
     slug: String(row.slug || "").trim(),
     excerpt: String(row.excerpt || "").trim(),
-    status: String(row.status || "draft").trim().toLowerCase(),
+    status: String(row.status || "draft")
+      .trim()
+      .toLowerCase(),
     published_at: row.published_at || null,
     updated_at: row.updated_at || null,
     primary_product_id: Number(row.primary_product_id) || null,
@@ -4261,6 +4277,77 @@ async function runMigrations() {
     await safeQuery(`
       ALTER TABLE "user"
       ADD COLUMN IF NOT EXISTS last_otp_verified_at TIMESTAMPTZ;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE "user"
+      ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';
+    `);
+
+    await safeQuery(`
+      ALTER TABLE "user"
+      ADD COLUMN IF NOT EXISTS department TEXT;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE "user"
+      ADD COLUMN IF NOT EXISTS bio TEXT;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE "user"
+      ADD COLUMN IF NOT EXISTS avatar TEXT;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE "user"
+      ADD COLUMN IF NOT EXISTS permissions_override JSONB DEFAULT '[]'::jsonb;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE "user"
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS rbac_roles (
+        id TEXT PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
+        built_in BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS rbac_permissions (
+        id TEXT PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        description TEXT DEFAULT '',
+        module TEXT DEFAULT '',
+        module_label TEXT DEFAULT '',
+        action TEXT DEFAULT '',
+        built_in BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS rbac_activity (
+        id SERIAL PRIMARY KEY,
+        actor TEXT DEFAULT 'System',
+        actor_role TEXT DEFAULT 'admin',
+        module TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target TEXT DEFAULT '',
+        status TEXT DEFAULT 'success',
+        note TEXT DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
     `);
 
     await safeQuery(`
@@ -4967,9 +5054,7 @@ const WEBAUTHN_ALLOWED_ORIGINS = new Set([
 const ORGANIZATION_PIN_PATTERN = new RegExp(
   `^\\d{${ORGANIZATION_PIN_LENGTH}}$`,
 );
-const DATA_DELETE_PIN_PATTERN = new RegExp(
-  `^\\d{${DATA_DELETE_PIN_LENGTH}}$`,
-);
+const DATA_DELETE_PIN_PATTERN = new RegExp(`^\\d{${DATA_DELETE_PIN_LENGTH}}$`);
 
 const loginInitiateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -5183,20 +5268,55 @@ const serializeAdminUser = (user) => ({
   id: user.id,
   email: user.email,
   role: user.role,
-  username: user.user_name,
+  username: user.user_name || user.username,
+  first_name: user.first_name || "",
+  last_name: user.last_name || "",
+  display_name:
+    user.display_name || user.full_name || user.user_name || user.email || "",
+  permissions_override: normalizeRbacPermissionList(
+    user.permissions_override || [],
+  ),
+  role_permissions: normalizeRbacPermissionList(user.role_permissions || []),
+  effective_permissions: normalizeRbacPermissionList(
+    user.effective_permissions || [],
+  ),
 });
 
 const issueAdminAccessToken = (user) =>
   jwt.sign(serializeAdminUser(user), SECRET, { expiresIn: ACCESS_TOKEN_TTL });
 
-const buildSuccessfulAdminLoginResponse = (
+const buildAdminSessionUser = async (user = {}) => {
+  try {
+    const roleMap = await getRbacRoleMap();
+    return buildRbacUserPayload(user, roleMap);
+  } catch (err) {
+    console.warn("Failed to hydrate RBAC session user:", err.message);
+    return {
+      ...user,
+      role: normalizeRbacRole(user.role || "viewer"),
+      permissions_override: normalizeRbacPermissionList(
+        user.permissions_override || [],
+      ),
+      role_permissions: getDefaultPermissionsForRole(user.role || "viewer"),
+      effective_permissions: expandRbacPermissionSet([
+        ...getDefaultPermissionsForRole(user.role || "viewer"),
+        ...normalizeRbacPermissionList(user.permissions_override || []),
+      ]),
+    };
+  }
+};
+
+const buildSuccessfulAdminLoginResponse = async (
   user,
   message = "Login successful",
-) => ({
-  message,
-  token: issueAdminAccessToken(user),
-  user: serializeAdminUser(user),
-});
+) => {
+  const sessionUser = await buildAdminSessionUser(user);
+  return {
+    message,
+    token: issueAdminAccessToken(sessionUser),
+    user: serializeAdminUser(sessionUser),
+  };
+};
 
 const hasFreshOtpVerification = (lastOtpVerifiedAt) => {
   if (!lastOtpVerifiedAt) return false;
@@ -5392,10 +5512,7 @@ const resolveDeleteAuditTarget = (req) => {
       target.productType ||
       null,
     target_snapshot:
-      target.target_snapshot ||
-      target.targetSnapshot ||
-      target.snapshot ||
-      {},
+      target.target_snapshot || target.targetSnapshot || target.snapshot || {},
   };
 };
 
@@ -5702,7 +5819,7 @@ app.post("/api/auth/register", async (req, res) => {
     const gender = b.gender || null;
     const email = b.email;
     const password = b.password || `${Math.random()}${Date.now()}`;
-    const role = b.role || "admin";
+    const role = normalizeRbacRole(b.role || "admin");
 
     if (!email || !password) {
       return res.status(400).json({ message: "email and password required" });
@@ -5714,13 +5831,16 @@ app.post("/api/auth/register", async (req, res) => {
       `INSERT INTO "user"
         (user_name, first_name, last_name, phone, gender, email, password, role)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       RETURNING id, email, role`,
+       RETURNING ${RBAC_USER_SELECT_FIELDS}`,
       [user_name, first_name, last_name, phone, gender, email, hashed, role],
     );
 
+    const roleMap = await getRbacRoleMap();
+    const user = buildRbacUserPayload(result.rows[0], roleMap);
+
     res.status(201).json({
       message: "User registered successfully. Email sent.",
-      user: result.rows[0],
+      user,
     });
   } catch (err) {
     if (err.code === "23505") {
@@ -5816,7 +5936,7 @@ app.post("/api/auth/login/pin", loginPinVerifyLimiter, async (req, res) => {
       return res.status(401).json({ message: "Invalid organization PIN." });
     }
 
-    return res.json(buildSuccessfulAdminLoginResponse(user));
+    return res.json(await buildSuccessfulAdminLoginResponse(user));
   } catch (err) {
     console.error("PIN login verification error:", err);
     return res.status(500).json({
@@ -5860,7 +5980,7 @@ app.post(
       }
 
       return res.json(
-        buildSuccessfulAdminLoginResponse(
+        await buildSuccessfulAdminLoginResponse(
           user,
           "Organization PIN created successfully",
         ),
@@ -6013,7 +6133,7 @@ app.post(
         );
       }
 
-      return res.json(buildSuccessfulAdminLoginResponse(user));
+      return res.json(await buildSuccessfulAdminLoginResponse(user));
     } catch (err) {
       if (client) {
         try {
@@ -6198,7 +6318,7 @@ app.post(
       }
 
       return res.json(
-        buildSuccessfulAdminLoginResponse(
+        await buildSuccessfulAdminLoginResponse(
           user,
           "Device verified. Login successful.",
         ),
@@ -6382,7 +6502,7 @@ app.post(
       }
 
       return res.json(
-        buildSuccessfulAdminLoginResponse(
+        await buildSuccessfulAdminLoginResponse(
           user,
           "Device verification enabled. Login successful.",
         ),
@@ -6413,7 +6533,7 @@ app.post("/api/auth/login/finalize", loginInitiateLimiter, async (req, res) => {
     }
 
     await clearWebAuthnChallenges(loginTicket);
-    return res.json(buildSuccessfulAdminLoginResponse(user));
+    return res.json(await buildSuccessfulAdminLoginResponse(user));
   } catch (err) {
     console.error("Finalize login error:", err);
     return res.status(500).json({
@@ -7962,63 +8082,1075 @@ app.post("/api/admin/careers/:id/notify", authenticate, async (req, res) => {
   }
 });
 
-/* ---- Blogs (Eligibility + Suggestions + Editor) ---- */
+const RBAC_USER_SELECT_FIELDS = `
+  id,
+  user_name,
+  first_name,
+  last_name,
+  phone,
+  gender,
+  email,
+  role,
+  status,
+  department,
+  bio,
+  avatar,
+  permissions_override,
+  created_at,
+  updated_at
+`;
+
+const parseRbacArray = (value) => {
+  if (Array.isArray(value)) return value;
+  if (value == null) return [];
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      // Fall through to comma separated values.
+    }
+    return trimmed
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [];
+};
+
+const normalizeRbacPermissionList = (value = []) =>
+  Array.from(
+    new Set(
+      parseRbacArray(value)
+        .map((permission) => normalizeRbacPermissionToken(permission))
+        .filter(Boolean),
+    ),
+  );
+
+const splitRbacPermissionName = (name = "") => {
+  const normalized = normalizeRbacPermissionToken(name);
+  const lastDotIndex = normalized.lastIndexOf(".");
+  if (lastDotIndex <= 0) {
+    return { module: "", action: "" };
+  }
+  return {
+    module: normalized.slice(0, lastDotIndex),
+    action: normalized.slice(lastDotIndex + 1),
+  };
+};
+
+const getBuiltinRbacRoleRecords = () =>
+  Object.entries(RBAC_ROLE_PRESETS).map(([name, preset]) => {
+    const permissions = normalizeRbacPermissionList(preset.permissions || []);
+    return {
+      id: name,
+      name,
+      title: String(preset.label || name).trim(),
+      description: String(preset.description || "").trim(),
+      permissions,
+      effective_permissions: expandRbacPermissionSet(permissions),
+      built_in: true,
+      source: "builtin",
+      created_at: null,
+      updated_at: null,
+    };
+  });
+
+const getBuiltinRbacPermissionRecords = () =>
+  getRbacPermissionMatrix().flatMap((module) =>
+    module.permissions.map((permission) => ({
+      id: permission.code,
+      name: permission.code,
+      description: `Allows ${permission.action} on ${module.label}`,
+      module: module.key,
+      module_label: module.label,
+      action: permission.action,
+      built_in: true,
+      source: "builtin",
+      created_at: null,
+      updated_at: null,
+    })),
+  );
+
+const isBuiltinRbacRole = (value = "") => {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  return Boolean(RBAC_ROLE_PRESETS[normalizeRbacRole(raw)]);
+};
+
+const isBuiltinRbacPermission = (value = "") => {
+  const normalized = normalizeRbacPermissionToken(value);
+  if (!normalized) return false;
+  return getBuiltinRbacPermissionRecords().some(
+    (permission) =>
+      permission.name === normalized || permission.id === normalized,
+  );
+};
+
+const normalizeRbacRoleRecord = (row = {}) => {
+  const roleName = normalizeRbacRole(row.name || row.id || "");
+  const permissions = normalizeRbacPermissionList(row.permissions || []);
+  return {
+    id: roleName,
+    name: roleName,
+    title: String(row.title || roleName || "Role").trim(),
+    description: String(row.description || "").trim(),
+    permissions,
+    effective_permissions: expandRbacPermissionSet(permissions),
+    built_in: Boolean(row.built_in),
+    source: row.source || "server",
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
+};
+
+const normalizeRbacPermissionRecord = (row = {}) => {
+  const name = normalizeRbacPermissionToken(row.name || row.id || "");
+  const derived = splitRbacPermissionName(name);
+  return {
+    id: name,
+    name,
+    description: String(row.description || "").trim(),
+    module: String(row.module || derived.module || "").trim(),
+    module_label: String(
+      row.module_label || row.module || derived.module || "",
+    ).trim(),
+    action: String(row.action || derived.action || "").trim(),
+    built_in: Boolean(row.built_in),
+    source: row.source || "server",
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
+};
+
+const listRbacRoleRecords = async () => {
+  const result = await db.query(
+    `
+    SELECT id, name, title, description, permissions, built_in, created_at, updated_at
+    FROM rbac_roles
+    ORDER BY title ASC, name ASC
+  `,
+  );
+  const merged = new Map();
+
+  getBuiltinRbacRoleRecords().forEach((role) => {
+    merged.set(role.name, role);
+  });
+
+  (result.rows || []).forEach((row) => {
+    const role = normalizeRbacRoleRecord(row);
+    if (!role.name || merged.has(role.name)) return;
+    merged.set(role.name, role);
+  });
+
+  return Array.from(merged.values());
+};
+
+const listRbacPermissionRecords = async () => {
+  const result = await db.query(
+    `
+    SELECT id, name, description, module, module_label, action, built_in, created_at, updated_at
+    FROM rbac_permissions
+    ORDER BY name ASC
+  `,
+  );
+  const merged = new Map();
+
+  getBuiltinRbacPermissionRecords().forEach((permission) => {
+    merged.set(permission.name, permission);
+  });
+
+  (result.rows || []).forEach((row) => {
+    const permission = normalizeRbacPermissionRecord(row);
+    if (!permission.name || merged.has(permission.name)) return;
+    merged.set(permission.name, permission);
+  });
+
+  return Array.from(merged.values()).sort((a, b) =>
+    String(a.name).localeCompare(String(b.name)),
+  );
+};
+
+const getRbacRoleMap = async () => {
+  const roles = await listRbacRoleRecords();
+  return new Map(roles.map((role) => [normalizeRbacRole(role.name), role]));
+};
+
+const inferRbacDepartment = (role = "") => {
+  const normalized = normalizeRbacRole(role);
+  if (normalized === "ceo") return "Executive";
+  if (normalized === "admin") return "Administration";
+  if (["content_admin", "editor", "author", "moderator"].includes(normalized)) {
+    return "Content";
+  }
+  if (normalized === "product_manager") return "Products";
+  if (normalized === "analyst") return "Analytics";
+  if (normalized === "seo") return "SEO";
+  return "General";
+};
+
+const buildRbacUserPayload = (user = {}, roleMap = new Map()) => {
+  const role = normalizeRbacRole(user.role || "viewer");
+  const roleRecord =
+    roleMap.get(role) ||
+    normalizeRbacRoleRecord({
+      id: role,
+      name: role,
+      title: role,
+      permissions: getDefaultPermissionsForRole(role),
+      built_in: isBuiltinRbacRole(role),
+    });
+  const rolePermissions = normalizeRbacPermissionList(
+    roleRecord.permissions || [],
+  );
+  const permissionsOverride = normalizeRbacPermissionList(
+    user.permissions_override || [],
+  );
+  const effectivePermissions = expandRbacPermissionSet([
+    ...rolePermissions,
+    ...permissionsOverride,
+  ]);
+  const fullName = [user.first_name, user.last_name]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .join(" ");
+  const displayName =
+    fullName ||
+    String(user.user_name || "").trim() ||
+    String(user.email || "").trim() ||
+    `User ${user.id}`;
+  const status =
+    String(user.status || "active")
+      .trim()
+      .toLowerCase() === "inactive"
+      ? "inactive"
+      : "active";
+
+  return {
+    id: Number(user.id),
+    user_name: user.user_name || "",
+    username: user.user_name || "",
+    first_name: user.first_name || "",
+    last_name: user.last_name || "",
+    full_name: fullName || displayName,
+    display_name: displayName,
+    author_name: displayName,
+    email: user.email || "",
+    phone: user.phone || "",
+    gender: user.gender || "",
+    bio: user.bio || "",
+    avatar: user.avatar || "",
+    role,
+    role_title: roleRecord.title || role,
+    role_description: roleRecord.description || "",
+    role_permissions: rolePermissions,
+    permissions_override: permissionsOverride,
+    effective_permissions: effectivePermissions,
+    permissions: effectivePermissions,
+    status,
+    department: user.department || inferRbacDepartment(role),
+    is_active: status !== "inactive",
+    active: status !== "inactive",
+    source: "server",
+    created_at: user.created_at || null,
+    updated_at: user.updated_at || null,
+  };
+};
+
+const listRbacUsers = async ({ includeInactive = true } = {}) => {
+  const roleMap = await getRbacRoleMap();
+  const whereClause = includeInactive
+    ? ""
+    : "WHERE COALESCE(status, 'active') <> 'inactive'";
+  const result = await db.query(
+    `
+    SELECT ${RBAC_USER_SELECT_FIELDS}
+    FROM "user"
+    ${whereClause}
+    ORDER BY
+      COALESCE(first_name, '') ASC,
+      COALESCE(user_name, '') ASC,
+      id ASC
+    LIMIT 500
+  `,
+  );
+
+  return (result.rows || []).map((user) => buildRbacUserPayload(user, roleMap));
+};
+
+const getRbacUserById = async (id) => {
+  const result = await db.query(
+    `
+    SELECT ${RBAC_USER_SELECT_FIELDS}
+    FROM "user"
+    WHERE id = $1
+    LIMIT 1
+  `,
+    [id],
+  );
+  if (!result.rows.length) return null;
+  const roleMap = await getRbacRoleMap();
+  return buildRbacUserPayload(result.rows[0], roleMap);
+};
+
+const logRbacActivity = async (
+  req,
+  { module, action, target = "", status = "success", note = "" } = {},
+) => {
+  try {
+    const actor =
+      req.user?.display_name ||
+      req.user?.user_name ||
+      req.user?.username ||
+      req.user?.email ||
+      "System";
+    const actorRole = normalizeRbacRole(req.user?.role || "admin");
+    await db.query(
+      `
+      INSERT INTO rbac_activity (actor, actor_role, module, action, target, status, note)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
+    `,
+      [
+        String(actor || "System"),
+        actorRole,
+        String(module || "rbac"),
+        String(action || "updated"),
+        String(target || ""),
+        String(status || "success"),
+        String(note || ""),
+      ],
+    );
+  } catch (err) {
+    console.warn("Failed to write RBAC activity:", err.message);
+  }
+};
+
+const requestHasRbacAccess = async (req, requestedPermissions = []) => {
+  const role = normalizeRbacRole(req.user?.role || "");
+  if (role === "admin" || role === "ceo") return true;
+
+  const userId = Number(req.user?.id);
+  if (!Number.isInteger(userId) || userId <= 0) return false;
+
+  const user = await getRbacUserById(userId);
+  const effectivePermissions = normalizeRbacPermissionList(
+    user?.effective_permissions || [],
+  );
+  if (hasRbacPermissionSet(effectivePermissions, "*")) return true;
+
+  const permissions = Array.isArray(requestedPermissions)
+    ? requestedPermissions
+    : [requestedPermissions];
+  return permissions
+    .map((permission) => normalizeRbacPermissionToken(permission))
+    .filter(Boolean)
+    .some((permission) =>
+      hasRbacPermissionSet(effectivePermissions, permission),
+    );
+};
+
+const requireRbacAccess = async (
+  req,
+  res,
+  requestedPermissions = [],
+  message = "RBAC permission required",
+) => {
+  if (await requestHasRbacAccess(req, requestedPermissions)) return true;
+  res.status(403).json({ message });
+  return false;
+};
+
+/* ---- RBAC (Users, Roles, Permissions) ---- */
+app.get("/api/users", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        ["users.view", "users.manage"],
+        "User management access required",
+      ))
+    )
+      return;
+    const includeInactive =
+      String(req.query.includeInactive || "true") !== "false";
+    const users = await listRbacUsers({ includeInactive });
+    return res.json(users);
+  } catch (err) {
+    console.error("GET /api/users error:", err);
+    return res.status(500).json({ message: "Failed to load users" });
+  }
+});
+
+app.put("/api/users/:id", authenticate, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const requestedPermissions = Object.prototype.hasOwnProperty.call(
+      body,
+      "permissions_override",
+    )
+      ? ["users.edit", "users.manage", "permissions.manage"]
+      : ["users.edit", "users.manage"];
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        requestedPermissions,
+        "User edit access required",
+      ))
+    )
+      return;
+
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: "Invalid user id" });
+    }
+
+    const updates = [];
+    const values = [];
+    const addUpdate = (column, value) => {
+      values.push(value);
+      updates.push(`${column} = $${values.length}`);
+    };
+
+    if (Object.prototype.hasOwnProperty.call(body, "user_name")) {
+      addUpdate("user_name", String(body.user_name || "").trim() || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "first_name")) {
+      addUpdate("first_name", String(body.first_name || "").trim() || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "last_name")) {
+      addUpdate("last_name", String(body.last_name || "").trim() || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "phone")) {
+      addUpdate("phone", String(body.phone || "").trim() || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "gender")) {
+      addUpdate("gender", String(body.gender || "").trim() || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "email")) {
+      const email = String(body.email || "")
+        .trim()
+        .toLowerCase();
+      if (!email) return res.status(400).json({ message: "Email is required" });
+      addUpdate("email", email);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "role")) {
+      const role = normalizeRbacRole(body.role || "viewer");
+      const roleMap = await getRbacRoleMap();
+      if (!roleMap.has(role)) {
+        return res.status(400).json({ message: "Unknown role" });
+      }
+      addUpdate("role", role);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "status")) {
+      const status =
+        String(body.status || "active")
+          .trim()
+          .toLowerCase() === "inactive"
+          ? "inactive"
+          : "active";
+      addUpdate("status", status);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "department")) {
+      addUpdate("department", String(body.department || "").trim() || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "bio")) {
+      addUpdate("bio", String(body.bio || "").trim() || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "avatar")) {
+      addUpdate("avatar", String(body.avatar || "").trim() || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "permissions_override")) {
+      values.push(
+        JSON.stringify(normalizeRbacPermissionList(body.permissions_override)),
+      );
+      updates.push(`permissions_override = $${values.length}::jsonb`);
+    }
+    if (String(body.password || "").trim()) {
+      addUpdate(
+        "password",
+        await bcrypt.hash(String(body.password).trim(), 10),
+      );
+    }
+
+    if (!updates.length) {
+      const currentUser = await getRbacUserById(id);
+      if (!currentUser)
+        return res.status(404).json({ message: "User not found" });
+      return res.json({ user: currentUser });
+    }
+
+    values.push(id);
+    const result = await db.query(
+      `
+      UPDATE "user"
+      SET ${updates.join(", ")}, updated_at = now()
+      WHERE id = $${values.length}
+      RETURNING ${RBAC_USER_SELECT_FIELDS}
+    `,
+      values,
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const roleMap = await getRbacRoleMap();
+    const user = buildRbacUserPayload(result.rows[0], roleMap);
+    await logRbacActivity(req, {
+      module: "users",
+      action: "updated",
+      target: user.display_name,
+      note: "Updated user profile or permission overrides.",
+    });
+    return res.json({ user });
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ message: "Email already registered" });
+    }
+    console.error("PUT /api/users/:id error:", err);
+    return res.status(500).json({ message: "Failed to update user" });
+  }
+});
+
+app.delete("/api/users/:id", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        ["users.delete", "users.manage"],
+        "User delete access required",
+      ))
+    )
+      return;
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: "Invalid user id" });
+    }
+
+    const currentUser = await getRbacUserById(id);
+    if (!currentUser)
+      return res.status(404).json({ message: "User not found" });
+
+    await db.query(`DELETE FROM "user" WHERE id = $1`, [id]);
+    await logRbacActivity(req, {
+      module: "users",
+      action: "deleted",
+      target: currentUser.display_name,
+      note: "Deleted user account.",
+    });
+    return res.json({ message: "User deleted", user: currentUser });
+  } catch (err) {
+    console.error("DELETE /api/users/:id error:", err);
+    return res.status(500).json({ message: "Failed to delete user" });
+  }
+});
+
 app.get("/api/rbac/users", authenticate, async (req, res) => {
   try {
     if (!ensureBlogManagerAccess(req, res)) return;
-
-    const result = await db.query(
-      `
-      SELECT
-        id,
-        user_name,
-        first_name,
-        last_name,
-        email,
-        role,
-        created_at
-      FROM "user"
-      ORDER BY
-        COALESCE(first_name, '') ASC,
-        COALESCE(user_name, '') ASC,
-        id ASC
-      LIMIT 500
-    `,
-    );
-
-    const users = (result.rows || []).map((user) => {
-      const fullName = [user.first_name, user.last_name]
-        .map((value) => String(value || "").trim())
-        .filter(Boolean)
-        .join(" ");
-      const displayName =
-        fullName ||
-        String(user.user_name || "").trim() ||
-        String(user.email || "").trim() ||
-        `User ${user.id}`;
-
-      return {
-        id: Number(user.id),
-        user_name: user.user_name || "",
-        username: user.user_name || "",
-        first_name: user.first_name || "",
-        last_name: user.last_name || "",
-        full_name: fullName,
-        display_name: displayName,
-        author_name: displayName,
-        email: user.email || "",
-        role: user.role || "viewer",
-        role_title: user.role || "viewer",
-        is_active: true,
-        active: true,
-        created_at: user.created_at || null,
-      };
-    });
-
+    const includeInactive =
+      String(req.query.includeInactive || "true") !== "false";
+    const users = await listRbacUsers({ includeInactive });
     return res.json(users);
   } catch (err) {
     console.error("GET /api/rbac/users error:", err);
     return res.status(500).json({ message: "Failed to load users" });
+  }
+});
+
+app.post("/api/rbac/users/:id/roles", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        ["users.assign", "users.manage", "roles.manage"],
+        "Role assignment access required",
+      ))
+    )
+      return;
+
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: "Invalid user id" });
+    }
+
+    const rawRole = req.body?.role_id || req.body?.role || req.body?.name;
+    const requestedRole = normalizeRbacRole(rawRole || "");
+    const roleMap = await getRbacRoleMap();
+    const roleRecord = roleMap.get(requestedRole);
+
+    if (!roleRecord) {
+      return res.status(400).json({ message: "Unknown role" });
+    }
+
+    const result = await db.query(
+      `
+      UPDATE "user"
+      SET role = $1, updated_at = now()
+      WHERE id = $2
+      RETURNING ${RBAC_USER_SELECT_FIELDS}
+    `,
+      [roleRecord.name, id],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const user = buildRbacUserPayload(result.rows[0], roleMap);
+    await logRbacActivity(req, {
+      module: "users",
+      action: "role_assigned",
+      target: user.display_name,
+      note: `Assigned ${roleRecord.title || roleRecord.name} role.`,
+    });
+    return res.json({ user });
+  } catch (err) {
+    console.error("POST /api/rbac/users/:id/roles error:", err);
+    return res.status(500).json({ message: "Failed to assign role" });
+  }
+});
+
+app.get("/api/rbac/roles", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        [
+          "roles.view",
+          "roles.manage",
+          "permissions.view",
+          "permissions.manage",
+        ],
+        "Role catalog access required",
+      ))
+    )
+      return;
+    const roles = await listRbacRoleRecords();
+    return res.json(roles);
+  } catch (err) {
+    console.error("GET /api/rbac/roles error:", err);
+    return res.status(500).json({ message: "Failed to load RBAC roles" });
+  }
+});
+
+app.post("/api/rbac/roles", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        ["roles.create", "roles.manage"],
+        "Role create access required",
+      ))
+    )
+      return;
+
+    const body = req.body || {};
+    const rawName = String(body.name || "").trim();
+    if (!rawName)
+      return res.status(400).json({ message: "Role name is required" });
+
+    const name = normalizeRbacRole(rawName);
+    if (isBuiltinRbacRole(name)) {
+      return res
+        .status(409)
+        .json({ message: "Built-in roles cannot be recreated" });
+    }
+
+    const permissions = normalizeRbacPermissionList(body.permissions || []);
+    const title = String(body.title || rawName).trim();
+    const description = String(body.description || "").trim();
+    const result = await db.query(
+      `
+      INSERT INTO rbac_roles (id, name, title, description, permissions, built_in)
+      VALUES ($1,$2,$3,$4,$5::jsonb,false)
+      ON CONFLICT (id)
+      DO UPDATE SET
+        title = EXCLUDED.title,
+        description = EXCLUDED.description,
+        permissions = EXCLUDED.permissions,
+        built_in = false,
+        updated_at = now()
+      RETURNING id, name, title, description, permissions, built_in, created_at, updated_at
+    `,
+      [name, name, title, description, JSON.stringify(permissions)],
+    );
+
+    const role = normalizeRbacRoleRecord(result.rows[0]);
+    await logRbacActivity(req, {
+      module: "roles",
+      action: "created",
+      target: role.title,
+      note: "Created or updated custom role.",
+    });
+    return res.status(201).json(role);
+  } catch (err) {
+    console.error("POST /api/rbac/roles error:", err);
+    return res.status(500).json({ message: "Failed to save role" });
+  }
+});
+
+app.put("/api/rbac/roles/:id", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        ["roles.edit", "roles.manage"],
+        "Role edit access required",
+      ))
+    )
+      return;
+
+    const rawName = String(req.params.id || "").trim();
+    if (!rawName)
+      return res.status(400).json({ message: "Role id is required" });
+
+    const name = normalizeRbacRole(rawName);
+    if (isBuiltinRbacRole(name)) {
+      return res
+        .status(403)
+        .json({ message: "Built-in roles cannot be edited" });
+    }
+
+    const body = req.body || {};
+    const permissions = normalizeRbacPermissionList(body.permissions || []);
+    const title = String(body.title || body.name || name).trim();
+    const description = String(body.description || "").trim();
+    const result = await db.query(
+      `
+      UPDATE rbac_roles
+      SET title = $1,
+          description = $2,
+          permissions = $3::jsonb,
+          updated_at = now()
+      WHERE id = $4
+      RETURNING id, name, title, description, permissions, built_in, created_at, updated_at
+    `,
+      [title, description, JSON.stringify(permissions), name],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Role not found" });
+    }
+
+    const role = normalizeRbacRoleRecord(result.rows[0]);
+    await logRbacActivity(req, {
+      module: "roles",
+      action: "updated",
+      target: role.title,
+      note: "Updated custom role.",
+    });
+    return res.json(role);
+  } catch (err) {
+    console.error("PUT /api/rbac/roles/:id error:", err);
+    return res.status(500).json({ message: "Failed to update role" });
+  }
+});
+
+app.delete("/api/rbac/roles/:id", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        ["roles.delete", "roles.manage"],
+        "Role delete access required",
+      ))
+    )
+      return;
+
+    const rawName = String(req.params.id || "").trim();
+    if (!rawName)
+      return res.status(400).json({ message: "Role id is required" });
+
+    const name = normalizeRbacRole(rawName);
+    if (isBuiltinRbacRole(name)) {
+      return res
+        .status(403)
+        .json({ message: "Built-in roles cannot be deleted" });
+    }
+
+    const result = await db.query(
+      `
+      DELETE FROM rbac_roles
+      WHERE id = $1
+      RETURNING id, name, title, description, permissions, built_in, created_at, updated_at
+    `,
+      [name],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Role not found" });
+    }
+
+    await db.query(
+      `UPDATE "user" SET role = 'viewer', updated_at = now() WHERE role = $1`,
+      [name],
+    );
+
+    const role = normalizeRbacRoleRecord(result.rows[0]);
+    await logRbacActivity(req, {
+      module: "roles",
+      action: "deleted",
+      target: role.title,
+      note: "Deleted custom role and moved assigned users to Viewer.",
+    });
+    return res.json({ message: "Role deleted", role });
+  } catch (err) {
+    console.error("DELETE /api/rbac/roles/:id error:", err);
+    return res.status(500).json({ message: "Failed to delete role" });
+  }
+});
+
+app.get("/api/rbac/permissions", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        [
+          "permissions.view",
+          "permissions.manage",
+          "roles.view",
+          "roles.manage",
+        ],
+        "Permission catalog access required",
+      ))
+    )
+      return;
+    const permissions = await listRbacPermissionRecords();
+    return res.json(permissions);
+  } catch (err) {
+    console.error("GET /api/rbac/permissions error:", err);
+    return res.status(500).json({ message: "Failed to load RBAC permissions" });
+  }
+});
+
+app.post("/api/rbac/permissions", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        ["permissions.create", "permissions.manage"],
+        "Permission create access required",
+      ))
+    )
+      return;
+
+    const body = req.body || {};
+    const name = normalizeRbacPermissionToken(body.name || body.id || "");
+    if (!name) {
+      return res.status(400).json({ message: "Permission name is required" });
+    }
+    if (isBuiltinRbacPermission(name)) {
+      return res
+        .status(409)
+        .json({ message: "Built-in permissions cannot be recreated" });
+    }
+
+    const derived = splitRbacPermissionName(name);
+    const result = await db.query(
+      `
+      INSERT INTO rbac_permissions
+        (id, name, description, module, module_label, action, built_in)
+      VALUES ($1,$2,$3,$4,$5,$6,false)
+      ON CONFLICT (id)
+      DO UPDATE SET
+        description = EXCLUDED.description,
+        module = EXCLUDED.module,
+        module_label = EXCLUDED.module_label,
+        action = EXCLUDED.action,
+        built_in = false,
+        updated_at = now()
+      RETURNING id, name, description, module, module_label, action, built_in, created_at, updated_at
+    `,
+      [
+        name,
+        name,
+        String(body.description || "").trim(),
+        String(body.module || derived.module || "").trim(),
+        String(body.module_label || body.module || derived.module || "").trim(),
+        String(body.action || derived.action || "").trim(),
+      ],
+    );
+
+    const permission = normalizeRbacPermissionRecord(result.rows[0]);
+    await logRbacActivity(req, {
+      module: "permissions",
+      action: "created",
+      target: permission.name,
+      note: "Created or updated custom permission.",
+    });
+    return res.status(201).json(permission);
+  } catch (err) {
+    console.error("POST /api/rbac/permissions error:", err);
+    return res.status(500).json({ message: "Failed to save permission" });
+  }
+});
+
+app.put("/api/rbac/permissions/:id", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        ["permissions.edit", "permissions.manage"],
+        "Permission edit access required",
+      ))
+    )
+      return;
+
+    const name = normalizeRbacPermissionToken(req.params.id || "");
+    if (!name)
+      return res.status(400).json({ message: "Permission id is required" });
+    if (isBuiltinRbacPermission(name)) {
+      return res
+        .status(403)
+        .json({ message: "Built-in permissions cannot be edited" });
+    }
+
+    const body = req.body || {};
+    const derived = splitRbacPermissionName(name);
+    const result = await db.query(
+      `
+      UPDATE rbac_permissions
+      SET description = $1,
+          module = $2,
+          module_label = $3,
+          action = $4,
+          updated_at = now()
+      WHERE id = $5
+      RETURNING id, name, description, module, module_label, action, built_in, created_at, updated_at
+    `,
+      [
+        String(body.description || "").trim(),
+        String(body.module || derived.module || "").trim(),
+        String(body.module_label || body.module || derived.module || "").trim(),
+        String(body.action || derived.action || "").trim(),
+        name,
+      ],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Permission not found" });
+    }
+
+    const permission = normalizeRbacPermissionRecord(result.rows[0]);
+    await logRbacActivity(req, {
+      module: "permissions",
+      action: "updated",
+      target: permission.name,
+      note: "Updated custom permission.",
+    });
+    return res.json(permission);
+  } catch (err) {
+    console.error("PUT /api/rbac/permissions/:id error:", err);
+    return res.status(500).json({ message: "Failed to update permission" });
+  }
+});
+
+app.delete("/api/rbac/permissions/:id", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        ["permissions.delete", "permissions.manage"],
+        "Permission delete access required",
+      ))
+    )
+      return;
+
+    const name = normalizeRbacPermissionToken(req.params.id || "");
+    if (!name)
+      return res.status(400).json({ message: "Permission id is required" });
+    if (isBuiltinRbacPermission(name)) {
+      return res
+        .status(403)
+        .json({ message: "Built-in permissions cannot be deleted" });
+    }
+
+    const result = await db.query(
+      `
+      DELETE FROM rbac_permissions
+      WHERE id = $1
+      RETURNING id, name, description, module, module_label, action, built_in, created_at, updated_at
+    `,
+      [name],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Permission not found" });
+    }
+
+    await db.query(
+      `
+      UPDATE rbac_roles
+      SET permissions = (
+            SELECT COALESCE(jsonb_agg(permission_value.value), '[]'::jsonb)
+            FROM jsonb_array_elements_text(permissions) AS permission_value(value)
+            WHERE permission_value.value <> $1
+          ),
+          updated_at = now()
+      WHERE permissions ? $1
+    `,
+      [name],
+    );
+
+    const permission = normalizeRbacPermissionRecord(result.rows[0]);
+    await logRbacActivity(req, {
+      module: "permissions",
+      action: "deleted",
+      target: permission.name,
+      note: "Deleted custom permission.",
+    });
+    return res.json({ message: "Permission deleted", permission });
+  } catch (err) {
+    console.error("DELETE /api/rbac/permissions/:id error:", err);
+    return res.status(500).json({ message: "Failed to delete permission" });
+  }
+});
+
+app.get("/api/rbac/activity", authenticate, async (req, res) => {
+  try {
+    if (
+      !(await requireRbacAccess(
+        req,
+        res,
+        ["activity.view", "reports.view"],
+        "Activity access required",
+      ))
+    )
+      return;
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+    const result = await db.query(
+      `
+      SELECT id, actor, actor_role, module, action, target, status, note, created_at
+      FROM rbac_activity
+      ORDER BY created_at DESC, id DESC
+      LIMIT $1
+    `,
+      [limit],
+    );
+    return res.json(
+      (result.rows || []).map((activity) => ({
+        ...activity,
+        at: activity.created_at,
+      })),
+    );
+  } catch (err) {
+    console.error("GET /api/rbac/activity error:", err);
+    return res.status(500).json({ message: "Failed to load RBAC activity" });
   }
 });
 
@@ -8826,37 +9958,43 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/api/admin/blogs/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    if (!ensureBlogManagerAccess(req, res)) return;
+app.delete(
+  "/api/admin/blogs/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      if (!ensureBlogManagerAccess(req, res)) return;
 
-    const blogId = Number(req.params.id);
-    if (!Number.isInteger(blogId) || blogId <= 0) {
-      return res.status(400).json({ message: "Invalid blog id" });
-    }
+      const blogId = Number(req.params.id);
+      if (!Number.isInteger(blogId) || blogId <= 0) {
+        return res.status(400).json({ message: "Invalid blog id" });
+      }
 
-    const deleteRes = await db.query(
-      `
+      const deleteRes = await db.query(
+        `
       DELETE FROM blogs
       WHERE id = $1
       RETURNING id, product_id, title, slug
     `,
-      [blogId],
-    );
+        [blogId],
+      );
 
-    if (!deleteRes.rows.length) {
-      return res.status(404).json({ message: "Blog not found" });
+      if (!deleteRes.rows.length) {
+        return res.status(404).json({ message: "Blog not found" });
+      }
+
+      return res.json({
+        message: "Blog deleted successfully",
+        blog: deleteRes.rows[0],
+      });
+    } catch (err) {
+      console.error("DELETE /api/admin/blogs/:id error:", err);
+      return res.status(500).json({ message: "Failed to delete blog" });
     }
-
-    return res.json({
-      message: "Blog deleted successfully",
-      blog: deleteRes.rows[0],
-    });
-  } catch (err) {
-    console.error("DELETE /api/admin/blogs/:id error:", err);
-    return res.status(500).json({ message: "Failed to delete blog" });
-  }
-});
+  },
+);
 
 app.get("/api/admin/news-articles/search", authenticate, async (req, res) => {
   try {
@@ -8941,18 +10079,21 @@ app.get("/api/admin/news-articles/search", authenticate, async (req, res) => {
   }
 });
 
-app.get("/api/admin/products/:productId/linked-news", authenticate, async (req, res) => {
-  try {
-    const productId = Number(req.params.productId);
-    if (!Number.isInteger(productId) || productId <= 0) {
-      return res.status(400).json({ message: "Invalid product id" });
-    }
+app.get(
+  "/api/admin/products/:productId/linked-news",
+  authenticate,
+  async (req, res) => {
+    try {
+      const productId = Number(req.params.productId);
+      if (!Number.isInteger(productId) || productId <= 0) {
+        return res.status(400).json({ message: "Invalid product id" });
+      }
 
-    const limit = Math.min(25, toPositiveInt(req.query.limit, 12));
-    const query = String(req.query.query || req.query.q || "").trim();
+      const limit = Math.min(25, toPositiveInt(req.query.limit, 12));
+      const query = String(req.query.query || req.query.q || "").trim();
 
-    const productRes = await db.query(
-      `
+      const productRes = await db.query(
+        `
       SELECT
         p.id AS product_id,
         p.name,
@@ -8964,15 +10105,15 @@ app.get("/api/admin/products/:productId/linked-news", authenticate, async (req, 
       WHERE p.id = $1
       LIMIT 1
     `,
-      [productId],
-    );
+        [productId],
+      );
 
-    if (!productRes.rows.length) {
-      return res.status(404).json({ message: "Product not found" });
-    }
+      if (!productRes.rows.length) {
+        return res.status(404).json({ message: "Product not found" });
+      }
 
-    const linkedRes = await db.query(
-      `
+      const linkedRes = await db.query(
+        `
       SELECT
         bl.id,
         bl.title,
@@ -9003,14 +10144,14 @@ app.get("/api/admin/products/:productId/linked-news", authenticate, async (req, 
       WHERE bpl.product_id = $1
       ORDER BY bl.updated_at DESC, bl.id DESC
     `,
-      [productId],
-    );
+        [productId],
+      );
 
-    const searchParams = [productId];
-    let searchFilterSql = "";
-    if (query) {
-      searchParams.push(`%${query}%`);
-      searchFilterSql = `
+      const searchParams = [productId];
+      let searchFilterSql = "";
+      if (query) {
+        searchParams.push(`%${query}%`);
+        searchFilterSql = `
         AND (
           bl.title ILIKE $2
           OR bl.slug ILIKE $2
@@ -9018,12 +10159,12 @@ app.get("/api/admin/products/:productId/linked-news", authenticate, async (req, 
           OR COALESCE(primary_brand.name, '') ILIKE $2
         )
       `;
-    }
-    searchParams.push(limit);
-    const limitIndex = searchParams.length;
+      }
+      searchParams.push(limit);
+      const limitIndex = searchParams.length;
 
-    const searchRes = await db.query(
-      `
+      const searchRes = await db.query(
+        `
       SELECT
         bl.id,
         bl.title,
@@ -9070,121 +10211,130 @@ app.get("/api/admin/products/:productId/linked-news", authenticate, async (req, 
         bl.id DESC
       LIMIT $${limitIndex}
     `,
-      searchParams,
-    );
-
-    return res.json({
-      product: productRes.rows[0],
-      linked_articles: mapBlogLinkRows(linkedRes.rows),
-      search_results: mapBlogLinkRows(searchRes.rows),
-      query,
-      limit,
-    });
-  } catch (err) {
-    console.error("GET /api/admin/products/:productId/linked-news error:", err);
-    return res.status(500).json({ message: "Failed to fetch linked news" });
-  }
-});
-
-app.put("/api/admin/products/:productId/linked-news", authenticate, async (req, res) => {
-  const connection = await db.connect();
-
-  try {
-    const productId = Number(req.params.productId);
-    if (!Number.isInteger(productId) || productId <= 0) {
-      return res.status(400).json({ message: "Invalid product id" });
-    }
-
-    const requestedBlogIds = normalizePositiveIntegerList(
-      Array.isArray(req.body?.blog_ids)
-        ? req.body.blog_ids
-        : Array.isArray(req.body?.blogIds)
-          ? req.body.blogIds
-          : [],
-    );
-
-    const productRes = await connection.query(
-      `SELECT id FROM products WHERE id = $1 LIMIT 1`,
-      [productId],
-    );
-    if (!productRes.rows.length) {
-      return res.status(404).json({ message: "Product not found" });
-    }
-
-    if (requestedBlogIds.length) {
-      const existingBlogsRes = await connection.query(
-        `SELECT id FROM blogs WHERE id = ANY($1::int[])`,
-        [requestedBlogIds],
+        searchParams,
       );
-      const existingBlogIds = normalizePositiveIntegerList(
-        (existingBlogsRes.rows || []).map((row) => row.id),
+
+      return res.json({
+        product: productRes.rows[0],
+        linked_articles: mapBlogLinkRows(linkedRes.rows),
+        search_results: mapBlogLinkRows(searchRes.rows),
+        query,
+        limit,
+      });
+    } catch (err) {
+      console.error(
+        "GET /api/admin/products/:productId/linked-news error:",
+        err,
       );
-      if (existingBlogIds.length !== requestedBlogIds.length) {
-        return res
-          .status(400)
-          .json({ message: "One or more selected news articles were not found" });
+      return res.status(500).json({ message: "Failed to fetch linked news" });
+    }
+  },
+);
+
+app.put(
+  "/api/admin/products/:productId/linked-news",
+  authenticate,
+  async (req, res) => {
+    const connection = await db.connect();
+
+    try {
+      const productId = Number(req.params.productId);
+      if (!Number.isInteger(productId) || productId <= 0) {
+        return res.status(400).json({ message: "Invalid product id" });
       }
-    }
 
-    await connection.query("BEGIN");
+      const requestedBlogIds = normalizePositiveIntegerList(
+        Array.isArray(req.body?.blog_ids)
+          ? req.body.blog_ids
+          : Array.isArray(req.body?.blogIds)
+            ? req.body.blogIds
+            : [],
+      );
 
-    const currentLinksRes = await connection.query(
-      `
+      const productRes = await connection.query(
+        `SELECT id FROM products WHERE id = $1 LIMIT 1`,
+        [productId],
+      );
+      if (!productRes.rows.length) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+
+      if (requestedBlogIds.length) {
+        const existingBlogsRes = await connection.query(
+          `SELECT id FROM blogs WHERE id = ANY($1::int[])`,
+          [requestedBlogIds],
+        );
+        const existingBlogIds = normalizePositiveIntegerList(
+          (existingBlogsRes.rows || []).map((row) => row.id),
+        );
+        if (existingBlogIds.length !== requestedBlogIds.length) {
+          return res.status(400).json({
+            message: "One or more selected news articles were not found",
+          });
+        }
+      }
+
+      await connection.query("BEGIN");
+
+      const currentLinksRes = await connection.query(
+        `
       SELECT blog_id
       FROM blog_product_links
       WHERE product_id = $1
       ORDER BY blog_id ASC
     `,
-      [productId],
-    );
-    const currentBlogIds = normalizePositiveIntegerList(
-      (currentLinksRes.rows || []).map((row) => row.blog_id),
-    );
-
-    const blogIdsToRemove = currentBlogIds.filter(
-      (blogId) => !requestedBlogIds.includes(blogId),
-    );
-    const blogIdsToAdd = requestedBlogIds.filter(
-      (blogId) => !currentBlogIds.includes(blogId),
-    );
-
-    for (const blogId of blogIdsToAdd) {
-      const fallbackPrimaryProductId = await readBlogPrimaryProductId(
-        connection,
-        blogId,
+        [productId],
       );
-      const existingProductIds = await readBlogLinkedProductIds(
-        connection,
-        blogId,
-        fallbackPrimaryProductId,
+      const currentBlogIds = normalizePositiveIntegerList(
+        (currentLinksRes.rows || []).map((row) => row.blog_id),
       );
-      await syncBlogProductLinks(connection, blogId, [
-        ...existingProductIds,
-        productId,
-      ]);
-    }
 
-    for (const blogId of blogIdsToRemove) {
-      const fallbackPrimaryProductId = await readBlogPrimaryProductId(
-        connection,
-        blogId,
+      const blogIdsToRemove = currentBlogIds.filter(
+        (blogId) => !requestedBlogIds.includes(blogId),
       );
-      const existingProductIds = await readBlogLinkedProductIds(
-        connection,
-        blogId,
-        fallbackPrimaryProductId,
+      const blogIdsToAdd = requestedBlogIds.filter(
+        (blogId) => !currentBlogIds.includes(blogId),
       );
-      await syncBlogProductLinks(
-        connection,
-        blogId,
-        existingProductIds.filter((linkedProductId) => linkedProductId !== productId),
-      );
-    }
 
-    await connection.query("COMMIT");
+      for (const blogId of blogIdsToAdd) {
+        const fallbackPrimaryProductId = await readBlogPrimaryProductId(
+          connection,
+          blogId,
+        );
+        const existingProductIds = await readBlogLinkedProductIds(
+          connection,
+          blogId,
+          fallbackPrimaryProductId,
+        );
+        await syncBlogProductLinks(connection, blogId, [
+          ...existingProductIds,
+          productId,
+        ]);
+      }
 
-    const refreshedLinks = await db.query(
-      `
+      for (const blogId of blogIdsToRemove) {
+        const fallbackPrimaryProductId = await readBlogPrimaryProductId(
+          connection,
+          blogId,
+        );
+        const existingProductIds = await readBlogLinkedProductIds(
+          connection,
+          blogId,
+          fallbackPrimaryProductId,
+        );
+        await syncBlogProductLinks(
+          connection,
+          blogId,
+          existingProductIds.filter(
+            (linkedProductId) => linkedProductId !== productId,
+          ),
+        );
+      }
+
+      await connection.query("COMMIT");
+
+      const refreshedLinks = await db.query(
+        `
       SELECT
         bl.id,
         bl.title,
@@ -9215,24 +10365,28 @@ app.put("/api/admin/products/:productId/linked-news", authenticate, async (req, 
       WHERE bpl.product_id = $1
       ORDER BY bl.updated_at DESC, bl.id DESC
     `,
-      [productId],
-    );
+        [productId],
+      );
 
-    return res.json({
-      message: "Linked news updated successfully",
-      linked_articles: mapBlogLinkRows(refreshedLinks.rows),
-      blog_ids: requestedBlogIds,
-    });
-  } catch (err) {
-    try {
-      await connection.query("ROLLBACK");
-    } catch {}
-    console.error("PUT /api/admin/products/:productId/linked-news error:", err);
-    return res.status(500).json({ message: "Failed to update linked news" });
-  } finally {
-    connection.release();
-  }
-});
+      return res.json({
+        message: "Linked news updated successfully",
+        linked_articles: mapBlogLinkRows(refreshedLinks.rows),
+        blog_ids: requestedBlogIds,
+      });
+    } catch (err) {
+      try {
+        await connection.query("ROLLBACK");
+      } catch {}
+      console.error(
+        "PUT /api/admin/products/:productId/linked-news error:",
+        err,
+      );
+      return res.status(500).json({ message: "Failed to update linked news" });
+    } finally {
+      connection.release();
+    }
+  },
+);
 
 app.get("/api/public/blogs", async (req, res) => {
   try {
@@ -9242,7 +10396,9 @@ app.get("/api/public/blogs", async (req, res) => {
     );
     const hasProductFilter =
       Number.isInteger(requestedProductId) && requestedProductId > 0;
-    const productType = String(req.query.productType || req.query.product_type || "")
+    const productType = String(
+      req.query.productType || req.query.product_type || "",
+    )
       .trim()
       .toLowerCase();
     const whereClauses = ["bl.status = 'published'"];
@@ -9576,28 +10732,34 @@ app.put("/api/admin/customers/:id", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/api/admin/customers/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    const customerId = req.params.id;
+app.delete(
+  "/api/admin/customers/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      const customerId = req.params.id;
 
-    const result = await db.query(
-      "DELETE FROM Customers WHERE id = $1 RETURNING id",
-      [customerId],
-    );
+      const result = await db.query(
+        "DELETE FROM Customers WHERE id = $1 RETURNING id",
+        [customerId],
+      );
 
-    if (!result.rows.length) {
-      return res.status(404).json({ message: "Customer not found" });
+      if (!result.rows.length) {
+        return res.status(404).json({ message: "Customer not found" });
+      }
+
+      res.json({
+        success: true,
+        message: "Customer deleted successfully",
+      });
+    } catch (err) {
+      console.error("Delete customer error:", err);
+      res.status(500).json({ error: err.message });
     }
-
-    res.json({
-      success: true,
-      message: "Customer deleted successfully",
-    });
-  } catch (err) {
-    console.error("Delete customer error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+  },
+);
 
 /*--- ratings smartphones  ---*/
 app.post(
@@ -10625,7 +11787,10 @@ app.get("/api/smartphone/:id", async (req, res) => {
     sanitized.brand_website = productBrandWebsite || null;
     sanitized.launch_date = smartphone.launch_date || null;
     sanitized.created_at = smartphone.created_at || null;
-    sanitized.price = resolveEffectiveSmartphonePrice(variants, sanitized.price);
+    sanitized.price = resolveEffectiveSmartphonePrice(
+      variants,
+      sanitized.price,
+    );
     const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
     applySmartphoneAvailabilityDetails(
       sanitized,
@@ -12887,37 +14052,42 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
 });
 
 // Delete smartphone
-app.delete("/api/smartphone/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  const client = await db.connect();
-  console.log(req.params.id);
-  try {
-    const sid = Number(req.params.id);
-    if (Number.isNaN(sid) || sid <= 0) {
-      return res.status(400).json({ message: "Invalid id" });
-    }
+app.delete(
+  "/api/smartphone/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    const client = await db.connect();
+    console.log(req.params.id);
+    try {
+      const sid = Number(req.params.id);
+      if (Number.isNaN(sid) || sid <= 0) {
+        return res.status(400).json({ message: "Invalid id" });
+      }
 
-    await client.query("BEGIN");
+      await client.query("BEGIN");
 
-    // resolve product_id from smartphone
-    // Accept either internal smartphones.id or the linked products.id (product_id)
-    let sres = await client.query(
-      "SELECT product_id FROM smartphones WHERE product_id = $1 LIMIT 1",
-      [sid],
-    );
-    if (!sres.rows.length) {
-      sres = await client.query(
-        "SELECT product_id FROM smartphones WHERE id = $1 LIMIT 1",
+      // resolve product_id from smartphone
+      // Accept either internal smartphones.id or the linked products.id (product_id)
+      let sres = await client.query(
+        "SELECT product_id FROM smartphones WHERE product_id = $1 LIMIT 1",
         [sid],
       );
-    }
-    if (!sres.rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ message: "Smartphone not found" });
-    }
+      if (!sres.rows.length) {
+        sres = await client.query(
+          "SELECT product_id FROM smartphones WHERE id = $1 LIMIT 1",
+          [sid],
+        );
+      }
+      if (!sres.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Smartphone not found" });
+      }
 
-    const productId = sres.rows[0].product_id;
-    const productMetaRes = await client.query(
-      `SELECT
+      const productId = sres.rows[0].product_id;
+      const productMetaRes = await client.query(
+        `SELECT
          p.id,
          p.name,
          p.product_type,
@@ -12930,93 +14100,99 @@ app.delete("/api/smartphone/:id", authenticate, dataDeletePinVerifyLimiter, requ
          ON pub.product_id = p.id
        WHERE p.id = $1
        LIMIT 1`,
-      [productId],
-    );
-    const productMeta = productMetaRes.rows[0] || {};
-    req.deleteAuditTarget = {
-      target_table: "products",
-      target_id: productId,
-      target_name: productMeta.name || `Smartphone ${productId}`,
-      target_type: productMeta.product_type || "smartphone",
-      target_snapshot: productMeta,
-    };
+        [productId],
+      );
+      const productMeta = productMetaRes.rows[0] || {};
+      req.deleteAuditTarget = {
+        target_table: "products",
+        target_id: productId,
+        target_name: productMeta.name || `Smartphone ${productId}`,
+        target_type: productMeta.product_type || "smartphone",
+        target_snapshot: productMeta,
+      };
 
-    // check publish status from product_publish table
-    const pub = await client.query(
-      "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
-      [productId],
-    );
+      // check publish status from product_publish table
+      const pub = await client.query(
+        "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
+        [productId],
+      );
 
-    if (pub.rows.length && pub.rows[0].is_published) {
+      if (pub.rows.length && pub.rows[0].is_published) {
+        await client.query("ROLLBACK");
+        return res
+          .status(403)
+          .json({ message: "Cannot delete: Smartphone is published" });
+      }
+
+      // delete any publish record for the product
+      await client.query("DELETE FROM product_publish WHERE product_id = $1", [
+        productId,
+      ]);
+
+      // delete any product comparisons referencing this product (either side)
+      await client.query(
+        "DELETE FROM product_comparisons WHERE product_id = $1 OR compared_with = $1",
+        [productId],
+      );
+
+      // delete any sphere ratings associated with this product
+      await client.query(
+        "DELETE FROM product_sphere_ratings WHERE product_id = $1",
+        [productId],
+      );
+
+      // delete the product (cascades to smartphones, product_variants, product_images via FK ON DELETE CASCADE)
+      await client.query("DELETE FROM products WHERE id = $1", [productId]);
+
+      await client.query("COMMIT");
+      return res.json({
+        message: "Unpublished smartphone and product deleted successfully",
+      });
+    } catch (err) {
       await client.query("ROLLBACK");
-      return res
-        .status(403)
-        .json({ message: "Cannot delete: Smartphone is published" });
+      console.error("DELETE /api/smartphone/:id error:", err);
+      return res.status(500).json({ error: err.message });
+    } finally {
+      client.release();
     }
-
-    // delete any publish record for the product
-    await client.query("DELETE FROM product_publish WHERE product_id = $1", [
-      productId,
-    ]);
-
-    // delete any product comparisons referencing this product (either side)
-    await client.query(
-      "DELETE FROM product_comparisons WHERE product_id = $1 OR compared_with = $1",
-      [productId],
-    );
-
-    // delete any sphere ratings associated with this product
-    await client.query(
-      "DELETE FROM product_sphere_ratings WHERE product_id = $1",
-      [productId],
-    );
-
-    // delete the product (cascades to smartphones, product_variants, product_images via FK ON DELETE CASCADE)
-    await client.query("DELETE FROM products WHERE id = $1", [productId]);
-
-    await client.query("COMMIT");
-    return res.json({
-      message: "Unpublished smartphone and product deleted successfully",
-    });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("DELETE /api/smartphone/:id error:", err);
-    return res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
-  }
-});
+  },
+);
 
 // Delete laptop
-app.delete("/api/laptop/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  const client = await db.connect();
-  try {
-    const lid = Number(req.params.id);
-    if (Number.isNaN(lid) || lid <= 0) {
-      return res.status(400).json({ message: "Invalid id" });
-    }
+app.delete(
+  "/api/laptop/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    const client = await db.connect();
+    try {
+      const lid = Number(req.params.id);
+      if (Number.isNaN(lid) || lid <= 0) {
+        return res.status(400).json({ message: "Invalid id" });
+      }
 
-    await client.query("BEGIN");
+      await client.query("BEGIN");
 
-    // Accept either laptop.product_id or laptop.id
-    let lres = await client.query(
-      "SELECT product_id FROM laptop WHERE product_id = $1 LIMIT 1",
-      [lid],
-    );
-    if (!lres.rows.length) {
-      lres = await client.query(
-        "SELECT product_id FROM laptop WHERE id = $1 LIMIT 1",
+      // Accept either laptop.product_id or laptop.id
+      let lres = await client.query(
+        "SELECT product_id FROM laptop WHERE product_id = $1 LIMIT 1",
         [lid],
       );
-    }
-    if (!lres.rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ message: "Laptop not found" });
-    }
+      if (!lres.rows.length) {
+        lres = await client.query(
+          "SELECT product_id FROM laptop WHERE id = $1 LIMIT 1",
+          [lid],
+        );
+      }
+      if (!lres.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Laptop not found" });
+      }
 
-    const productId = lres.rows[0].product_id;
-    const productMetaRes = await client.query(
-      `SELECT
+      const productId = lres.rows[0].product_id;
+      const productMetaRes = await client.query(
+        `SELECT
          p.id,
          p.name,
          p.product_type,
@@ -13029,78 +14205,84 @@ app.delete("/api/laptop/:id", authenticate, dataDeletePinVerifyLimiter, requireD
          ON pub.product_id = p.id
        WHERE p.id = $1
        LIMIT 1`,
-      [productId],
-    );
-    const productMeta = productMetaRes.rows[0] || {};
-    req.deleteAuditTarget = {
-      target_table: "products",
-      target_id: productId,
-      target_name: productMeta.name || `Laptop ${productId}`,
-      target_type: productMeta.product_type || "laptop",
-      target_snapshot: productMeta,
-    };
+        [productId],
+      );
+      const productMeta = productMetaRes.rows[0] || {};
+      req.deleteAuditTarget = {
+        target_table: "products",
+        target_id: productId,
+        target_name: productMeta.name || `Laptop ${productId}`,
+        target_type: productMeta.product_type || "laptop",
+        target_snapshot: productMeta,
+      };
 
-    // Prevent deleting published laptops
-    const pub = await client.query(
-      "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
-      [productId],
-    );
-    if (pub.rows.length && pub.rows[0].is_published) {
+      // Prevent deleting published laptops
+      const pub = await client.query(
+        "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
+        [productId],
+      );
+      if (pub.rows.length && pub.rows[0].is_published) {
+        await client.query("ROLLBACK");
+        return res
+          .status(403)
+          .json({ message: "Cannot delete: Laptop is published" });
+      }
+
+      await client.query("DELETE FROM product_publish WHERE product_id = $1", [
+        productId,
+      ]);
+      await client.query(
+        "DELETE FROM product_comparisons WHERE product_id = $1 OR compared_with = $1",
+        [productId],
+      );
+      await client.query(
+        "DELETE FROM product_sphere_ratings WHERE product_id = $1",
+        [productId],
+      );
+      await client.query("DELETE FROM products WHERE id = $1", [productId]);
+
+      await client.query("COMMIT");
+      return res.json({
+        message: "Unpublished laptop and product deleted successfully",
+      });
+    } catch (err) {
       await client.query("ROLLBACK");
-      return res
-        .status(403)
-        .json({ message: "Cannot delete: Laptop is published" });
+      console.error("DELETE /api/laptop/:id error:", err);
+      return res.status(500).json({ error: err.message });
+    } finally {
+      client.release();
     }
-
-    await client.query("DELETE FROM product_publish WHERE product_id = $1", [
-      productId,
-    ]);
-    await client.query(
-      "DELETE FROM product_comparisons WHERE product_id = $1 OR compared_with = $1",
-      [productId],
-    );
-    await client.query(
-      "DELETE FROM product_sphere_ratings WHERE product_id = $1",
-      [productId],
-    );
-    await client.query("DELETE FROM products WHERE id = $1", [productId]);
-
-    await client.query("COMMIT");
-    return res.json({
-      message: "Unpublished laptop and product deleted successfully",
-    });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("DELETE /api/laptop/:id error:", err);
-    return res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
-  }
-});
+  },
+);
 
 // Delete TV
-app.delete("/api/tvs/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  const client = await db.connect();
-  try {
-    const tid = Number(req.params.id);
-    if (Number.isNaN(tid) || tid <= 0) {
-      return res.status(400).json({ message: "Invalid id" });
-    }
+app.delete(
+  "/api/tvs/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    const client = await db.connect();
+    try {
+      const tid = Number(req.params.id);
+      if (Number.isNaN(tid) || tid <= 0) {
+        return res.status(400).json({ message: "Invalid id" });
+      }
 
-    await client.query("BEGIN");
+      await client.query("BEGIN");
 
-    const tvRes = await client.query(
-      "SELECT product_id FROM tvs WHERE product_id = $1 LIMIT 1",
-      [tid],
-    );
-    if (!tvRes.rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ message: "TV not found" });
-    }
+      const tvRes = await client.query(
+        "SELECT product_id FROM tvs WHERE product_id = $1 LIMIT 1",
+        [tid],
+      );
+      if (!tvRes.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "TV not found" });
+      }
 
-    const productId = tvRes.rows[0].product_id;
-    const productMetaRes = await client.query(
-      `SELECT
+      const productId = tvRes.rows[0].product_id;
+      const productMetaRes = await client.query(
+        `SELECT
          p.id,
          p.name,
          p.product_type,
@@ -13113,53 +14295,54 @@ app.delete("/api/tvs/:id", authenticate, dataDeletePinVerifyLimiter, requireData
          ON pub.product_id = p.id
        WHERE p.id = $1
        LIMIT 1`,
-      [productId],
-    );
-    const productMeta = productMetaRes.rows[0] || {};
-    req.deleteAuditTarget = {
-      target_table: "products",
-      target_id: productId,
-      target_name: productMeta.name || `TV ${productId}`,
-      target_type: productMeta.product_type || "tv",
-      target_snapshot: productMeta,
-    };
+        [productId],
+      );
+      const productMeta = productMetaRes.rows[0] || {};
+      req.deleteAuditTarget = {
+        target_table: "products",
+        target_id: productId,
+        target_name: productMeta.name || `TV ${productId}`,
+        target_type: productMeta.product_type || "tv",
+        target_snapshot: productMeta,
+      };
 
-    const pubRes = await client.query(
-      "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
-      [productId],
-    );
-    if (pubRes.rows.length && pubRes.rows[0].is_published) {
+      const pubRes = await client.query(
+        "SELECT is_published FROM product_publish WHERE product_id = $1 LIMIT 1",
+        [productId],
+      );
+      if (pubRes.rows.length && pubRes.rows[0].is_published) {
+        await client.query("ROLLBACK");
+        return res
+          .status(403)
+          .json({ message: "Cannot delete: TV is published" });
+      }
+
+      await client.query("DELETE FROM product_publish WHERE product_id = $1", [
+        productId,
+      ]);
+      await client.query(
+        "DELETE FROM product_comparisons WHERE product_id = $1 OR compared_with = $1",
+        [productId],
+      );
+      await client.query(
+        "DELETE FROM product_sphere_ratings WHERE product_id = $1",
+        [productId],
+      );
+      await client.query("DELETE FROM products WHERE id = $1", [productId]);
+
+      await client.query("COMMIT");
+      return res.json({
+        message: "Unpublished TV and product deleted successfully",
+      });
+    } catch (err) {
       await client.query("ROLLBACK");
-      return res
-        .status(403)
-        .json({ message: "Cannot delete: TV is published" });
+      console.error("DELETE /api/tvs/:id error:", err);
+      return res.status(500).json({ error: err.message });
+    } finally {
+      client.release();
     }
-
-    await client.query("DELETE FROM product_publish WHERE product_id = $1", [
-      productId,
-    ]);
-    await client.query(
-      "DELETE FROM product_comparisons WHERE product_id = $1 OR compared_with = $1",
-      [productId],
-    );
-    await client.query(
-      "DELETE FROM product_sphere_ratings WHERE product_id = $1",
-      [productId],
-    );
-    await client.query("DELETE FROM products WHERE id = $1", [productId]);
-
-    await client.query("COMMIT");
-    return res.json({
-      message: "Unpublished TV and product deleted successfully",
-    });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("DELETE /api/tvs/:id error:", err);
-    return res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
-  }
-});
+  },
+);
 
 // Delete a color from a smartphone's colors JSONB by index
 app.get("/api/laptop", authenticate, async (req, res) => {
@@ -13793,23 +14976,29 @@ app.put("/api/ram-storage-config/:id", authenticate, async (req, res) => {
 });
 
 // Delete a spec entry (authenticated) - path expected by client
-app.delete("/api/ram-storage-config/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!id || Number.isNaN(id))
-      return res.status(400).json({ message: "Invalid id" });
+app.delete(
+  "/api/ram-storage-config/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!id || Number.isNaN(id))
+        return res.status(400).json({ message: "Invalid id" });
 
-    const r = await db.query("DELETE FROM ram_storage_long WHERE id = $1", [
-      id,
-    ]);
-    if (r.rowCount === 0)
-      return res.status(404).json({ message: "Spec not found" });
-    return res.json({ message: "Spec deleted" });
-  } catch (err) {
-    console.error("DELETE /api/ram-storage-config/:id error:", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
+      const r = await db.query("DELETE FROM ram_storage_long WHERE id = $1", [
+        id,
+      ]);
+      if (r.rowCount === 0)
+        return res.status(404).json({ message: "Spec not found" });
+      return res.json({ message: "Spec deleted" });
+    } catch (err) {
+      console.error("DELETE /api/ram-storage-config/:id error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 /* -----------------------
   Categories CRUD
@@ -13903,20 +15092,26 @@ app.put("/api/categories/:id", authenticate, async (req, res) => {
 });
 
 // Delete category (authenticated)
-app.delete("/api/categories/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!id || Number.isNaN(id))
-      return res.status(400).json({ message: "Invalid id" });
-    const r = await db.query("DELETE FROM categories WHERE id=$1", [id]);
-    if (r.rowCount === 0)
-      return res.status(404).json({ message: "Category not found" });
-    return res.json({ message: "Category deleted" });
-  } catch (err) {
-    console.error("DELETE /api/categories/:id error:", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
+app.delete(
+  "/api/categories/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!id || Number.isNaN(id))
+        return res.status(400).json({ message: "Invalid id" });
+      const r = await db.query("DELETE FROM categories WHERE id=$1", [id]);
+      if (r.rowCount === 0)
+        return res.status(404).json({ message: "Category not found" });
+      return res.json({ message: "Category deleted" });
+    } catch (err) {
+      console.error("DELETE /api/categories/:id error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 /* -----------------------
   Online Stores CRUD
@@ -13987,20 +15182,26 @@ app.put("/api/online-stores/:id", authenticate, async (req, res) => {
 });
 
 // Delete an online store (authenticated)
-app.delete("/api/online-stores/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!id || Number.isNaN(id))
-      return res.status(400).json({ message: "Invalid id" });
-    const r = await db.query("DELETE FROM online_stores WHERE id = $1", [id]);
-    if (r.rowCount === 0)
-      return res.status(404).json({ message: "Store not found" });
-    return res.json({ message: "Store deleted" });
-  } catch (err) {
-    console.error("DELETE /api/online-stores/:id error:", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
+app.delete(
+  "/api/online-stores/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!id || Number.isNaN(id))
+        return res.status(400).json({ message: "Invalid id" });
+      const r = await db.query("DELETE FROM online_stores WHERE id = $1", [id]);
+      if (r.rowCount === 0)
+        return res.status(404).json({ message: "Store not found" });
+      return res.json({ message: "Store deleted" });
+    } catch (err) {
+      console.error("DELETE /api/online-stores/:id error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 // Patch status for an online store (authenticated)
 app.patch("/api/online-stores/:id/status", authenticate, async (req, res) => {
@@ -14025,71 +15226,89 @@ app.patch("/api/online-stores/:id/status", authenticate, async (req, res) => {
 });
 
 // Delete a spec entry (authenticated)
-app.delete("/api/specs/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!id || Number.isNaN(id))
-      return res.status(400).json({ message: "Invalid id" });
+app.delete(
+  "/api/specs/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!id || Number.isNaN(id))
+        return res.status(400).json({ message: "Invalid id" });
 
-    const r = await db.query("DELETE FROM ram_storage_long  WHERE id = $1", [
-      id,
-    ]);
-    if (r.rowCount === 0)
-      return res.status(404).json({ message: "Spec not found" });
-    return res.json({ message: "Spec deleted" });
-  } catch (err) {
-    console.error("DELETE /api/specs/:id error:", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
+      const r = await db.query("DELETE FROM ram_storage_long  WHERE id = $1", [
+        id,
+      ]);
+      if (r.rowCount === 0)
+        return res.status(404).json({ message: "Spec not found" });
+      return res.json({ message: "Spec deleted" });
+    } catch (err) {
+      console.error("DELETE /api/specs/:id error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 // Delete a variant by id (will cascade-delete store prices via FK)
-app.delete("/api/variant/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    const vid = Number(req.params.id);
-    if (!vid || Number.isNaN(vid))
-      return res.status(400).json({ message: "Invalid variant id" });
+app.delete(
+  "/api/variant/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      const vid = Number(req.params.id);
+      if (!vid || Number.isNaN(vid))
+        return res.status(400).json({ message: "Invalid variant id" });
 
-    const result = await db.query(
-      "DELETE FROM product_variants WHERE id = $1 RETURNING product_id;",
-      [vid],
-    );
-    if (!result.rows.length)
-      return res.status(404).json({ message: "Variant not found" });
+      const result = await db.query(
+        "DELETE FROM product_variants WHERE id = $1 RETURNING product_id;",
+        [vid],
+      );
+      if (!result.rows.length)
+        return res.status(404).json({ message: "Variant not found" });
 
-    return res.json({
-      message: "Variant deleted",
-      product_id: result.rows[0].product_id,
-    });
-  } catch (err) {
-    console.error("DELETE variant error:", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
+      return res.json({
+        message: "Variant deleted",
+        product_id: result.rows[0].product_id,
+      });
+    } catch (err) {
+      console.error("DELETE variant error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 // Delete a store price entry by id
-app.delete("/api/storeprice/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    const pid = Number(req.params.id);
-    if (!pid || Number.isNaN(pid))
-      return res.status(400).json({ message: "Invalid price id" });
+app.delete(
+  "/api/storeprice/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      const pid = Number(req.params.id);
+      if (!pid || Number.isNaN(pid))
+        return res.status(400).json({ message: "Invalid price id" });
 
-    const result = await db.query(
-      "DELETE FROM variant_store_prices  WHERE id = $1 RETURNING variant_id;",
-      [pid],
-    );
-    if (!result.rows.length)
-      return res.status(404).json({ message: "Store price not found" });
+      const result = await db.query(
+        "DELETE FROM variant_store_prices  WHERE id = $1 RETURNING variant_id;",
+        [pid],
+      );
+      if (!result.rows.length)
+        return res.status(404).json({ message: "Store price not found" });
 
-    return res.json({
-      message: "Store price deleted",
-      variant_id: result.rows[0].variant_id,
-    });
-  } catch (err) {
-    console.error("DELETE storeprice error:", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
+      return res.json({
+        message: "Store price deleted",
+        variant_id: result.rows[0].variant_id,
+      });
+    } catch (err) {
+      console.error("DELETE storeprice error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 /* -----------------------
   Variants & Store Price endpoints (single-item helpers) -  
@@ -14431,23 +15650,29 @@ app.put("/api/brands/:id", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/api/brands/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!id) return res.status(400).json({ message: "Invalid brand id" });
+app.delete(
+  "/api/brands/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!id) return res.status(400).json({ message: "Invalid brand id" });
 
-    const r = await db.query("DELETE FROM brands WHERE id = $1", [id]);
+      const r = await db.query("DELETE FROM brands WHERE id = $1", [id]);
 
-    if (!r.rowCount) {
-      return res.status(404).json({ message: "Brand not found" });
+      if (!r.rowCount) {
+        return res.status(404).json({ message: "Brand not found" });
+      }
+
+      res.json({ message: "Brand deleted" });
+    } catch (err) {
+      console.error("DELETE /api/brands/:id error:", err);
+      res.status(500).json({ error: err.message });
     }
-
-    res.json({ message: "Brand deleted" });
-  } catch (err) {
-    console.error("DELETE /api/brands/:id error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+  },
+);
 
 /* -----------------------
   Banners (marketing)
@@ -14673,22 +15898,28 @@ app.put("/api/admin/banners/:id", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/api/admin/banners/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!id) return res.status(400).json({ message: "Invalid banner id" });
+app.delete(
+  "/api/admin/banners/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!id) return res.status(400).json({ message: "Invalid banner id" });
 
-    const result = await db.query("DELETE FROM banners WHERE id = $1", [id]);
-    if (!result.rowCount) {
-      return res.status(404).json({ message: "Banner not found" });
+      const result = await db.query("DELETE FROM banners WHERE id = $1", [id]);
+      if (!result.rowCount) {
+        return res.status(404).json({ message: "Banner not found" });
+      }
+
+      return res.json({ message: "Banner deleted" });
+    } catch (err) {
+      console.error("DELETE /api/admin/banners/:id error:", err);
+      return res.status(500).json({ error: err.message });
     }
-
-    return res.json({ message: "Banner deleted" });
-  } catch (err) {
-    console.error("DELETE /api/admin/banners/:id error:", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
+  },
+);
 
 app.get("/api/public/banners", async (req, res) => {
   try {
@@ -14947,7 +16178,9 @@ app.get("/api/reports/launch-timing", authenticate, async (req, res) => {
         category: row.category || "Uncategorized",
         name: row.product_name || "Device",
         product_name: row.product_name || "Device",
-        launch_date: row.launch_date ? String(row.launch_date).slice(0, 10) : null,
+        launch_date: row.launch_date
+          ? String(row.launch_date).slice(0, 10)
+          : null,
         sale_start_date: row.sale_start_date
           ? String(row.sale_start_date).slice(0, 10)
           : null,
@@ -14986,7 +16219,9 @@ app.get("/api/reports/launch-timing", authenticate, async (req, res) => {
     });
   } catch (err) {
     console.error("GET /api/reports/launch-timing error:", err);
-    return res.status(500).json({ message: "Failed to load launch timing report" });
+    return res
+      .status(500)
+      .json({ message: "Failed to load launch timing report" });
   }
 });
 
@@ -15964,7 +17199,11 @@ const handleTrendingSmartphones = async (req, res) => {
       item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
       item.price = effectivePrice;
       item.starting_price = effectivePrice;
-      applySmartphoneAvailabilityDetails(item, availabilityForecast, todayIndia);
+      applySmartphoneAvailabilityDetails(
+        item,
+        availabilityForecast,
+        todayIndia,
+      );
       const launchStage = resolveSmartphoneLaunchStage(item, todayIndia);
       const saleStage = resolveSmartphoneSaleStage(item, todayIndia);
       item.launch_status = launchStage;
@@ -16150,7 +17389,11 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
         item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
         item.price = resolveEffectiveSmartphonePrice(variants, item.price);
         item.starting_price = item.price;
-        applySmartphoneAvailabilityDetails(item, availabilityForecast, todayIndia);
+        applySmartphoneAvailabilityDetails(
+          item,
+          availabilityForecast,
+          todayIndia,
+        );
         item.launch_status = resolveSmartphoneLaunchStage(item, todayIndia);
         item.launchStatus = item.launch_status;
         item.sale_status = resolveSmartphoneSaleStage(item, todayIndia);
@@ -16207,7 +17450,8 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
         if (leftLaunchDate !== null) return -1;
         if (rightLaunchDate !== null) return 1;
 
-        const stageDelta = stageRank(left.launch_status) - stageRank(right.launch_status);
+        const stageDelta =
+          stageRank(left.launch_status) - stageRank(right.launch_status);
         if (stageDelta !== 0) return stageDelta;
 
         const hookDelta =
@@ -16401,7 +17645,11 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
         has_purchase_signal: Boolean(row.has_purchase_signal),
       };
 
-      applySmartphoneAvailabilityDetails(base, availabilityForecast, todayIndia);
+      applySmartphoneAvailabilityDetails(
+        base,
+        availabilityForecast,
+        todayIndia,
+      );
       const launchStage = resolveSmartphoneLaunchStage(base, todayIndia);
       const saleStage = resolveSmartphoneSaleStage(base, todayIndia);
       base.launch_status = launchStage;
@@ -16422,7 +17670,9 @@ app.get("/api/public/smartphones/highlights", async (req, res) => {
           const difference = selector(right) - selector(left);
           if (difference !== 0) return difference;
         }
-        return String(left?.name || "").localeCompare(String(right?.name || ""));
+        return String(left?.name || "").localeCompare(
+          String(right?.name || ""),
+        );
       };
 
     const sanitizePhones = (items) =>
@@ -17121,7 +18371,11 @@ app.get("/api/public/new/smartphones", async (req, res) => {
       item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
       item.price = effectivePrice;
       item.starting_price = effectivePrice;
-      applySmartphoneAvailabilityDetails(item, availabilityForecast, todayIndia);
+      applySmartphoneAvailabilityDetails(
+        item,
+        availabilityForecast,
+        todayIndia,
+      );
       const launchStage = resolveSmartphoneLaunchStage(item, todayIndia);
       item.launch_status = launchStage;
       item.launchStatus = launchStage;
@@ -17160,13 +18414,13 @@ app.get("/api/public/new/smartphones", async (req, res) => {
         if (left.releaseDateMs !== right.releaseDateMs) {
           return right.releaseDateMs - left.releaseDateMs;
         }
-        return Number(right.item.product_id || 0) - Number(left.item.product_id || 0);
+        return (
+          Number(right.item.product_id || 0) - Number(left.item.product_id || 0)
+        );
       })
       .slice(0, 20)
       .map((entry) => entry.item)
-      .map((item) =>
-      toPublicSmartphoneResponse(item),
-      );
+      .map((item) => toPublicSmartphoneResponse(item));
 
     return res.json({ new: publicLaunches });
   } catch (err) {
@@ -17941,7 +19195,8 @@ const normalizePopularityProductType = (value = "") => {
 };
 
 const buildPublicProductDetailPath = (productType, name, productId) => {
-  const normalizedType = normalizePopularityProductType(productType) || "smartphone";
+  const normalizedType =
+    normalizePopularityProductType(productType) || "smartphone";
   const slug = toProductSlug(name, productId);
 
   if (normalizedType === "smartphone") {
@@ -17965,10 +19220,7 @@ const parseComparePageSlug = (value = "") => {
     normalized = String(value || "");
   }
 
-  normalized = normalized
-    .trim()
-    .toLowerCase()
-    .replace(/\/+$/g, "");
+  normalized = normalized.trim().toLowerCase().replace(/\/+$/g, "");
 
   if (!normalized) return [];
 
@@ -18019,7 +19271,9 @@ const resolveCompareSegmentLabelFromPrices = (prices = []) => {
 
 const buildCompareRouteSlug = (items = []) => {
   const parts = (Array.isArray(items) ? items : [])
-    .map((item) => toProductSlug(item?.product_name || item?.name || "", item?.product_id))
+    .map((item) =>
+      toProductSlug(item?.product_name || item?.name || "", item?.product_id),
+    )
     .filter(Boolean)
     .slice(0, 3);
 
@@ -18045,7 +19299,10 @@ const buildComparePageTitle = ({ items = [], segmentLabel = "" } = {}) => {
   return `Compare ${joinedNames} Price Specifications and Features in India`;
 };
 
-const buildComparePageDescription = ({ items = [], segmentLabel = "" } = {}) => {
+const buildComparePageDescription = ({
+  items = [],
+  segmentLabel = "",
+} = {}) => {
   const joinedNames = joinCompareNamesWithoutCommas(
     (Array.isArray(items) ? items : []).map(
       (item) => item?.product_name || item?.name || "",
@@ -18076,9 +19333,12 @@ const buildComparePagePayload = (items = [], options = {}) => {
     normalizedItems.push({
       product_id: productId,
       product_name: String(item?.product_name || item?.name || "Device").trim(),
-      product_type: normalizePopularityProductType(item?.product_type) || "smartphone",
+      product_type:
+        normalizePopularityProductType(item?.product_type) || "smartphone",
       brand_name: String(item?.brand_name || item?.brand || "").trim(),
-      best_price: toSafeNumeric(item?.best_price ?? item?.bestPrice ?? item?.price),
+      best_price: toSafeNumeric(
+        item?.best_price ?? item?.bestPrice ?? item?.price,
+      ),
       image_url: String(item?.image_url || item?.image || "").trim() || null,
       detail_path:
         String(item?.detail_path || item?.detailPath || "").trim() ||
@@ -18095,7 +19355,8 @@ const buildComparePagePayload = (items = [], options = {}) => {
   const productType = normalizedItems[0]?.product_type || "smartphone";
   if (
     normalizedItems.some(
-      (item) => normalizePopularityProductType(item?.product_type) !== productType,
+      (item) =>
+        normalizePopularityProductType(item?.product_type) !== productType,
     )
   ) {
     return null;
@@ -18111,7 +19372,10 @@ const buildComparePagePayload = (items = [], options = {}) => {
     String(options.slug || "").trim() || buildCompareRouteSlug(normalizedItems);
   const generatedAt = options.generatedAt || new Date().toISOString();
   const updatedAt =
-    options.updatedAt || options.lastComparedAt || options.publishedAt || generatedAt;
+    options.updatedAt ||
+    options.lastComparedAt ||
+    options.publishedAt ||
+    generatedAt;
 
   return {
     id: Number(options.id) || null,
@@ -18134,12 +19398,17 @@ const buildComparePagePayload = (items = [], options = {}) => {
       String(options.metaDescription || "").trim() ||
       buildComparePageDescription({ items: normalizedItems, segmentLabel }),
     status:
-      String(options.status || "published").trim().toLowerCase() === "draft"
+      String(options.status || "published")
+        .trim()
+        .toLowerCase() === "draft"
         ? "draft"
         : "published",
-    source: String(options.source || "automatic").trim().toLowerCase(),
-    generation_reason:
-      String(options.generationReason || "User Comparison Trend").trim(),
+    source: String(options.source || "automatic")
+      .trim()
+      .toLowerCase(),
+    generation_reason: String(
+      options.generationReason || "User Comparison Trend",
+    ).trim(),
     system_score: toSafeNumeric(options.systemScore) || 0,
     manual_compare_count: Number(options.manualCompareCount) || 0,
     last_compared_at: options.lastComparedAt || null,
@@ -18156,7 +19425,9 @@ const resolveSearchFreshnessScore = (row = {}) => {
     return Math.max(0, Math.min(100, dynamicFreshness));
   }
 
-  const referenceDate = row?.reference_date ? new Date(row.reference_date) : null;
+  const referenceDate = row?.reference_date
+    ? new Date(row.reference_date)
+    : null;
   if (!referenceDate || Number.isNaN(referenceDate.getTime())) return 30;
 
   const ageDays = Math.max(
@@ -18374,7 +19645,10 @@ const fetchSearchPopularityRows = async ({
         0,
         Math.min(100, Number(row?.buyer_intent) || 0),
       );
-      const hookScore = Math.max(0, Math.min(100, Number(row?.hook_score) || 0));
+      const hookScore = Math.max(
+        0,
+        Math.min(100, Number(row?.hook_score) || 0),
+      );
       const trendVelocity = Math.max(
         0,
         Math.min(100, Number(row?.trend_velocity) || 0),
@@ -18445,12 +19719,15 @@ const fetchSearchPopularityRows = async ({
         (right._manual_priority || 0) - (left._manual_priority || 0);
       if (priorityDiff !== 0) return priorityDiff;
       const boostDiff =
-        Number(Boolean(right._manual_boost)) - Number(Boolean(left._manual_boost));
+        Number(Boolean(right._manual_boost)) -
+        Number(Boolean(left._manual_boost));
       if (boostDiff !== 0) return boostDiff;
       const scoreDiff =
-        (right.search_popularity_score || 0) - (left.search_popularity_score || 0);
+        (right.search_popularity_score || 0) -
+        (left.search_popularity_score || 0);
       if (scoreDiff !== 0) return scoreDiff;
-      const searchesDiff = (right.search_count_30d || 0) - (left.search_count_30d || 0);
+      const searchesDiff =
+        (right.search_count_30d || 0) - (left.search_count_30d || 0);
       if (searchesDiff !== 0) return searchesDiff;
       return String(left.name || "").localeCompare(String(right.name || ""));
     })
@@ -18467,7 +19744,8 @@ const fetchSearchPopularityRows = async ({
 
 app.get("/api/public/search-popularity", async (req, res) => {
   try {
-    const productTypeRaw = req.query?.productType ?? req.query?.product_type ?? "all";
+    const productTypeRaw =
+      req.query?.productType ?? req.query?.product_type ?? "all";
     const normalizedType = normalizePopularityProductType(productTypeRaw);
     if (normalizedType === null) {
       return res.status(400).json({ message: "Invalid productType" });
@@ -18498,7 +19776,9 @@ app.get("/api/public/search-popularity", async (req, res) => {
     });
   } catch (err) {
     console.error("GET /api/public/search-popularity error:", err);
-    return res.status(500).json({ message: "Failed to load search popularity" });
+    return res
+      .status(500)
+      .json({ message: "Failed to load search popularity" });
   }
 });
 
@@ -18508,7 +19788,8 @@ app.get("/api/admin/search-popularity", authenticate, async (req, res) => {
       return res.status(403).json({ message: "Admin access required" });
     }
 
-    const productTypeRaw = req.query?.productType ?? req.query?.product_type ?? "all";
+    const productTypeRaw =
+      req.query?.productType ?? req.query?.product_type ?? "all";
     const normalizedType = normalizePopularityProductType(productTypeRaw);
     if (normalizedType === null) {
       return res.status(400).json({ message: "Invalid productType" });
@@ -18539,7 +19820,9 @@ app.get("/api/admin/search-popularity", authenticate, async (req, res) => {
     });
   } catch (err) {
     console.error("GET /api/admin/search-popularity error:", err);
-    return res.status(500).json({ message: "Failed to load search popularity" });
+    return res
+      .status(500)
+      .json({ message: "Failed to load search popularity" });
   }
 });
 
@@ -18574,7 +19857,9 @@ const normalizeComparePageItem = (item, positionFallback = 1) => {
     product_name: productName,
     product_type: productType,
     brand_name: String(item?.brand_name || item?.brand || "").trim(),
-    best_price: toSafeNumeric(item?.best_price ?? item?.bestPrice ?? item?.price),
+    best_price: toSafeNumeric(
+      item?.best_price ?? item?.bestPrice ?? item?.price,
+    ),
     image_url: String(item?.image_url || item?.image || "").trim() || null,
     detail_path:
       String(item?.detail_path || item?.detailPath || "").trim() ||
@@ -18605,13 +19890,19 @@ const normalizeComparePageRecord = (row) => {
     ).trim(),
     slug: String(row.slug || "").trim(),
     title: String(row.title || "").trim(),
-    meta_description: String(row.meta_description || row.metaDescription || "").trim(),
+    meta_description: String(
+      row.meta_description || row.metaDescription || "",
+    ).trim(),
     status:
-      String(row.status || "published").trim().toLowerCase() === "draft"
+      String(row.status || "published")
+        .trim()
+        .toLowerCase() === "draft"
         ? "draft"
         : "published",
     source:
-      String(row.source || "manual").trim().toLowerCase() === "automatic"
+      String(row.source || "manual")
+        .trim()
+        .toLowerCase() === "automatic"
         ? "automatic"
         : "manual",
     generation_reason: String(
@@ -18622,7 +19913,8 @@ const normalizeComparePageRecord = (row) => {
       Number(row.manual_compare_count ?? row.manualCompareCount) || 0,
     last_compared_at: row.last_compared_at ?? row.lastComparedAt ?? null,
     generated_at: row.generated_at ?? row.generatedAt ?? null,
-    route_path: String(row.route_path || row.routePath || "").trim() ||
+    route_path:
+      String(row.route_path || row.routePath || "").trim() ||
       (row.slug ? `/compare/${String(row.slug).trim()}` : "/compare"),
     updated_at: row.updated_at ?? row.updatedAt ?? null,
     published_at: row.published_at ?? row.publishedAt ?? null,
@@ -18848,10 +20140,14 @@ const toComparePageDbValues = (page, nowIso = new Date().toISOString()) => [
   String(page.slug || "").trim() || null,
   String(page.title || "").trim() || null,
   String(page.meta_description || "").trim() || null,
-  String(page.status || "published").trim().toLowerCase() === "draft"
+  String(page.status || "published")
+    .trim()
+    .toLowerCase() === "draft"
     ? "draft"
     : "published",
-  String(page.source || "manual").trim().toLowerCase() === "automatic"
+  String(page.source || "manual")
+    .trim()
+    .toLowerCase() === "automatic"
     ? "automatic"
     : "manual",
   String(page.generation_reason || "").trim() || null,
@@ -18903,7 +20199,8 @@ const persistComparePageRecord = async (page) => {
       [pageId, ...values],
     );
 
-    if (updateResult.rows?.[0]) return normalizeComparePageRecord(updateResult.rows[0]);
+    if (updateResult.rows?.[0])
+      return normalizeComparePageRecord(updateResult.rows[0]);
   }
 
   const result = await db.query(
@@ -18963,12 +20260,11 @@ const persistComparePageRecord = async (page) => {
   return normalizeComparePageRecord(fallback.rows?.[0] || null);
 };
 
-const syncAutomaticComparePages = async ({
-  days = 180,
-  limit = 100,
-} = {}) => {
+const syncAutomaticComparePages = async ({ days = 180, limit = 100 } = {}) => {
   const pages = await fetchAutomaticComparePageCandidates({ days, limit });
-  const generatedKeys = pages.map((page) => String(page.compare_key || "").trim()).filter(Boolean);
+  const generatedKeys = pages
+    .map((page) => String(page.compare_key || "").trim())
+    .filter(Boolean);
 
   for (const page of pages) {
     // Automatic pages stay fresh, but manual edits always win because the
@@ -18996,7 +20292,8 @@ const syncAutomaticComparePages = async ({
 };
 
 const requireAdminAccess = (req, res) => {
-  if (req.user?.role !== "admin") {
+  const role = normalizeRbacRole(req.user?.role || "");
+  if (role !== "admin" && role !== "ceo") {
     res.status(403).json({ message: "Admin access required" });
     return false;
   }
@@ -19026,9 +20323,10 @@ const fetchComparePageRecordById = async (pageId) => {
   const id = Number(pageId);
   if (!Number.isInteger(id) || id <= 0) return null;
 
-  const result = await db.query(`SELECT * FROM compare_pages WHERE id = $1 LIMIT 1`, [
-    id,
-  ]);
+  const result = await db.query(
+    `SELECT * FROM compare_pages WHERE id = $1 LIMIT 1`,
+    [id],
+  );
   return normalizeComparePageRecord(result.rows?.[0] || null);
 };
 
@@ -19080,7 +20378,10 @@ const buildComparePageFromBody = async (body = {}, existingPage = null) => {
       existingPage?.primary_product_id ??
       null,
     segmentLabel:
-      body.segment_label || body.segmentLabel || existingPage?.segment_label || "",
+      body.segment_label ||
+      body.segmentLabel ||
+      existingPage?.segment_label ||
+      "",
     smartphoneTypeLabel:
       body.smartphone_type_label ||
       body.smartphoneTypeLabel ||
@@ -19089,7 +20390,10 @@ const buildComparePageFromBody = async (body = {}, existingPage = null) => {
     slug: body.slug || existingPage?.slug || "",
     title: body.title || existingPage?.title || "",
     metaDescription:
-      body.meta_description || body.metaDescription || existingPage?.meta_description || "",
+      body.meta_description ||
+      body.metaDescription ||
+      existingPage?.meta_description ||
+      "",
     status: body.status || existingPage?.status || "published",
     source: body.source || existingPage?.source || "manual",
     generationReason:
@@ -19105,11 +20409,21 @@ const buildComparePageFromBody = async (body = {}, existingPage = null) => {
       existingPage?.manual_compare_count ??
       0,
     lastComparedAt:
-      body.last_compared_at ?? body.lastComparedAt ?? existingPage?.last_compared_at ?? null,
-    generatedAt: body.generated_at ?? body.generatedAt ?? existingPage?.generated_at ?? nowIso,
+      body.last_compared_at ??
+      body.lastComparedAt ??
+      existingPage?.last_compared_at ??
+      null,
+    generatedAt:
+      body.generated_at ??
+      body.generatedAt ??
+      existingPage?.generated_at ??
+      nowIso,
     updatedAt: nowIso,
     publishedAt:
-      body.published_at ?? body.publishedAt ?? existingPage?.published_at ?? nowIso,
+      body.published_at ??
+      body.publishedAt ??
+      existingPage?.published_at ??
+      nowIso,
   });
 };
 
@@ -19198,58 +20512,70 @@ app.get("/api/admin/compare-pages", authenticate, async (req, res) => {
   }
 });
 
-app.get("/api/admin/compare-pages/suggestions/:productId", authenticate, async (req, res) => {
-  try {
-    if (!requireAdminAccess(req, res)) return;
+app.get(
+  "/api/admin/compare-pages/suggestions/:productId",
+  authenticate,
+  async (req, res) => {
+    try {
+      if (!requireAdminAccess(req, res)) return;
 
-    const productId = Number(req.params.productId);
-    if (!Number.isInteger(productId) || productId <= 0) {
-      return res.status(400).json({ message: "Invalid product id" });
+      const productId = Number(req.params.productId);
+      if (!Number.isInteger(productId) || productId <= 0) {
+        return res.status(400).json({ message: "Invalid product id" });
+      }
+
+      const daysRaw = Number(req.query?.days ?? 180);
+      const limitRaw = Number(req.query?.limit ?? 5);
+      const { existingPage, suggestions } =
+        await fetchComparePageSuggestionsForProduct({
+          productId,
+          days: Number.isFinite(daysRaw) ? daysRaw : 180,
+          limit: Number.isFinite(limitRaw) ? limitRaw : 5,
+        });
+
+      return res.json({
+        product_id: productId,
+        existing_page: existingPage,
+        suggestions,
+        generated_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error(
+        "GET /api/admin/compare-pages/suggestions/:productId error:",
+        err,
+      );
+      return res
+        .status(500)
+        .json({ message: "Failed to load compare page suggestions" });
     }
+  },
+);
 
-    const daysRaw = Number(req.query?.days ?? 180);
-    const limitRaw = Number(req.query?.limit ?? 5);
-    const { existingPage, suggestions } = await fetchComparePageSuggestionsForProduct({
-      productId,
-      days: Number.isFinite(daysRaw) ? daysRaw : 180,
-      limit: Number.isFinite(limitRaw) ? limitRaw : 5,
-    });
+app.post(
+  "/api/admin/compare-pages/auto-sync",
+  authenticate,
+  async (req, res) => {
+    try {
+      if (!requireAdminAccess(req, res)) return;
 
-    return res.json({
-      product_id: productId,
-      existing_page: existingPage,
-      suggestions,
-      generated_at: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error("GET /api/admin/compare-pages/suggestions/:productId error:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to load compare page suggestions" });
-  }
-});
+      const daysRaw = Number(req.body?.days ?? req.query?.days ?? 180);
+      const limitRaw = Number(req.body?.limit ?? req.query?.limit ?? 100);
+      const result = await syncAutomaticComparePages({
+        days: Number.isFinite(daysRaw) ? daysRaw : 180,
+        limit: Number.isFinite(limitRaw) ? limitRaw : 100,
+      });
 
-app.post("/api/admin/compare-pages/auto-sync", authenticate, async (req, res) => {
-  try {
-    if (!requireAdminAccess(req, res)) return;
-
-    const daysRaw = Number(req.body?.days ?? req.query?.days ?? 180);
-    const limitRaw = Number(req.body?.limit ?? req.query?.limit ?? 100);
-    const result = await syncAutomaticComparePages({
-      days: Number.isFinite(daysRaw) ? daysRaw : 180,
-      limit: Number.isFinite(limitRaw) ? limitRaw : 100,
-    });
-
-    return res.json({
-      ok: true,
-      generated_at: new Date().toISOString(),
-      result,
-    });
-  } catch (err) {
-    console.error("POST /api/admin/compare-pages/auto-sync error:", err);
-    return res.status(500).json({ message: "Failed to sync compare pages" });
-  }
-});
+      return res.json({
+        ok: true,
+        generated_at: new Date().toISOString(),
+        result,
+      });
+    } catch (err) {
+      console.error("POST /api/admin/compare-pages/auto-sync error:", err);
+      return res.status(500).json({ message: "Failed to sync compare pages" });
+    }
+  },
+);
 
 app.get("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
   try {
@@ -19328,34 +20654,40 @@ app.put("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/api/admin/compare-pages/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    if (!requireAdminAccess(req, res)) return;
+app.delete(
+  "/api/admin/compare-pages/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      if (!requireAdminAccess(req, res)) return;
 
-    const pageId = Number(req.params.id);
-    if (!Number.isInteger(pageId) || pageId <= 0) {
-      return res.status(400).json({ message: "Invalid compare page id" });
+      const pageId = Number(req.params.id);
+      if (!Number.isInteger(pageId) || pageId <= 0) {
+        return res.status(400).json({ message: "Invalid compare page id" });
+      }
+
+      const result = await db.query(
+        `DELETE FROM compare_pages WHERE id = $1 RETURNING id`,
+        [pageId],
+      );
+
+      if (!result.rows?.length) {
+        return res.status(404).json({ message: "Compare page not found" });
+      }
+
+      return res.json({
+        ok: true,
+        deleted_id: pageId,
+        generated_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error("DELETE /api/admin/compare-pages/:id error:", err);
+      return res.status(500).json({ message: "Failed to delete compare page" });
     }
-
-    const result = await db.query(
-      `DELETE FROM compare_pages WHERE id = $1 RETURNING id`,
-      [pageId],
-    );
-
-    if (!result.rows?.length) {
-      return res.status(404).json({ message: "Compare page not found" });
-    }
-
-    return res.json({
-      ok: true,
-      deleted_id: pageId,
-      generated_at: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error("DELETE /api/admin/compare-pages/:id error:", err);
-    return res.status(500).json({ message: "Failed to delete compare page" });
-  }
-});
+  },
+);
 
 app.get("/api/public/compare-pages/routes", async (req, res) => {
   try {
@@ -19512,7 +20844,9 @@ app.get("/api/public/compare-pages/routes", async (req, res) => {
     });
   } catch (err) {
     console.error("GET /api/public/compare-pages/routes error:", err);
-    return res.status(500).json({ message: "Failed to load compare page routes" });
+    return res
+      .status(500)
+      .json({ message: "Failed to load compare page routes" });
   }
 });
 
@@ -19588,16 +20922,21 @@ app.get("/api/public/compare-pages/resolve", async (req, res) => {
       bySlug.set(rowSlug, row);
     }
 
-    const orderedRows = slugParts.map((part) => bySlug.get(part)).filter(Boolean);
+    const orderedRows = slugParts
+      .map((part) => bySlug.get(part))
+      .filter(Boolean);
     if (orderedRows.length < 2) {
       return res.json({ page: null });
     }
 
-    const firstType = normalizePopularityProductType(orderedRows[0]?.product_type);
+    const firstType = normalizePopularityProductType(
+      orderedRows[0]?.product_type,
+    );
     if (
       !firstType ||
       orderedRows.some(
-        (row) => normalizePopularityProductType(row?.product_type) !== firstType,
+        (row) =>
+          normalizePopularityProductType(row?.product_type) !== firstType,
       )
     ) {
       return res.json({ page: null });
@@ -21017,16 +22356,22 @@ app.put("/api/ram-storage-config/:id", authenticate, async (req, res) => {
 });
 
 // Delete config
-app.delete("/api/ram-storage-config/:id", authenticate, dataDeletePinVerifyLimiter, requireDataDeleteApproval, async (req, res) => {
-  try {
-    const id = req.params.id;
-    await db.query(`DELETE FROM ram_storage_long WHERE id = $1`, [id]);
-    return res.json({ message: "Deleted" });
-  } catch (err) {
-    console.error("Delete ram-storage-config error:", err);
-    return res.status(500).json({ message: "Internal server error" });
-  }
-});
+app.delete(
+  "/api/ram-storage-config/:id",
+  authenticate,
+  dataDeletePinVerifyLimiter,
+  requireDataDeleteApproval,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      await db.query(`DELETE FROM ram_storage_long WHERE id = $1`, [id]);
+      return res.json({ message: "Deleted" });
+    } catch (err) {
+      console.error("Delete ram-storage-config error:", err);
+      return res.status(500).json({ message: "Internal server error" });
+    }
+  },
+);
 
 const importSmartphonesRouter = require("./routes/importSmartphones");
 const importLaptopsRouter = require("./routes/importLaptop");
