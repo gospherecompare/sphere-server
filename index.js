@@ -5264,6 +5264,13 @@ const normalizeTransportList = (value) =>
     (transport) => typeof transport === "string" && transport.trim(),
   );
 
+const serializeAdminTokenUser = (user) => ({
+  id: user.id,
+  email: user.email,
+  role: user.role,
+  username: user.user_name || user.username,
+});
+
 const serializeAdminUser = (user) => ({
   id: user.id,
   email: user.email,
@@ -5283,7 +5290,7 @@ const serializeAdminUser = (user) => ({
 });
 
 const issueAdminAccessToken = (user) =>
-  jwt.sign(serializeAdminUser(user), SECRET, { expiresIn: ACCESS_TOKEN_TTL });
+  jwt.sign(serializeAdminTokenUser(user), SECRET, { expiresIn: ACCESS_TOKEN_TTL });
 
 const buildAdminSessionUser = async (user = {}) => {
   try {
