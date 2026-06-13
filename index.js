@@ -1815,6 +1815,9 @@ const toNullableOneDecimalNumber = (value) => {
   return Number.isFinite(parsed) ? Number(parsed.toFixed(1)) : null;
 };
 
+const SMARTPHONE_PUBLIC_SCORE_MIN = 72;
+const SMARTPHONE_PUBLIC_SCORE_MAX = 98;
+
 const normalizePublicScoreSource = (value) =>
   String(value || "")
     .trim()
@@ -1834,25 +1837,25 @@ const toPublicAlgorithmScore = (value, source) => {
 
 const resolvePublicSmartphoneSpecScore = (
   value,
-  { allowLegacySpecScore = false } = {},
+  { allowLegacySpecScore = false, useDisplayBand = false } = {},
 ) => {
   if (!value || typeof value !== "object") return null;
 
   const candidates = [
-    toPublicAlgorithmScore(
-      value.spec_score_v2_raw,
-      value.spec_score_v2_source ?? value.specScoreV2Source,
-    ),
-    toPublicAlgorithmScore(
-      value.specScoreV2Raw,
-      value.spec_score_v2_source ?? value.specScoreV2Source,
-    ),
     toPublicAlgorithmScore(
       value.spec_score_v2,
       value.spec_score_v2_source ?? value.specScoreV2Source,
     ),
     toPublicAlgorithmScore(
       value.specScoreV2,
+      value.spec_score_v2_source ?? value.specScoreV2Source,
+    ),
+    toPublicAlgorithmScore(
+      value.spec_score_v2_raw,
+      value.spec_score_v2_source ?? value.specScoreV2Source,
+    ),
+    toPublicAlgorithmScore(
+      value.specScoreV2Raw,
       value.spec_score_v2_source ?? value.specScoreV2Source,
     ),
   ];
@@ -1871,7 +1874,15 @@ const resolvePublicSmartphoneSpecScore = (
   }
 
   for (const candidate of candidates) {
-    if (candidate != null) return candidate;
+    if (candidate != null) {
+      return useDisplayBand
+        ? mapScoreToDisplayBand(
+            candidate,
+            SMARTPHONE_PUBLIC_SCORE_MIN,
+            SMARTPHONE_PUBLIC_SCORE_MAX,
+          )
+        : candidate;
+    }
   }
   return null;
 };
@@ -1880,6 +1891,9 @@ const toPublicSmartphoneResponse = (value) => {
   const withoutBusinessFields = stripPublicSmartphoneBusinessFields(value);
   const resolvedSpecScore = resolvePublicSmartphoneSpecScore(
     withoutBusinessFields,
+    {
+      useDisplayBand: true,
+    },
   );
   const publicRow = stripPublicSpecScoreDecorations(withoutBusinessFields);
 
@@ -3157,22 +3171,162 @@ const computeSmartphoneRawSpecScoreV2 = (source) => {
   };
 };
 
-const computePercentileScore = (value, sortedValues) => {
-  const n = Array.isArray(sortedValues) ? sortedValues.length : 0;
-  if (!n) return null;
-  if (n === 1) return 100;
+const SMARTPHONE_SEGMENT_PEER_MIN = 6;
+const SMARTPHONE_BRAND_SEGMENT_PEER_MIN = 3;
+const SMARTPHONE_GLOBAL_PEER_MIN = 8;
+const SMARTPHONE_RECENCY_HALF_LIFE_DAYS = 540;
 
+const normalizeSmartphoneScoreBrand = (row) => {
+  const value =
+    row?.brand_name ??
+    row?.brandName ??
+    row?.brand ??
+    row?.manufacturer ??
+    "";
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+  return normalized || "unknown";
+};
+
+const parseSmartphoneScoreDateMs = (row) => {
+  const candidates = [
+    row?.sale_start_date,
+    row?.saleStartDate,
+    row?.available_date,
+    row?.availableDate,
+    row?.launch_date,
+    row?.launchDate,
+    row?.created_at,
+    row?.createdAt,
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const parsed = new Date(candidate);
+    const ms = parsed.getTime();
+    if (Number.isFinite(ms)) return ms;
+  }
+  return null;
+};
+
+const getSmartphoneScoreRecencyWeight = (row, nowMs = Date.now()) => {
+  const dateMs = parseSmartphoneScoreDateMs(row);
+  if (dateMs == null) return 1;
+
+  const ageDays = Math.max(0, (nowMs - dateMs) / 86400000);
+  const recency = Math.exp(-ageDays / SMARTPHONE_RECENCY_HALF_LIFE_DAYS);
+  return Number(
+    Math.max(0.55, Math.min(1.35, 0.55 + recency * 0.8)).toFixed(3),
+  );
+};
+
+const addSmartphoneScoreBucketEntry = (buckets, key, entry) => {
+  const bucketKey = String(key || "unknown");
+  if (!buckets.has(bucketKey)) buckets.set(bucketKey, []);
+  buckets.get(bucketKey).push(entry);
+};
+
+const computeWeightedPercentileScore = (value, peerEntries) => {
   const target = Number(value);
   if (!Number.isFinite(target)) return null;
 
-  let countLessOrEqual = 0;
-  for (const item of sortedValues) {
-    if (item <= target) countLessOrEqual += 1;
+  const peers = (Array.isArray(peerEntries) ? peerEntries : [])
+    .map((entry) => ({
+      raw: Number(entry?.raw),
+      weight: Number(entry?.weight),
+    }))
+    .filter(
+      (entry) =>
+        Number.isFinite(entry.raw) &&
+        Number.isFinite(entry.weight) &&
+        entry.weight > 0,
+    )
+    .sort((a, b) => a.raw - b.raw);
+
+  if (!peers.length) return null;
+  if (peers.length === 1) return 100;
+
+  const totalWeight = peers.reduce((sum, entry) => sum + entry.weight, 0);
+  if (!Number.isFinite(totalWeight) || totalWeight <= 0) return null;
+
+  let belowWeight = 0;
+  let equalWeight = 0;
+  for (const entry of peers) {
+    if (entry.raw < target) {
+      belowWeight += entry.weight;
+    } else if (entry.raw === target) {
+      equalWeight += entry.weight;
+    }
   }
 
-  const rank = Math.max(1, countLessOrEqual);
-  const percentile = ((rank - 1) / (n - 1)) * 100;
+  const percentile = ((belowWeight + equalWeight / 2) / totalWeight) * 100;
   return Number(Math.max(0, Math.min(100, percentile)).toFixed(1));
+};
+
+const resolveSmartphoneContextScore = (entry, buckets) => {
+  const parts = [];
+  const brandSegmentKey = `${entry.band}::${entry.brand}`;
+  const brandBucket = buckets.brandSegment.get(brandSegmentKey) || [];
+  const segmentBucket = buckets.segment.get(entry.band) || [];
+  const globalBucket = buckets.global;
+
+  if (
+    entry.brand !== "unknown" &&
+    brandBucket.length >= SMARTPHONE_BRAND_SEGMENT_PEER_MIN
+  ) {
+    const percentile = computeWeightedPercentileScore(entry.raw, brandBucket);
+    if (percentile != null) {
+      parts.push({
+        score: percentile,
+        weight: 0.58,
+        source: "brand_segment",
+      });
+    }
+  }
+
+  if (segmentBucket.length >= SMARTPHONE_SEGMENT_PEER_MIN) {
+    const percentile = computeWeightedPercentileScore(entry.raw, segmentBucket);
+    if (percentile != null) {
+      parts.push({
+        score: percentile,
+        weight: parts.length ? 0.42 : 1,
+        source: "segment",
+      });
+    }
+  }
+
+  if (!parts.length && globalBucket.length >= SMARTPHONE_GLOBAL_PEER_MIN) {
+    const percentile = computeWeightedPercentileScore(entry.raw, globalBucket);
+    if (percentile != null) {
+      parts.push({
+        score: percentile,
+        weight: 1,
+        source: "latest",
+      });
+    }
+  }
+
+  if (!parts.length) return null;
+
+  const weightTotal = parts.reduce((sum, part) => sum + part.weight, 0);
+  if (!Number.isFinite(weightTotal) || weightTotal <= 0) return null;
+
+  const percentile =
+    parts.reduce((sum, part) => sum + part.score * part.weight, 0) /
+    weightTotal;
+  const blended = Number((percentile * 0.68 + entry.raw * 0.32).toFixed(1));
+  const learned = Number(
+    (
+      Math.pow(Math.max(0, Math.min(100, blended)) / 100, 1.06) * 100
+    ).toFixed(1),
+  );
+
+  return {
+    score: learned,
+    source: `model_v2_${parts.map((part) => part.source).join("_")}_percentile`,
+  };
 };
 
 const applySpecScoreToRow = (type, row, profiles) => {
@@ -3266,11 +3420,25 @@ const applySpecScoreToRow = (type, row, profiles) => {
         }
       : row.camera_json;
   const specScoreDisplay =
-    specScoreV2Display8098 != null ? specScoreV2Display8098 : specScore;
+    normalizedType === "smartphone"
+      ? mapScoreToDisplayBand(
+          specScoreV2 ?? specScore,
+          SMARTPHONE_PUBLIC_SCORE_MIN,
+          SMARTPHONE_PUBLIC_SCORE_MAX,
+        )
+      : specScoreV2Display8098 != null
+        ? specScoreV2Display8098
+        : specScore;
   const overallScoreDisplay =
-    overallScoreV2Display8098 != null
-      ? overallScoreV2Display8098
-      : overallScore;
+    normalizedType === "smartphone"
+      ? mapScoreToDisplayBand(
+          overallScoreV2 ?? overallScore,
+          SMARTPHONE_PUBLIC_SCORE_MIN,
+          SMARTPHONE_PUBLIC_SCORE_MAX,
+        )
+      : overallScoreV2Display8098 != null
+        ? overallScoreV2Display8098
+        : overallScore;
 
   return {
     ...row,
@@ -3309,7 +3477,14 @@ const applySpecScoreToRows = (type, rows, profiles) => {
     return scoredRows;
   }
 
-  const bandBuckets = new Map();
+  const buckets = {
+    brandSegment: new Map(),
+    segment: new Map(),
+    global: [],
+  };
+  const entries = [];
+  const nowMs = Date.now();
+
   scoredRows.forEach((row, index) => {
     const raw = toFiniteScore100(row?.spec_score_v2_raw);
     if (raw == null) return;
@@ -3318,45 +3493,52 @@ const applySpecScoreToRows = (type, rows, profiles) => {
     if (sourceKey.includes("fallback") || sourceKey.includes("unavailable"))
       return;
 
-    const band = row?.spec_score_price_band || "unknown";
-    if (!bandBuckets.has(band)) bandBuckets.set(band, []);
-    bandBuckets.get(band).push({ index, raw });
+    const entry = {
+      index,
+      raw,
+      band: row?.spec_score_price_band || "unknown",
+      brand: normalizeSmartphoneScoreBrand(row),
+      weight: getSmartphoneScoreRecencyWeight(row, nowMs),
+    };
+
+    entries.push(entry);
+    buckets.global.push(entry);
+    addSmartphoneScoreBucketEntry(buckets.segment, entry.band, entry);
+    addSmartphoneScoreBucketEntry(
+      buckets.brandSegment,
+      `${entry.band}::${entry.brand}`,
+      entry,
+    );
   });
 
   const updated = new Map();
-  for (const [, bucket] of bandBuckets.entries()) {
-    if (!Array.isArray(bucket) || bucket.length < 8) continue;
+  entries.forEach((entry) => {
+    const context = resolveSmartphoneContextScore(entry, buckets);
+    if (!context) return;
 
-    const sortedValues = bucket
-      .map((item) => item.raw)
-      .filter((value) => Number.isFinite(value))
-      .sort((a, b) => a - b);
+    const display8098 = mapScoreToDisplayBand(context.score);
+    const publicDisplay = mapScoreToDisplayBand(
+      context.score,
+      SMARTPHONE_PUBLIC_SCORE_MIN,
+      SMARTPHONE_PUBLIC_SCORE_MAX,
+    );
 
-    if (!sortedValues.length) continue;
-
-    bucket.forEach(({ index, raw }) => {
-      const percentile = computePercentileScore(raw, sortedValues);
-      if (percentile == null) return;
-
-      const blended = Number((percentile * 0.68 + raw * 0.32).toFixed(1));
-      const compressed = Number(
-        (
-          Math.pow(Math.max(0, Math.min(100, blended)) / 100, 1.06) * 100
-        ).toFixed(1),
-      );
-      const display8098 = mapScoreToDisplayBand(compressed);
-
-      updated.set(index, {
-        spec_score_v2: compressed,
-        overall_score_v2: compressed,
-        spec_score_v2_source: "model_v2_segment_percentile",
-        overall_score_v2_source: "model_v2_segment_percentile",
-        spec_score_v2_display_80_98: display8098,
-        overall_score_v2_display_80_98: display8098,
-        spec_tier_v2: toSpecTier(compressed),
-      });
+    updated.set(entry.index, {
+      spec_score: context.score,
+      spec_score_source: context.source,
+      overall_score: context.score,
+      overall_score_source: context.source,
+      spec_score_v2: context.score,
+      overall_score_v2: context.score,
+      spec_score_v2_source: context.source,
+      overall_score_v2_source: context.source,
+      spec_score_v2_display_80_98: display8098,
+      overall_score_v2_display_80_98: display8098,
+      spec_score_display: publicDisplay,
+      overall_score_display: publicDisplay,
+      spec_tier_v2: toSpecTier(context.score),
     });
-  }
+  });
 
   return scoredRows.map((row, index) => {
     const patch = updated.get(index);
