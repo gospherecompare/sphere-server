@@ -1815,31 +1815,63 @@ const toNullableOneDecimalNumber = (value) => {
   return Number.isFinite(parsed) ? Number(parsed.toFixed(1)) : null;
 };
 
-const resolvePublicSmartphoneSpecScore = (value) => {
+const normalizePublicScoreSource = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase();
+
+const toPublicAlgorithmScore = (value, source) => {
+  const normalized = toNullableOneDecimalNumber(value);
+  if (normalized == null) return null;
+
+  const sourceKey = normalizePublicScoreSource(source);
+  if (sourceKey.includes("fallback") || sourceKey.includes("unavailable")) {
+    return null;
+  }
+
+  return normalized;
+};
+
+const resolvePublicSmartphoneSpecScore = (
+  value,
+  { allowLegacySpecScore = false } = {},
+) => {
   if (!value || typeof value !== "object") return null;
 
   const candidates = [
-    value.spec_score,
-    value.specScore,
-    value.spec_score_display,
-    value.specScoreDisplay,
-    value.spec_score_v2_display_80_98,
-    value.specScoreV2Display8098,
-    value.overall_score_display,
-    value.overallScoreDisplay,
-    value.overall_score_v2_display_80_98,
-    value.overallScoreV2Display8098,
-    value.spec_score_v2,
-    value.specScoreV2,
-    value.overall_score,
-    value.overallScore,
-    value.overall_score_v2,
-    value.overallScoreV2,
+    toPublicAlgorithmScore(
+      value.spec_score_v2_raw,
+      value.spec_score_v2_source ?? value.specScoreV2Source,
+    ),
+    toPublicAlgorithmScore(
+      value.specScoreV2Raw,
+      value.spec_score_v2_source ?? value.specScoreV2Source,
+    ),
+    toPublicAlgorithmScore(
+      value.spec_score_v2,
+      value.spec_score_v2_source ?? value.specScoreV2Source,
+    ),
+    toPublicAlgorithmScore(
+      value.specScoreV2,
+      value.spec_score_v2_source ?? value.specScoreV2Source,
+    ),
   ];
 
+  if (allowLegacySpecScore) {
+    candidates.push(
+      toPublicAlgorithmScore(
+        value.spec_score,
+        value.spec_score_source ?? value.specScoreSource,
+      ),
+      toPublicAlgorithmScore(
+        value.specScore,
+        value.spec_score_source ?? value.specScoreSource,
+      ),
+    );
+  }
+
   for (const candidate of candidates) {
-    const normalized = toNullableOneDecimalNumber(candidate);
-    if (normalized != null) return normalized;
+    if (candidate != null) return candidate;
   }
   return null;
 };
@@ -1902,6 +1934,7 @@ const toPublicTvResponse = (value) => {
   const withoutBusinessFields = stripPublicTvBusinessFields(value);
   const resolvedSpecScore = resolvePublicSmartphoneSpecScore(
     withoutBusinessFields,
+    { allowLegacySpecScore: true },
   );
   const publicRow = stripPublicSpecScoreDecorations(withoutBusinessFields);
 
@@ -3046,7 +3079,7 @@ const toSpecTier = (score) => {
   return "Entry";
 };
 
-const computeSmartphoneRawSpecScoreV2 = (source, fieldProfile) => {
+const computeSmartphoneRawSpecScoreV2 = (source) => {
   const batteryMah = readSmartphoneBatteryMah(source);
   const chargingW = readSmartphoneChargingWatt(source);
   const refreshHz = readSmartphoneRefreshRateHz(source);
@@ -3088,15 +3121,11 @@ const computeSmartphoneRawSpecScoreV2 = (source, fieldProfile) => {
     weightTotal += weight;
   });
 
-  const profileScore = toFiniteScore100(fieldProfile?.score);
   let rawScore = null;
   let sourceKey = "model_v2_feature_raw";
 
   if (weightTotal > 0) {
     rawScore = weightedTotal / weightTotal;
-  } else if (profileScore != null) {
-    rawScore = profileScore;
-    sourceKey = "model_v2_profile_fallback";
   }
 
   if (rawScore == null) {
@@ -3156,22 +3185,33 @@ const applySpecScoreToRow = (type, row, profiles) => {
   const fieldProfile = resolveDeviceFieldProfileScore(type, source, profiles);
 
   const providedSpecScore = toFiniteScore100(row.spec_score ?? row.specScore);
-  const specScore =
-    providedSpecScore != null ? providedSpecScore : fieldProfile.score;
-  const specScoreSource =
-    providedSpecScore != null ? "provided" : "profile_fallback";
+  const allowProfileFallbackScore = normalizedType !== "smartphone";
+  let specScore =
+    providedSpecScore != null
+      ? providedSpecScore
+      : allowProfileFallbackScore
+        ? fieldProfile.score
+        : null;
+  let specScoreSource =
+    providedSpecScore != null
+      ? "provided"
+      : allowProfileFallbackScore && specScore != null
+        ? "profile_fallback"
+        : "model_v2_unavailable";
 
   const providedOverallScore = toFiniteScore100(
     row.overall_score ?? row.overallScore,
   );
-  const overallScore =
+  let overallScore =
     providedOverallScore != null ? providedOverallScore : specScore;
-  const overallScoreSource =
+  let overallScoreSource =
     providedOverallScore != null
       ? "provided"
       : providedSpecScore != null
         ? "derived_from_spec_score"
-        : "profile_fallback";
+        : allowProfileFallbackScore && specScore != null
+          ? "profile_fallback"
+          : "model_v2_unavailable";
 
   let specScoreV2 = null;
   let specScoreV2Source = "model_v2_unavailable";
@@ -3187,13 +3227,17 @@ const applySpecScoreToRow = (type, row, profiles) => {
   let cameraScoreV2Display8099 = null;
 
   if (normalizedType === "smartphone") {
-    const v2 = computeSmartphoneRawSpecScoreV2(source, fieldProfile);
+    const v2 = computeSmartphoneRawSpecScoreV2(source);
     specScoreV2 = toFiniteScore100(v2.rawScore);
     specScoreV2Raw = specScoreV2;
     specScoreV2Source = v2.source;
     overallScoreV2 = specScoreV2;
     overallScoreV2Source =
       specScoreV2 != null ? "model_v2_raw" : "model_v2_unavailable";
+    specScore = specScoreV2;
+    specScoreSource = specScoreV2Source;
+    overallScore = specScoreV2;
+    overallScoreSource = overallScoreV2Source;
     specScorePrice = toFiniteNumberOrNull(v2.price);
     specScorePriceBand = v2.priceBand || "unknown";
     specFeatureCoverage = toFiniteNumberOrNull(v2.featureCoverage);
@@ -5290,7 +5334,9 @@ const serializeAdminUser = (user) => ({
 });
 
 const issueAdminAccessToken = (user) =>
-  jwt.sign(serializeAdminTokenUser(user), SECRET, { expiresIn: ACCESS_TOKEN_TTL });
+  jwt.sign(serializeAdminTokenUser(user), SECRET, {
+    expiresIn: ACCESS_TOKEN_TTL,
+  });
 
 const buildAdminSessionUser = async (user = {}) => {
   try {
