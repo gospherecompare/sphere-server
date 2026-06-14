@@ -1918,7 +1918,6 @@ const PUBLIC_TV_RESPONSE_NORMALIZED_EXCLUDE_KEYS = new Set([
   "manualboost",
   "manualpriority",
   "manualbadge",
-  "trendbadge",
   "trenddelta",
   "trendingcalculatedat",
 ]);
@@ -1959,6 +1958,43 @@ const toPublicTvResponse = (value) => {
   }
 
   return publicRow;
+};
+
+const normalizeManualTrendBadge = (value) => {
+  if (value === null || value === undefined) return null;
+  const badge = String(value).trim().replace(/\s+/g, " ").slice(0, 64);
+  return badge || null;
+};
+
+const resolveAutomaticTrendBadge = ({ rank, hookScore, trendScore } = {}) => {
+  const rankNumber = Number(rank);
+  const hook = Number(hookScore);
+  const trend = Number(trendScore);
+  const hasHook = Number.isFinite(hook) && hook > 0;
+  const hasTrend = Number.isFinite(trend) && trend > 0;
+
+  if (Number.isFinite(rankNumber) && rankNumber === 1 && hasHook) {
+    return "Top Trending";
+  }
+  if (Number.isFinite(rankNumber) && rankNumber <= 3 && hasHook) {
+    return "Hot Trending";
+  }
+  if (hasHook && hook >= 85) return "Trending Now";
+  if (hasHook && hook >= 70) return "Rising Fast";
+  if (hasTrend && trend >= 60) return "Popular This Week";
+  return "Trending";
+};
+
+const resolvePublicTrendBadge = ({
+  manualBoost,
+  manualBadge,
+  rank,
+  hookScore,
+  trendScore,
+} = {}) => {
+  const cleanManualBadge = normalizeManualTrendBadge(manualBadge);
+  if (manualBoost && cleanManualBadge) return cleanManualBadge;
+  return resolveAutomaticTrendBadge({ rank, hookScore, trendScore });
 };
 
 const removeSectionKeyCollisions = (
@@ -2393,6 +2429,217 @@ const toCompareScoringAdminResponse = (config) => ({
     : DEFAULT_COMPARE_SCORING_CONFIG.chipsetRules,
   updated_at: config.updated_at || null,
 });
+
+const SPEC_SCORE_ALGORITHM_UPDATED_AT =
+  process.env.SPEC_SCORE_ALGORITHM_UPDATED_AT || "2026-06-13";
+
+const percentLabel = (value) => `${Number(value * 100).toFixed(0)}%`;
+
+const buildFieldRows = (fields = {}) =>
+  Object.entries(fields || {}).map(([key, paths]) => ({
+    key,
+    value: Array.isArray(paths) ? paths.join(", ") : String(paths || ""),
+    note: Array.isArray(paths)
+      ? `${paths.length} source path${paths.length === 1 ? "" : "s"} checked`
+      : "1 source path checked",
+  }));
+
+const buildSpecScoreAlgorithmResponse = (profileConfig = {}) => {
+  const profiles = normalizeDeviceFieldProfilesConfig(profileConfig.profiles);
+  const profileUpdatedAt = profileConfig.updated_at || null;
+  const coverageWeights = [
+    {
+      key: "mandatory_coverage",
+      value: "75%",
+      note: "Core fields that must exist for a product to look complete.",
+    },
+    {
+      key: "display_coverage",
+      value: "25%",
+      note: "Extra product-page display fields that improve completeness.",
+    },
+  ];
+
+  return {
+    success: true,
+    updated_at: SPEC_SCORE_ALGORITHM_UPDATED_AT,
+    generated_at: new Date().toISOString(),
+    categories: [
+      {
+        id: "smartphone",
+        label: "Smartphone",
+        model: "V2 raw spec score with runtime segment learning",
+        status: "Active",
+        updated_at: SPEC_SCORE_ALGORITHM_UPDATED_AT,
+        public_display_band: `${SMARTPHONE_PUBLIC_SCORE_MIN}-${SMARTPHONE_PUBLIC_SCORE_MAX}`,
+        score_outputs: [
+          {
+            key: "raw_spec_score",
+            value: "0-100",
+            note: "Internal technical score calculated from actual specs.",
+          },
+          {
+            key: "learned_spec_score",
+            value: "0-100",
+            note: "Runtime peer percentile score for same segment, brand segment, or latest global fallback.",
+          },
+          {
+            key: "display_spec_score",
+            value: `${SMARTPHONE_PUBLIC_SCORE_MIN}-${SMARTPHONE_PUBLIC_SCORE_MAX}`,
+            note: "Frontend-safe public score mapped from the internal raw/learned score.",
+          },
+        ],
+        weights: [
+          {
+            key: "processor",
+            value: percentLabel(0.24),
+            note: "Chipset tier from processor text.",
+          },
+          {
+            key: "display",
+            value: percentLabel(0.16),
+            note: "Refresh rate normalized from 60Hz to 165Hz.",
+          },
+          {
+            key: "camera",
+            value: percentLabel(0.3),
+            note: "Camera quality score first, megapixel fallback second.",
+          },
+          {
+            key: "battery",
+            value: percentLabel(0.14),
+            note: "Battery capacity normalized from 3000mAh to 7500mAh.",
+          },
+          {
+            key: "charging",
+            value: percentLabel(0.06),
+            note: "Charging speed normalized from 10W to 150W.",
+          },
+          {
+            key: "ram",
+            value: percentLabel(0.06),
+            note: "RAM normalized from 4GB to 24GB.",
+          },
+          {
+            key: "storage",
+            value: percentLabel(0.04),
+            note: "Storage normalized from 64GB to 1024GB.",
+          },
+        ],
+        learning: [
+          {
+            key: "brand_segment_peer_min",
+            value: String(SMARTPHONE_BRAND_SEGMENT_PEER_MIN),
+            note: "Minimum same-brand, same-price-band peers before brand learning is used.",
+          },
+          {
+            key: "segment_peer_min",
+            value: String(SMARTPHONE_SEGMENT_PEER_MIN),
+            note: "Minimum same-price-band peers before segment learning is used.",
+          },
+          {
+            key: "global_peer_min",
+            value: String(SMARTPHONE_GLOBAL_PEER_MIN),
+            note: "Minimum latest global peers before fallback learning is used.",
+          },
+          {
+            key: "recency_half_life_days",
+            value: String(SMARTPHONE_RECENCY_HALF_LIFE_DAYS),
+            note: "Newer phones carry more peer-learning weight.",
+          },
+          {
+            key: "brand_segment_blend",
+            value: "58%",
+            note: "Brand segment percentile share when enough brand peers exist.",
+          },
+          {
+            key: "segment_blend",
+            value: "42%",
+            note: "Segment percentile share when brand segment learning also exists.",
+          },
+          {
+            key: "final_peer_raw_blend",
+            value: "68% peer percentile + 32% raw score",
+            note: "Keeps current market context without losing real technical strength.",
+          },
+        ],
+        notes: [
+          "Smartphone learning is recalculated at response time when multiple smartphone rows are scored together.",
+          "The learned value is not stored as a permanent database score by this endpoint.",
+          "Rumored, announced, and upcoming launch policies can hide public spec score rendering.",
+        ],
+      },
+      {
+        id: "laptop",
+        label: "Laptop",
+        model: "Server profile coverage score",
+        status: "Server computed",
+        updated_at: profileUpdatedAt,
+        public_display_band: "0-100",
+        score_outputs: [
+          {
+            key: "spec_score",
+            value: "0-100",
+            note: "Generated on the server from mandatory/display field coverage when no stored score is supplied.",
+          },
+          {
+            key: "overall_score",
+            value: "0-100",
+            note: "Uses supplied overall score, supplied spec score, or the server profile score.",
+          },
+        ],
+        weights: coverageWeights,
+        mandatory_fields: buildFieldRows(profiles.laptop?.mandatory),
+        display_fields: buildFieldRows(profiles.laptop?.display),
+        learning: [
+          {
+            key: "runtime_learning",
+            value: "Not enabled",
+            note: "Laptop scores do not currently use segment/brand peer percentile learning.",
+          },
+        ],
+        notes: [
+          "Laptop scoring currently measures spec data completeness, not performance power.",
+          "Profile paths come from the server device field profile config.",
+        ],
+      },
+      {
+        id: "tv",
+        label: "TV",
+        model: "Server profile coverage score",
+        status: "Server computed",
+        updated_at: profileUpdatedAt,
+        public_display_band: "0-100",
+        score_outputs: [
+          {
+            key: "spec_score",
+            value: "0-100",
+            note: "Generated on the server from mandatory/display field coverage when no stored score is supplied.",
+          },
+          {
+            key: "overall_score",
+            value: "0-100",
+            note: "Uses supplied overall score, supplied spec score, or the server profile score.",
+          },
+        ],
+        weights: coverageWeights,
+        mandatory_fields: buildFieldRows(profiles.tv?.mandatory),
+        display_fields: buildFieldRows(profiles.tv?.display),
+        learning: [
+          {
+            key: "runtime_learning",
+            value: "Not enabled",
+            note: "TV scores do not currently use segment/brand peer percentile learning.",
+          },
+        ],
+        notes: [
+          "TV scoring currently measures spec data completeness, not panel/video quality strength.",
+          "Profile paths come from the server device field profile config.",
+        ],
+      },
+    ],
+  };
+};
 
 async function readCompareScoringConfig() {
   const result = await db.query(
@@ -16682,7 +16929,8 @@ app.get("/api/admin/trending", authenticate, async (req, res) => {
         ts.manual_badge,
         COALESCE(vt.views_total, 0) AS views_total,
         COALESCE(vt.unique_visitors_total, 0) AS unique_visitors_total,
-        COALESCE(ct.compares_total, 0) AS compares_total
+        COALESCE(ct.compares_total, 0) AS compares_total,
+        COALESCE(ds.hook_score, 0) AS hook_score
       FROM product_trending_score ts
       INNER JOIN products p
         ON p.id = ts.product_id
@@ -16695,8 +16943,11 @@ app.get("/api/admin/trending", authenticate, async (req, res) => {
         ON vt.product_id = p.id
       LEFT JOIN compares_total ct
         ON ct.product_id = p.id
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
       ${where}
       ORDER BY
+        COALESCE(ds.hook_score, 0) DESC,
         ts.manual_priority DESC,
         ts.manual_boost DESC,
         ts.trending_score DESC,
@@ -16707,12 +16958,31 @@ app.get("/api/admin/trending", authenticate, async (req, res) => {
       params,
     );
 
+    const results = (result.rows || []).map((row, index) => {
+      const autoBadge = resolveAutomaticTrendBadge({
+        rank: index + 1,
+        hookScore: row.hook_score,
+        trendScore: row.trending_score,
+      });
+      return {
+        ...row,
+        auto_badge: autoBadge,
+        display_badge: resolvePublicTrendBadge({
+          manualBoost: row.manual_boost,
+          manualBadge: row.manual_badge,
+          rank: index + 1,
+          hookScore: row.hook_score,
+          trendScore: row.trending_score,
+        }),
+      };
+    });
+
     return res.json({
       success: true,
       type: typeRaw || "all",
       period: "7d",
-      updated_at: result.rows?.[0]?.updated_at || null,
-      results: result.rows || [],
+      updated_at: results?.[0]?.updated_at || null,
+      results,
     });
   } catch (err) {
     console.error("GET /api/admin/trending error:", err);
@@ -16742,10 +17012,7 @@ app.post("/api/admin/trending/boost", authenticate, async (req, res) => {
       ? Math.max(0, Math.floor(manualPriorityRaw))
       : 0;
     const manualBadgeRaw = body.manual_badge ?? body.manualBadge ?? body.badge;
-    const manualBadge =
-      manualBadgeRaw === null || manualBadgeRaw === undefined
-        ? null
-        : String(manualBadgeRaw).trim().slice(0, 64);
+    const manualBadge = normalizeManualTrendBadge(manualBadgeRaw);
 
     const parseBool = (v) => {
       if (v === true || v === false) return v;
@@ -16801,6 +17068,22 @@ app.get("/api/admin/compare-scoring", authenticate, async (req, res) => {
     return res
       .status(500)
       .json({ message: "Failed to load compare scoring config" });
+  }
+});
+
+app.get("/api/admin/spec-score-algorithms", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const profileConfig = await readDeviceFieldProfilesConfig();
+    return res.json(buildSpecScoreAlgorithmResponse(profileConfig));
+  } catch (err) {
+    console.error("GET /api/admin/spec-score-algorithms error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to load spec score algorithms" });
   }
 });
 
@@ -17045,6 +17328,7 @@ app.get("/api/public/trending-products", async (req, res) => {
         ts.manual_boost,
         ts.manual_priority,
         ts.manual_badge,
+        COALESCE(ds.hook_score, 0) AS hook_score,
         to_char(
           MAX(ts.calculated_at) OVER () AT TIME ZONE 'UTC',
           'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
@@ -17080,8 +17364,11 @@ app.get("/api/public/trending-products", async (req, res) => {
        AND pub.is_published = true
       LEFT JOIN brands b
         ON b.id = p.brand_id
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
       WHERE p.product_type = $1
       ORDER BY
+        COALESCE(ds.hook_score, 0) DESC,
         ts.manual_priority DESC,
         ts.manual_boost DESC,
         ts.trending_score DESC,
@@ -17101,26 +17388,18 @@ app.get("/api/public/trending-products", async (req, res) => {
       return s || `product-${id}`;
     };
 
-    const badgeForScore = (score) => {
-      const s = Number(score);
-      if (!Number.isFinite(s)) return "👀 Gaining Attention";
-      if (s >= 80) return "🔥 Trending Now";
-      if (s >= 60) return "📈 Popular This Week";
-      return "👀 Gaining Attention";
-    };
-
     const rows = result.rows || [];
     const updatedAt = rows?.[0]?.updated_at || null;
 
-    const trending = rows.map((r) => {
+    const trending = rows.map((r, index) => {
       const manualBoost = Boolean(r.manual_boost);
-      const manualBadge = r.manual_badge ? String(r.manual_badge).trim() : "";
-      const badge =
-        manualBoost && manualBadge
-          ? manualBadge
-          : manualBoost
-            ? "🚀 Editor Pick"
-            : badgeForScore(r.trending_score);
+      const badge = resolvePublicTrendBadge({
+        manualBoost,
+        manualBadge: r.manual_badge,
+        rank: index + 1,
+        hookScore: r.hook_score,
+        trendScore: r.trending_score,
+      });
 
       return {
         id: r.product_id,
@@ -17239,6 +17518,7 @@ const handleTrendingSmartphones = async (req, res) => {
         MAX(ts.manual_priority) AS manual_priority,
         MAX(ts.manual_badge) AS manual_badge,
         MAX(ts.calculated_at) AS trending_calculated_at,
+        MAX(ds.hook_score) AS hook_score,
         (
           SELECT pi.image_url
           FROM product_images pi
@@ -17315,6 +17595,7 @@ const handleTrendingSmartphones = async (req, res) => {
       LEFT JOIN brands b ON b.id = p.brand_id
       LEFT JOIN product_variants v ON v.product_id = p.id
       LEFT JOIN product_trending_score ts ON ts.product_id = p.id
+      LEFT JOIN product_dynamic_score ds ON ds.product_id = p.id
       WHERE p.product_type = 'smartphone'
       GROUP BY
         p.id,
@@ -17336,6 +17617,7 @@ const handleTrendingSmartphones = async (req, res) => {
         s.multimedia,
         s.sensors
       ORDER BY
+        COALESCE(MAX(ds.hook_score), 0) DESC,
         COALESCE(MAX(ts.manual_priority), 0) DESC,
         COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
         COALESCE(MAX(ts.trending_score), 0) DESC,
@@ -17348,57 +17630,69 @@ const handleTrendingSmartphones = async (req, res) => {
     const rows = result.rows || [];
     const trending = applySpecScoreToRows(
       "smartphone",
-      rows.map((row) => ({
-        id: row.product_id,
-        product_id: row.product_id,
-        name: row.name,
-        brand: row.brand || null,
-        brand_name: row.brand || null,
-        brand_logo: row.brand_logo || null,
-        brand_website: row.brand_website || null,
-        official_preorder_url: row.official_preorder_url || null,
-        launch_status_override: row.launch_status_override || null,
-        model: row.model || null,
-        launch_date: row.launch_date || null,
-        display: row.display || null,
-        performance: row.performance || null,
-        camera: row.camera || null,
-        battery: row.battery || null,
-        connectivity: row.connectivity || null,
-        network: row.network || null,
-        build_design: row.build_design || null,
-        audio: row.audio || null,
-        multimedia: row.multimedia || null,
-        sensors: row.sensors || null,
-        images: row.image_url ? [row.image_url] : [],
-        image_url: row.image_url || null,
-        variants: [],
-        price: row.starting_price ?? null,
-        starting_price: row.starting_price ?? null,
-        ram: combineMemoryValues(row.ram_values || []),
-        storage: combineMemoryValues(row.storage_values || []),
-        trend_score:
+      rows.map((row, index) => {
+        const manualBoost = Boolean(Number(row?.manual_boost ?? 0));
+        const trendScore =
           Number.isFinite(Number(row?.trending_score)) &&
           row?.trending_score !== null
             ? Number(row.trending_score)
-            : null,
-        trend_views_7d: Number.isFinite(Number(row?.views_7d))
-          ? Number(row.views_7d)
-          : 0,
-        trend_views_prev_7d: Number.isFinite(Number(row?.views_prev_7d))
-          ? Number(row.views_prev_7d)
-          : 0,
-        trend_velocity:
-          Number.isFinite(Number(row?.velocity)) && row?.velocity !== null
-            ? Number(row.velocity)
-            : null,
-        trend_manual_boost: Boolean(Number(row?.manual_boost ?? 0)),
-        trend_manual_priority: Number.isFinite(Number(row?.manual_priority))
-          ? Number(row.manual_priority)
-          : 0,
-        trend_manual_badge: row?.manual_badge || null,
-        trend_calculated_at: row?.trending_calculated_at ?? null,
-      })),
+            : null;
+
+        return {
+          id: row.product_id,
+          product_id: row.product_id,
+          name: row.name,
+          brand: row.brand || null,
+          brand_name: row.brand || null,
+          brand_logo: row.brand_logo || null,
+          brand_website: row.brand_website || null,
+          official_preorder_url: row.official_preorder_url || null,
+          launch_status_override: row.launch_status_override || null,
+          model: row.model || null,
+          launch_date: row.launch_date || null,
+          display: row.display || null,
+          performance: row.performance || null,
+          camera: row.camera || null,
+          battery: row.battery || null,
+          connectivity: row.connectivity || null,
+          network: row.network || null,
+          build_design: row.build_design || null,
+          audio: row.audio || null,
+          multimedia: row.multimedia || null,
+          sensors: row.sensors || null,
+          images: row.image_url ? [row.image_url] : [],
+          image_url: row.image_url || null,
+          variants: [],
+          price: row.starting_price ?? null,
+          starting_price: row.starting_price ?? null,
+          ram: combineMemoryValues(row.ram_values || []),
+          storage: combineMemoryValues(row.storage_values || []),
+          trend_score: trendScore,
+          trend_views_7d: Number.isFinite(Number(row?.views_7d))
+            ? Number(row.views_7d)
+            : 0,
+          trend_views_prev_7d: Number.isFinite(Number(row?.views_prev_7d))
+            ? Number(row.views_prev_7d)
+            : 0,
+          trend_velocity:
+            Number.isFinite(Number(row?.velocity)) && row?.velocity !== null
+              ? Number(row.velocity)
+              : null,
+          trend_manual_boost: manualBoost,
+          trend_manual_priority: Number.isFinite(Number(row?.manual_priority))
+            ? Number(row.manual_priority)
+            : 0,
+          trend_manual_badge: row?.manual_badge || null,
+          trend_badge: resolvePublicTrendBadge({
+            manualBoost,
+            manualBadge: row?.manual_badge,
+            rank: index + 1,
+            hookScore: row?.hook_score,
+            trendScore,
+          }),
+          trend_calculated_at: row?.trending_calculated_at ?? null,
+        };
+      }),
       profileConfig.profiles,
     );
 
@@ -18073,6 +18367,7 @@ app.get("/api/public/trending/laptops", async (req, res) => {
         MAX(ts.manual_priority) AS manual_priority,
         MAX(ts.manual_badge) AS manual_badge,
         MAX(ts.calculated_at) AS trending_calculated_at,
+        MAX(ds.hook_score) AS hook_score,
 
         /* ---------- Images ---------- */
         COALESCE(
@@ -18129,6 +18424,8 @@ app.get("/api/public/trending/laptops", async (req, res) => {
         ON v.product_id = p.id
       LEFT JOIN product_trending_score ts
         ON ts.product_id = p.id
+      LEFT JOIN product_dynamic_score ds
+        ON ds.product_id = p.id
 
       WHERE p.product_type = 'laptop'
 
@@ -18150,6 +18447,7 @@ app.get("/api/public/trending/laptops", async (req, res) => {
         l.created_at
 
       ORDER BY
+        COALESCE(MAX(ds.hook_score), 0) DESC,
         COALESCE(MAX(ts.manual_priority), 0) DESC,
         COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
         COALESCE(MAX(ts.trending_score), 0) DESC,
@@ -18160,17 +18458,9 @@ app.get("/api/public/trending/laptops", async (req, res) => {
       [limit],
     );
 
-    const badgeForScore = (score) => {
-      const s = Number(score);
-      if (!Number.isFinite(s)) return "Gaining Attention";
-      if (s >= 80) return "Trending Now";
-      if (s >= 60) return "Popular This Week";
-      return "Gaining Attention";
-    };
-
     const laptops = applySpecScoreToRows(
       "laptop",
-      (result.rows || []).map((row) => {
+      (result.rows || []).map((row, index) => {
         const trendScoreRaw = Number(row?.trending_score);
         const trendScore = Number.isFinite(trendScoreRaw)
           ? trendScoreRaw
@@ -18194,12 +18484,13 @@ app.get("/api/public/trending/laptops", async (req, res) => {
           trend_manual_boost: manualBoost,
           trend_manual_priority: row?.manual_priority ?? 0,
           trend_manual_badge: manualBadge || null,
-          trend_badge:
-            manualBoost && manualBadge
-              ? manualBadge
-              : manualBoost
-                ? "Editor Pick"
-                : badgeForScore(trendScore),
+          trend_badge: resolvePublicTrendBadge({
+            manualBoost,
+            manualBadge,
+            rank: index + 1,
+            hookScore: row?.hook_score,
+            trendScore,
+          }),
           trend_calculated_at: row?.trending_calculated_at ?? null,
         };
       }),
@@ -18262,6 +18553,7 @@ app.get("/api/public/trending/tvs", async (req, res) => {
         MAX(ts.manual_priority) AS manual_priority,
         MAX(ts.manual_badge) AS manual_badge,
         MAX(ts.calculated_at) AS trending_calculated_at,
+        MAX(ds.hook_score) AS hook_score,
 
         (
           SELECT ROUND(AVG(r.overall_rating)::numeric, 1)
@@ -18410,17 +18702,9 @@ app.get("/api/public/trending/tvs", async (req, res) => {
       [limit],
     );
 
-    const badgeForScore = (score) => {
-      const s = Number(score);
-      if (!Number.isFinite(s)) return "Gaining Attention";
-      if (s >= 80) return "Trending Now";
-      if (s >= 60) return "Popular This Week";
-      return "Gaining Attention";
-    };
-
     const tvs = applySpecScoreToRows(
       "tv",
-      (result.rows || []).map((row) => {
+      (result.rows || []).map((row, index) => {
         const trendScoreRaw = Number(row?.trending_score);
         const trendScore = Number.isFinite(trendScoreRaw)
           ? trendScoreRaw
@@ -18444,12 +18728,13 @@ app.get("/api/public/trending/tvs", async (req, res) => {
           trend_manual_boost: manualBoost,
           trend_manual_priority: row?.manual_priority ?? 0,
           trend_manual_badge: manualBadge || null,
-          trend_badge:
-            manualBoost && manualBadge
-              ? manualBadge
-              : manualBoost
-                ? "Editor Pick"
-                : badgeForScore(trendScore),
+          trend_badge: resolvePublicTrendBadge({
+            manualBoost,
+            manualBadge,
+            rank: index + 1,
+            hookScore: row?.hook_score,
+            trendScore,
+          }),
           trend_calculated_at: row?.trending_calculated_at ?? null,
         };
       }),
