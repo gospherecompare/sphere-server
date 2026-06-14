@@ -54,6 +54,9 @@ const { clean: xssClean } = require("xss-clean/lib/xss");
 
 const SECRET = process.env.JWT_SECRET || "smartarena_secret_key_25";
 const PORT = process.env.PORT || 5000;
+const COMPARE_DATA_RETENTION_DAYS = 548;
+const PUBLIC_COMPARE_WINDOW_DAYS = 180;
+const FRESH_COMPARE_WIDGET_DAYS = 7;
 
 const app = express();
 
@@ -5033,6 +5036,46 @@ async function runMigrations() {
         compared_at TIMESTAMP DEFAULT now()
       );
       `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS compare_sessions (
+        id BIGSERIAL PRIMARY KEY,
+        session_key TEXT,
+        visitor_key TEXT,
+        product_type TEXT,
+        product_count INT NOT NULL DEFAULT 2,
+        compared_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS compare_session_products (
+        session_id BIGINT NOT NULL REFERENCES compare_sessions(id) ON DELETE CASCADE,
+        product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        position INT NOT NULL DEFAULT 1,
+        PRIMARY KEY (session_id, product_id)
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_product_comparisons_compared_at
+      ON product_comparisons (compared_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_compare_sessions_compared_at
+      ON compare_sessions (compared_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_compare_sessions_visitor_compared_at
+      ON compare_sessions (visitor_key, compared_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_compare_session_products_product
+      ON compare_session_products (product_id, session_id);
+    `);
 
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS competitor_analysis (
@@ -16947,9 +16990,9 @@ app.get("/api/admin/trending", authenticate, async (req, res) => {
         ON ds.product_id = p.id
       ${where}
       ORDER BY
-        COALESCE(ds.hook_score, 0) DESC,
         ts.manual_priority DESC,
         ts.manual_boost DESC,
+        COALESCE(ds.hook_score, 0) DESC,
         ts.trending_score DESC,
         ts.calculated_at DESC,
         p.id DESC
@@ -17368,9 +17411,9 @@ app.get("/api/public/trending-products", async (req, res) => {
         ON ds.product_id = p.id
       WHERE p.product_type = $1
       ORDER BY
-        COALESCE(ds.hook_score, 0) DESC,
         ts.manual_priority DESC,
         ts.manual_boost DESC,
+        COALESCE(ds.hook_score, 0) DESC,
         ts.trending_score DESC,
         p.id DESC
       LIMIT $2
@@ -17617,9 +17660,9 @@ const handleTrendingSmartphones = async (req, res) => {
         s.multimedia,
         s.sensors
       ORDER BY
-        COALESCE(MAX(ds.hook_score), 0) DESC,
         COALESCE(MAX(ts.manual_priority), 0) DESC,
         COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
+        COALESCE(MAX(ds.hook_score), 0) DESC,
         COALESCE(MAX(ts.trending_score), 0) DESC,
         p.id DESC
       LIMIT $1;
@@ -18447,9 +18490,9 @@ app.get("/api/public/trending/laptops", async (req, res) => {
         l.created_at
 
       ORDER BY
-        COALESCE(MAX(ds.hook_score), 0) DESC,
         COALESCE(MAX(ts.manual_priority), 0) DESC,
         COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
+        COALESCE(MAX(ds.hook_score), 0) DESC,
         COALESCE(MAX(ts.trending_score), 0) DESC,
         p.id DESC
 
@@ -18689,12 +18732,12 @@ app.get("/api/public/trending/tvs", async (req, res) => {
         t.warranty_json,
         t.images_json
       ORDER BY
+        COALESCE(MAX(ts.manual_priority), 0) DESC,
+        COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
         COALESCE(MAX(ds.hook_score), 0) DESC,
         COALESCE(MAX(ds.buyer_intent), 0) DESC,
         COALESCE(MAX(ds.trend_velocity), 0) DESC,
         COALESCE(MAX(ds.freshness), 0) DESC,
-        COALESCE(MAX(ts.manual_priority), 0) DESC,
-        COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
         COALESCE(MAX(ts.trending_score), 0) DESC,
         p.id DESC
       LIMIT $1;
@@ -19419,6 +19462,7 @@ app.post("/api/public/compare", async (req, res) => {
     // 2) { left_product_id: 1, right_product_id: 2, product_type: 'smartphone' }
     const body = req.body || {};
     console.log("Comparison payload:", body);
+    await maybePruneOldCompareData();
 
     if (body.left_product_id && body.right_product_id) {
       const left = Number(body.left_product_id);
@@ -19458,12 +19502,18 @@ app.post("/api/public/compare", async (req, res) => {
       const [l, r] = [left, right].sort((a, b) => a - b);
 
       try {
-        await db.query(
-          `INSERT INTO product_comparisons (product_id, compared_with)
-           VALUES ($1, $2)`,
-          [l, r],
-        );
-        return res.json({ message: "Comparison recorded" });
+        const session = await recordCompareSession({
+          req,
+          body,
+          productIds: [l, r],
+          productType: body.product_type,
+        });
+        await recordPairwiseComparisons([l, r]);
+        return res.json({
+          message: "Comparison recorded",
+          product_count: 2,
+          session_id: session?.session_id || null,
+        });
       } catch (err) {
         console.error("POST /api/public/compare insert failed:", err);
         return res.status(500).json({ message: "Failed to record comparison" });
@@ -19506,17 +19556,19 @@ app.post("/api/public/compare", async (req, res) => {
       });
     }
 
-    for (let i = 0; i < filtered.length; i++) {
-      for (let j = i + 1; j < filtered.length; j++) {
-        await db.query(
-          `INSERT INTO product_comparisons (product_id, compared_with)
-           VALUES ($1, $2)`,
-          [filtered[i], filtered[j]],
-        );
-      }
-    }
+    const session = await recordCompareSession({
+      req,
+      body,
+      productIds: filtered,
+      productType: body.product_type,
+    });
+    await recordPairwiseComparisons(filtered);
 
-    return res.json({ message: "Comparison recorded" });
+    return res.json({
+      message: "Comparison recorded",
+      product_count: filtered.length,
+      session_id: session?.session_id || null,
+    });
   } catch (err) {
     console.error("POST /api/public/compare error:", err);
     return res.status(500).json({ message: "Failed to record comparison" });
@@ -19525,7 +19577,276 @@ app.post("/api/public/compare", async (req, res) => {
 
 app.get("/api/public/trending/most-compared", async (req, res) => {
   try {
-    const result = await db.query(`
+    const days = toSafeCompareWindowDays(
+      req.query?.days,
+      FRESH_COMPARE_WIDGET_DAYS,
+    );
+    const limit = toSafeCompareLimit(req.query?.limit, 100);
+    const scope = String(req.query?.scope || req.query?.mode || "pairs")
+      .trim()
+      .toLowerCase();
+    const useGroups = ["group", "groups", "session", "sessions"].includes(
+      scope,
+    );
+
+    if (useGroups) {
+      const result = await db.query(
+        `
+        WITH session_groups AS (
+          SELECT
+            cs.id AS session_id,
+            cs.visitor_key,
+            cs.compared_at,
+            ARRAY_AGG(csp.product_id ORDER BY csp.product_id)::int[] AS product_ids
+          FROM compare_sessions cs
+          INNER JOIN compare_session_products csp
+            ON csp.session_id = cs.id
+          WHERE cs.compared_at >= now() - make_interval(days => $1::int)
+          GROUP BY cs.id, cs.visitor_key, cs.compared_at
+          HAVING COUNT(csp.product_id) BETWEEN 2 AND 4
+        ),
+        group_counts AS (
+          SELECT
+            product_ids,
+            COUNT(*)::int AS compare_count,
+            COUNT(DISTINCT COALESCE(visitor_key, session_id::text))::int AS unique_users,
+            MAX(compared_at) AS last_compared_at
+          FROM session_groups
+          GROUP BY product_ids
+        )
+        SELECT
+          gc.product_ids,
+          gc.compare_count,
+          gc.unique_users,
+          gc.last_compared_at,
+          jsonb_agg(
+            jsonb_build_object(
+              'product_id', p.id,
+              'product_name', p.name,
+              'product_type', p.product_type,
+              'brand_name', b.name,
+              'image_url', (
+                SELECT pi.image_url
+                FROM product_images pi
+                WHERE pi.product_id = p.id
+                ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+                LIMIT 1
+              ),
+              'best_price', COALESCE(
+                (
+                  SELECT MIN(sp.price)::numeric
+                  FROM product_variants pv
+                  INNER JOIN variant_store_prices sp
+                    ON sp.variant_id = pv.id
+                  WHERE pv.product_id = p.id
+                    AND sp.price IS NOT NULL
+                ),
+                (
+                  SELECT MIN(pv.base_price)::numeric
+                  FROM product_variants pv
+                  WHERE pv.product_id = p.id
+                    AND pv.base_price IS NOT NULL
+                )
+              )
+            )
+            ORDER BY array_position(gc.product_ids, p.id)
+          ) AS products
+        FROM group_counts gc
+        INNER JOIN products p
+          ON p.id = ANY(gc.product_ids)
+        INNER JOIN product_publish pub
+          ON pub.product_id = p.id
+         AND pub.is_published = true
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        WHERE p.product_type IN ('smartphone', 'laptop', 'tv', 'networking')
+        GROUP BY gc.product_ids, gc.compare_count, gc.unique_users, gc.last_compared_at
+        HAVING COUNT(*) = cardinality(gc.product_ids)
+        ORDER BY gc.compare_count DESC, gc.last_compared_at DESC
+        LIMIT $2
+        `,
+        [days, limit],
+      );
+
+      const toMostComparedGroupRow = (row) => {
+        const products = (Array.isArray(row.products) ? row.products : [])
+          .map((product) => ({
+            product_id: Number(product.product_id),
+            id: Number(product.product_id),
+            product_name: product.product_name || "Device",
+            name: product.product_name || "Device",
+            product_type: product.product_type || "unknown",
+            brand_name: product.brand_name || null,
+            image_url: product.image_url || null,
+            image: product.image_url || null,
+            best_price: toSafeNumeric(product.best_price),
+            detail_path: buildPublicProductDetailPath(
+              product.product_type,
+              product.product_name,
+              product.product_id,
+            ),
+          }))
+          .filter((product) => product.product_id);
+        const [left, right] = products;
+        const canBuildCompareRoute =
+          products.length >= 2 &&
+          products.length <= 3 &&
+          products.every(
+            (product) => product.product_type === products[0]?.product_type,
+          );
+        const comparePage = canBuildCompareRoute
+          ? buildComparePagePayload(products, {
+              manualCompareCount: row.compare_count,
+              lastComparedAt: row.last_compared_at,
+              updatedAt: row.last_compared_at,
+            })
+          : null;
+
+        return {
+          products,
+          product_count: products.length,
+          product_ids: products.map((product) => product.product_id),
+          compare_count: Number(row.compare_count) || 0,
+          unique_users: Number(row.unique_users) || 0,
+          last_compared_at: row.last_compared_at || null,
+          route_path: comparePage?.route_path || "/compare",
+          product_id: left?.product_id || null,
+          product_name: left?.product_name || null,
+          product_type: left?.product_type || null,
+          product_image: left?.image_url || null,
+          compared_product_id: right?.product_id || null,
+          compared_product_name: right?.product_name || null,
+          compared_product_type: right?.product_type || null,
+          compared_product_image: right?.image_url || null,
+        };
+      };
+      const sessionRows = (result.rows || []).map(toMostComparedGroupRow);
+
+      const pairResult = await db.query(
+        `
+        WITH pair_counts AS (
+          SELECT
+            LEAST(pc.product_id, pc.compared_with) AS left_product_id,
+            GREATEST(pc.product_id, pc.compared_with) AS right_product_id,
+            COUNT(pc.id)::int AS compare_count,
+            MAX(pc.compared_at) AS last_compared_at
+          FROM product_comparisons pc
+          WHERE pc.compared_at >= now() - make_interval(days => $1::int)
+          GROUP BY 1, 2
+        )
+        SELECT
+          ARRAY[p1.id, p2.id]::int[] AS product_ids,
+          pair_counts.compare_count,
+          0::int AS unique_users,
+          pair_counts.last_compared_at,
+          jsonb_build_array(
+            jsonb_build_object(
+              'product_id', p1.id,
+              'product_name', p1.name,
+              'product_type', p1.product_type,
+              'brand_name', b1.name,
+              'image_url', (
+                SELECT image_url
+                FROM product_images
+                WHERE product_id = p1.id
+                ORDER BY position ASC NULLS LAST, id ASC
+                LIMIT 1
+              )
+            ),
+            jsonb_build_object(
+              'product_id', p2.id,
+              'product_name', p2.name,
+              'product_type', p2.product_type,
+              'brand_name', b2.name,
+              'image_url', (
+                SELECT image_url
+                FROM product_images
+                WHERE product_id = p2.id
+                ORDER BY position ASC NULLS LAST, id ASC
+                LIMIT 1
+              )
+            )
+          ) AS products
+        FROM pair_counts
+        INNER JOIN products p1 ON p1.id = pair_counts.left_product_id
+        INNER JOIN products p2 ON p2.id = pair_counts.right_product_id
+        INNER JOIN product_publish pub1
+          ON pub1.product_id = p1.id
+         AND pub1.is_published = true
+        INNER JOIN product_publish pub2
+          ON pub2.product_id = p2.id
+         AND pub2.is_published = true
+        LEFT JOIN brands b1 ON b1.id = p1.brand_id
+        LEFT JOIN brands b2 ON b2.id = p2.brand_id
+        WHERE p1.product_type IN ('smartphone', 'laptop', 'tv', 'networking')
+          AND p2.product_type IN ('smartphone', 'laptop', 'tv', 'networking')
+        ORDER BY pair_counts.compare_count DESC, pair_counts.last_compared_at DESC
+        LIMIT $2
+        `,
+        [days, limit],
+      );
+      const pairRows = (pairResult.rows || []).map(toMostComparedGroupRow);
+      const rowsByKey = new Map();
+      for (const row of [...pairRows, ...sessionRows]) {
+        const key = (row.product_ids || [])
+          .map((value) => Number(value))
+          .filter((value) => Number.isInteger(value) && value > 0)
+          .sort((left, right) => left - right)
+          .join("-");
+        if (!key) continue;
+        const existing = rowsByKey.get(key);
+        if (!existing) {
+          rowsByKey.set(key, row);
+          continue;
+        }
+        existing.compare_count = Math.max(
+          Number(existing.compare_count) || 0,
+          Number(row.compare_count) || 0,
+        );
+        existing.unique_users = Math.max(
+          Number(existing.unique_users) || 0,
+          Number(row.unique_users) || 0,
+        );
+        existing.last_compared_at =
+          maxIsoTimestamp(existing.last_compared_at, row.last_compared_at) ||
+          existing.last_compared_at ||
+          row.last_compared_at ||
+          null;
+      }
+      const rows = Array.from(rowsByKey.values())
+        .sort((left, right) => {
+          const countDiff =
+            (Number(right.compare_count) || 0) -
+            (Number(left.compare_count) || 0);
+          if (countDiff !== 0) return countDiff;
+          return (
+            new Date(right.last_compared_at || 0).getTime() -
+            new Date(left.last_compared_at || 0).getTime()
+          );
+        })
+        .slice(0, limit);
+
+      return res.json({
+        generated_at: new Date().toISOString(),
+        days,
+        limit,
+        scope: "groups",
+        mostCompared: rows,
+      });
+    }
+
+    const result = await db.query(
+      `
+      WITH pair_counts AS (
+        SELECT
+          LEAST(pc.product_id, pc.compared_with) AS left_product_id,
+          GREATEST(pc.product_id, pc.compared_with) AS right_product_id,
+          COUNT(pc.id)::int AS compare_count,
+          MAX(pc.compared_at) AS last_compared_at
+        FROM product_comparisons pc
+        WHERE pc.compared_at >= now() - make_interval(days => $1::int)
+        GROUP BY 1, 2
+      )
       SELECT
         p1.id AS product_id,
         p1.name AS product_name,
@@ -19547,29 +19868,35 @@ app.get("/api/public/trending/most-compared", async (req, res) => {
           ORDER BY position ASC NULLS LAST, id ASC
           LIMIT 1
         ) AS compared_product_image,
-        COUNT(pc.id) AS compare_count
-      FROM product_comparisons pc
-      JOIN products p1 ON p1.id = pc.product_id
-      JOIN products p2 ON p2.id = pc.compared_with
+        pair_counts.compare_count,
+        pair_counts.last_compared_at
+      FROM pair_counts
+      JOIN products p1 ON p1.id = pair_counts.left_product_id
+      JOIN products p2 ON p2.id = pair_counts.right_product_id
       INNER JOIN product_publish pub1
         ON pub1.product_id = p1.id
        AND pub1.is_published = true
       INNER JOIN product_publish pub2
         ON pub2.product_id = p2.id
        AND pub2.is_published = true
-      WHERE pc.compared_at >= now() - INTERVAL '7 days'
-        AND p1.product_type IN ('smartphone', 'laptop', 'tv')
-        AND p2.product_type IN ('smartphone', 'laptop', 'tv')
-      GROUP BY p1.id, p1.name, p1.product_type, p2.id, p2.name, p2.product_type
-      ORDER BY compare_count DESC
-    `);
+      WHERE p1.product_type IN ('smartphone', 'laptop', 'tv', 'networking')
+        AND p2.product_type IN ('smartphone', 'laptop', 'tv', 'networking')
+      ORDER BY pair_counts.compare_count DESC, pair_counts.last_compared_at DESC
+      LIMIT $2
+      `,
+      [days, limit],
+    );
 
-    res.json({
+    return res.json({
+      generated_at: new Date().toISOString(),
+      days,
+      limit,
+      scope: "pairs",
       mostCompared: result.rows,
     });
   } catch (err) {
     console.error("Most compared error:", err);
-    res.status(500).json({ error: "Internal server error" });
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -19732,6 +20059,149 @@ const buildPublicProductDetailPath = (productType, name, productId) => {
   return `/${slug}`;
 };
 
+const buildCompareVisitorKey = (req, body = {}) => {
+  const visitorIdRaw =
+    body.visitor_id ??
+    body.visitorId ??
+    body.compare_visitor_id ??
+    body.compareVisitorId ??
+    req.headers["x-visitor-id"] ??
+    "";
+  const ipRaw =
+    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+    req.ip ||
+    "";
+  const userAgent = req.headers["user-agent"] || "";
+  const keySource = visitorIdRaw
+    ? `vid:${String(visitorIdRaw).trim()}`
+    : `ip:${String(ipRaw)}|ua:${String(userAgent)}`;
+
+  return crypto
+    .createHash("sha256")
+    .update(keySource)
+    .digest("hex")
+    .slice(0, 32);
+};
+
+const normalizeCompareProductIds = (values = []) =>
+  Array.from(
+    new Set(
+      (Array.isArray(values) ? values : [])
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  ).slice(0, 4);
+
+let lastComparePruneAt = 0;
+const maybePruneOldCompareData = async () => {
+  const now = Date.now();
+  if (now - lastComparePruneAt < 24 * 60 * 60 * 1000) return;
+  lastComparePruneAt = now;
+
+  try {
+    await db.query(
+      `DELETE FROM product_comparisons
+       WHERE compared_at < now() - make_interval(days => $1::int)`,
+      [COMPARE_DATA_RETENTION_DAYS],
+    );
+    await db.query(
+      `DELETE FROM compare_sessions
+       WHERE compared_at < now() - make_interval(days => $1::int)`,
+      [COMPARE_DATA_RETENTION_DAYS],
+    );
+  } catch (err) {
+    // Analytics cleanup should never block public compare logging.
+    console.warn("Compare retention cleanup skipped:", err?.message || err);
+  }
+};
+
+const recordCompareSession = async ({
+  req,
+  body = {},
+  productIds = [],
+  productType = "",
+} = {}) => {
+  const ids = normalizeCompareProductIds(productIds);
+  if (ids.length < 2) return null;
+
+  const visitorKey = buildCompareVisitorKey(req, body);
+  const sessionKey =
+    String(
+      body.compare_session_id ||
+        body.compareSessionId ||
+        req.headers["x-compare-session-id"] ||
+        "",
+    ).trim() ||
+    (typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : crypto.randomBytes(16).toString("hex"));
+  const normalizedType = normalizePopularityProductType(productType) || null;
+
+  try {
+    const sessionResult = await db.query(
+      `
+      INSERT INTO compare_sessions (
+        session_key,
+        visitor_key,
+        product_type,
+        product_count
+      )
+      VALUES ($1, $2, $3, $4)
+      RETURNING id, compared_at
+      `,
+      [sessionKey, visitorKey, normalizedType, ids.length],
+    );
+    const sessionId = Number(sessionResult.rows?.[0]?.id);
+    if (!Number.isInteger(sessionId) || sessionId <= 0) return null;
+
+    for (let index = 0; index < ids.length; index += 1) {
+      await db.query(
+        `
+        INSERT INTO compare_session_products (session_id, product_id, position)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (session_id, product_id) DO UPDATE
+        SET position = EXCLUDED.position
+        `,
+        [sessionId, ids[index], index + 1],
+      );
+    }
+
+    return {
+      session_id: sessionId,
+      compared_at: sessionResult.rows?.[0]?.compared_at || null,
+    };
+  } catch (err) {
+    console.warn("Compare session logging skipped:", err?.message || err);
+    return null;
+  }
+};
+
+const recordPairwiseComparisons = async (productIds = []) => {
+  const ids = normalizeCompareProductIds(productIds);
+  for (let i = 0; i < ids.length; i += 1) {
+    for (let j = i + 1; j < ids.length; j += 1) {
+      const [left, right] = [ids[i], ids[j]].sort((a, b) => a - b);
+      await db.query(
+        `INSERT INTO product_comparisons (product_id, compared_with)
+         VALUES ($1, $2)`,
+        [left, right],
+      );
+    }
+  }
+};
+
+const toSafeCompareWindowDays = (value, fallback = FRESH_COMPARE_WIDGET_DAYS) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(PUBLIC_COMPARE_WINDOW_DAYS, Math.max(1, Math.floor(parsed)));
+};
+
+const toSafeCompareLimit = (value, fallback = 100) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(500, Math.max(1, Math.floor(parsed)));
+};
+
 const parseComparePageSlug = (value = "") => {
   let normalized = "";
   try {
@@ -19859,6 +20329,9 @@ const buildComparePagePayload = (items = [], options = {}) => {
       best_price: toSafeNumeric(
         item?.best_price ?? item?.bestPrice ?? item?.price,
       ),
+      launch_date: item?.launch_date
+        ? String(item.launch_date).slice(0, 10)
+        : null,
       image_url: String(item?.image_url || item?.image || "").trim() || null,
       detail_path:
         String(item?.detail_path || item?.detailPath || "").trim() ||
@@ -19910,6 +20383,12 @@ const buildComparePagePayload = (items = [], options = {}) => {
       `${productType}:${normalizedItems.map((item) => item.product_id).join("-")}`,
     segment_label: segmentLabel,
     smartphone_type_label: String(options.smartphoneTypeLabel || "").trim(),
+    launch_date:
+      normalizedItems
+        .map((item) => item.launch_date)
+        .filter(Boolean)
+        .sort()
+        .slice(-1)[0] || null,
     slug,
     title:
       String(options.title || "").trim() ||
@@ -20398,6 +20877,10 @@ const normalizeComparePageRecord = (row) => {
     Number(row.primary_product_id ?? row.primaryProductId) ||
     items[0]?.product_id ||
     null;
+  const launchDates = items
+    .map((item) => item.launch_date)
+    .filter(Boolean)
+    .sort();
 
   return {
     id: Number(row.id) || null,
@@ -20408,6 +20891,13 @@ const normalizeComparePageRecord = (row) => {
     smartphone_type_label: String(
       row.smartphone_type_label || row.smartphoneTypeLabel || "",
     ).trim(),
+    launch_date:
+      row.launch_date ||
+      row.launchDate ||
+      launchDates[launchDates.length - 1] ||
+      null,
+    oldest_launch_date: launchDates[0] || null,
+    latest_launch_date: launchDates[launchDates.length - 1] || null,
     slug: String(row.slug || "").trim(),
     title: String(row.title || "").trim(),
     meta_description: String(
@@ -20459,6 +20949,7 @@ const fetchComparePageProductsByIds = async (productIds = []) => {
       p.name AS product_name,
       p.product_type,
       b.name AS brand_name,
+      s.launch_date::date AS launch_date,
       COALESCE(
         (
           SELECT MIN(sp.price)::numeric
@@ -20488,6 +20979,8 @@ const fetchComparePageProductsByIds = async (productIds = []) => {
      AND pub.is_published = true
     LEFT JOIN brands b
       ON b.id = p.brand_id
+    LEFT JOIN smartphones s
+      ON s.product_id = p.id
     WHERE p.product_type = 'smartphone'
       AND p.id = ANY($1::int[])
     ORDER BY array_position($1::int[], p.id)
@@ -20500,6 +20993,7 @@ const fetchComparePageProductsByIds = async (productIds = []) => {
     product_name: row.product_name || "Device",
     product_type: row.product_type || "smartphone",
     brand_name: row.brand_name || null,
+    launch_date: row.launch_date ? String(row.launch_date).slice(0, 10) : null,
     best_price: toSafeNumeric(row.best_price),
     image_url: row.image_url || null,
   }));
@@ -20795,14 +21289,25 @@ const syncAutomaticComparePages = async ({ days = 180, limit = 100 } = {}) => {
   if (generatedKeys.length) {
     await db.query(
       `
-      DELETE FROM compare_pages
+      UPDATE compare_pages
+      SET
+        status = 'draft',
+        updated_at = now()
       WHERE source = 'automatic'
         AND NOT (compare_key = ANY($1::text[]))
       `,
       [generatedKeys],
     );
   } else {
-    await db.query(`DELETE FROM compare_pages WHERE source = 'automatic'`);
+    await db.query(
+      `
+      UPDATE compare_pages
+      SET
+        status = 'draft',
+        updated_at = now()
+      WHERE source = 'automatic'
+      `,
+    );
   }
 
   return {
@@ -20875,6 +21380,633 @@ const fetchComparePageRecordByProductId = async (productId) => {
   );
 
   return normalizeComparePageRecord(result.rows?.[0] || null);
+};
+
+const resolveComparePageAnalytics = async (
+  page,
+  days = PUBLIC_COMPARE_WINDOW_DAYS,
+) => {
+  const safeDays = Math.min(
+    PUBLIC_COMPARE_WINDOW_DAYS,
+    Math.max(7, Math.floor(Number(days) || PUBLIC_COMPARE_WINDOW_DAYS)),
+  );
+  const fallbackLastComparedAt = maxIsoTimestamp(page?.last_compared_at);
+  const fallbackDeadAt = fallbackLastComparedAt
+    ? new Date(
+        new Date(fallbackLastComparedAt).getTime() +
+          safeDays * 24 * 60 * 60 * 1000,
+      ).toISOString()
+    : null;
+  const fallbackCompareCount =
+    Number(page?.compare_count_180d ?? page?.compare_count ?? page?.manual_compare_count) ||
+    0;
+  const fallbackAnalytics = {
+    ...page,
+    compare_count_180d: fallbackCompareCount,
+    compare_count: fallbackCompareCount,
+    unique_users_180d:
+      Number(page?.unique_users_180d ?? page?.unique_user_count ?? page?.unique_users) ||
+      0,
+    unique_user_count:
+      Number(page?.unique_user_count ?? page?.unique_users_180d ?? page?.unique_users) ||
+      0,
+    unique_users:
+      Number(page?.unique_users ?? page?.unique_users_180d ?? page?.unique_user_count) ||
+      0,
+    last_compared_at: fallbackLastComparedAt || page?.last_compared_at || null,
+    alive_date: fallbackLastComparedAt || null,
+    alive_at: fallbackLastComparedAt || null,
+    dead_date: fallbackDeadAt,
+    dead_at: fallbackDeadAt,
+    is_alive:
+      String(page?.source || "").toLowerCase() === "manual" ||
+      (fallbackDeadAt ? new Date(fallbackDeadAt).getTime() >= Date.now() : false),
+    analytics_window_days: safeDays,
+  };
+
+  const ids = normalizeCompareProductIds(
+    (Array.isArray(page?.items) ? page.items : []).map(
+      (item) => item?.product_id ?? item?.productId ?? item?.id,
+    ),
+  ).sort((left, right) => left - right);
+
+  if (ids.length < 2) return fallbackAnalytics;
+
+  let pairCompareCount = 0;
+  let pairLastComparedAt = null;
+  if (ids.length === 2) {
+    try {
+      const pairResult = await db.query(
+        `
+        SELECT
+          COUNT(*)::int AS compare_count,
+          MAX(compared_at) AS last_compared_at
+        FROM product_comparisons
+        WHERE compared_at >= now() - make_interval(days => $3::int)
+          AND LEAST(product_id, compared_with) = LEAST($1, $2)
+          AND GREATEST(product_id, compared_with) = GREATEST($1, $2)
+        `,
+        [ids[0], ids[1], safeDays],
+      );
+      pairCompareCount = Number(pairResult.rows?.[0]?.compare_count) || 0;
+      pairLastComparedAt = pairResult.rows?.[0]?.last_compared_at || null;
+    } catch (err) {
+      console.warn("Compare pair analytics skipped:", {
+        compare_page_id: page?.id,
+        message: err?.message,
+      });
+    }
+  }
+
+  let sessionCompareCount = 0;
+  let uniqueUsers = 0;
+  let sessionLastComparedAt = null;
+  try {
+    const sessionResult = await db.query(
+      `
+      WITH session_groups AS (
+        SELECT
+          cs.id AS session_id,
+          cs.visitor_key,
+          cs.compared_at,
+          ARRAY_AGG(csp.product_id ORDER BY csp.product_id)::int[] AS product_ids
+        FROM compare_sessions cs
+        INNER JOIN compare_session_products csp
+          ON csp.session_id = cs.id
+        WHERE cs.compared_at >= now() - make_interval(days => $2::int)
+        GROUP BY cs.id, cs.visitor_key, cs.compared_at
+        HAVING COUNT(csp.product_id) BETWEEN 2 AND 4
+      )
+      SELECT
+        COUNT(*)::int AS compare_count,
+        COUNT(DISTINCT COALESCE(visitor_key, session_id::text))::int AS unique_users,
+        MAX(compared_at) AS last_compared_at
+      FROM session_groups
+      WHERE product_ids = $1::int[]
+      `,
+      [ids, safeDays],
+    );
+    sessionCompareCount =
+      Number(sessionResult.rows?.[0]?.compare_count) || 0;
+    uniqueUsers = Number(sessionResult.rows?.[0]?.unique_users) || 0;
+    sessionLastComparedAt =
+      sessionResult.rows?.[0]?.last_compared_at || null;
+  } catch (err) {
+    console.warn("Compare session analytics skipped:", {
+      compare_page_id: page?.id,
+      message: err?.message,
+    });
+  }
+
+  let launchRow = {};
+  try {
+    const launchResult = await db.query(
+      `
+      WITH product_launches AS (
+        SELECT
+          COALESCE(
+            s.launch_date::date,
+            l.created_at::date,
+            t.created_at::date,
+            n.created_at::date,
+            p.created_at::date
+          ) AS launch_date
+        FROM products p
+        LEFT JOIN smartphones s
+          ON s.product_id = p.id
+        LEFT JOIN laptop l
+          ON l.product_id = p.id
+        LEFT JOIN tvs t
+          ON t.product_id = p.id
+        LEFT JOIN networking n
+          ON n.product_id = p.id
+        WHERE p.id = ANY($1::int[])
+      )
+      SELECT
+        MIN(launch_date)::date AS oldest_launch_date,
+        MAX(launch_date)::date AS latest_launch_date
+      FROM product_launches
+      `,
+      [ids],
+    );
+    launchRow = launchResult.rows?.[0] || {};
+  } catch (err) {
+    console.warn("Compare launch analytics skipped:", {
+      compare_page_id: page?.id,
+      message: err?.message,
+    });
+  }
+
+  const lastComparedAt = maxIsoTimestamp(
+    pairLastComparedAt,
+    sessionLastComparedAt,
+    page?.last_compared_at,
+  );
+  const deadAt = lastComparedAt
+    ? new Date(
+        new Date(lastComparedAt).getTime() +
+          PUBLIC_COMPARE_WINDOW_DAYS * 24 * 60 * 60 * 1000,
+      ).toISOString()
+    : null;
+  const compareCount =
+    ids.length === 2
+      ? Math.max(pairCompareCount, sessionCompareCount)
+      : sessionCompareCount;
+  const latestLaunchDate =
+    launchRow.latest_launch_date ||
+    page?.latest_launch_date ||
+    page?.launch_date ||
+    null;
+  const oldestLaunchDate =
+    launchRow.oldest_launch_date ||
+    page?.oldest_launch_date ||
+    null;
+
+  return {
+    ...page,
+    compare_count_180d: compareCount,
+    compare_count: compareCount,
+    unique_users_180d: uniqueUsers,
+    unique_user_count: uniqueUsers,
+    unique_users: uniqueUsers,
+    last_compared_at: lastComparedAt || page?.last_compared_at || null,
+    alive_date: lastComparedAt || null,
+    alive_at: lastComparedAt || null,
+    dead_date: deadAt,
+    dead_at: deadAt,
+    is_alive:
+      String(page?.source || "").toLowerCase() === "manual" ||
+      (deadAt ? new Date(deadAt).getTime() >= Date.now() : false),
+    launch_date: latestLaunchDate
+      ? String(latestLaunchDate).slice(0, 10)
+      : null,
+    latest_launch_date: latestLaunchDate
+      ? String(latestLaunchDate).slice(0, 10)
+      : null,
+    oldest_launch_date: oldestLaunchDate
+      ? String(oldestLaunchDate).slice(0, 10)
+      : null,
+    analytics_window_days: safeDays,
+  };
+};
+
+const hydrateComparePagesWithAnalytics = async (
+  pages = [],
+  days = PUBLIC_COMPARE_WINDOW_DAYS,
+) => {
+  const normalizedPages = Array.isArray(pages) ? pages : [];
+  return Promise.all(
+    normalizedPages.map((page) =>
+      resolveComparePageAnalytics(page, days).catch((err) => {
+        console.warn("Compare page analytics hydration skipped:", {
+          compare_page_id: page?.id,
+          message: err?.message,
+        });
+        return page;
+      }),
+    ),
+  );
+};
+
+const addDaysToIso = (value, days = PUBLIC_COMPARE_WINDOW_DAYS) => {
+  const date = value ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) return null;
+  date.setDate(date.getDate() + days);
+  return date.toISOString();
+};
+
+const normalizeCompareGroupKey = (productIds = []) =>
+  normalizeCompareProductIds(productIds)
+    .sort((left, right) => left - right)
+    .join("-");
+
+const normalizeUserCompareProducts = (products = []) =>
+  (Array.isArray(products) ? products : [])
+    .map((product) => {
+      const productId = Number(product?.product_id ?? product?.id);
+      if (!Number.isInteger(productId) || productId <= 0) return null;
+      const productType =
+        normalizePopularityProductType(product?.product_type) || "unknown";
+      return {
+        product_id: productId,
+        id: productId,
+        product_name: product?.product_name || product?.name || "Device",
+        name: product?.product_name || product?.name || "Device",
+        product_type: productType,
+        brand_name: product?.brand_name || product?.brand || null,
+        image_url: product?.image_url || product?.image || null,
+        image: product?.image_url || product?.image || null,
+        best_price: toSafeNumeric(product?.best_price ?? product?.price),
+        launch_date: product?.launch_date
+          ? String(product.launch_date).slice(0, 10)
+          : null,
+        detail_path:
+          product?.detail_path ||
+          buildPublicProductDetailPath(
+            productType,
+            product?.product_name || product?.name || "",
+            productId,
+          ),
+      };
+    })
+    .filter(Boolean);
+
+const fetchAdminUserCompareGroups = async ({
+  days = COMPARE_DATA_RETENTION_DAYS,
+  limit = 500,
+} = {}) => {
+  const safeDays = Number.isFinite(Number(days))
+    ? Math.min(COMPARE_DATA_RETENTION_DAYS, Math.max(1, Math.floor(Number(days))))
+    : COMPARE_DATA_RETENTION_DAYS;
+  const safeLimit = Number.isFinite(Number(limit))
+    ? Math.min(1000, Math.max(1, Math.floor(Number(limit))))
+    : 500;
+
+  const rowsByKey = new Map();
+  const mergeRow = (row = {}, source = "session") => {
+    const products = normalizeUserCompareProducts(row.products || []);
+    const productIds = normalizeCompareProductIds(
+      row.product_ids || products.map((product) => product.product_id),
+    ).sort((left, right) => left - right);
+    const key = normalizeCompareGroupKey(productIds);
+    if (!key || productIds.length < 2) return;
+
+    const existing = rowsByKey.get(key);
+    const next = {
+      group_key: key,
+      product_ids: productIds,
+      product_count: productIds.length,
+      products,
+      compare_count: Number(row.compare_count) || 0,
+      unique_users: Number(row.unique_users) || 0,
+      first_compared_at: row.first_compared_at || null,
+      last_compared_at: row.last_compared_at || null,
+      data_source: source,
+    };
+
+    if (!existing) {
+      rowsByKey.set(key, next);
+      return;
+    }
+
+    existing.compare_count = Math.max(existing.compare_count, next.compare_count);
+    existing.unique_users = Math.max(existing.unique_users, next.unique_users);
+    existing.first_compared_at =
+      existing.first_compared_at && next.first_compared_at
+        ? new Date(existing.first_compared_at).getTime() <=
+          new Date(next.first_compared_at).getTime()
+          ? existing.first_compared_at
+          : next.first_compared_at
+        : existing.first_compared_at || next.first_compared_at || null;
+    existing.last_compared_at =
+      maxIsoTimestamp(existing.last_compared_at, next.last_compared_at) ||
+      existing.last_compared_at ||
+      next.last_compared_at ||
+      null;
+    existing.products = existing.products.length ? existing.products : next.products;
+    existing.data_source =
+      existing.data_source === "session" || source === "session"
+        ? "session"
+        : source;
+  };
+
+  try {
+    const sessionResult = await db.query(
+      `
+      WITH session_groups AS (
+        SELECT
+          cs.id AS session_id,
+          cs.visitor_key,
+          cs.compared_at,
+          ARRAY_AGG(csp.product_id ORDER BY csp.product_id)::int[] AS product_ids
+        FROM compare_sessions cs
+        INNER JOIN compare_session_products csp
+          ON csp.session_id = cs.id
+        WHERE cs.compared_at >= now() - make_interval(days => $1::int)
+        GROUP BY cs.id, cs.visitor_key, cs.compared_at
+        HAVING COUNT(csp.product_id) BETWEEN 2 AND 4
+      ),
+      group_counts AS (
+        SELECT
+          product_ids,
+          COUNT(*)::int AS compare_count,
+          COUNT(DISTINCT COALESCE(visitor_key, session_id::text))::int AS unique_users,
+          MIN(compared_at) AS first_compared_at,
+          MAX(compared_at) AS last_compared_at
+        FROM session_groups
+        GROUP BY product_ids
+      )
+      SELECT
+        gc.product_ids,
+        gc.compare_count,
+        gc.unique_users,
+        gc.first_compared_at,
+        gc.last_compared_at,
+        jsonb_agg(
+          jsonb_build_object(
+            'product_id', p.id,
+            'product_name', p.name,
+            'product_type', p.product_type,
+            'brand_name', b.name,
+            'image_url', (
+              SELECT pi.image_url
+              FROM product_images pi
+              WHERE pi.product_id = p.id
+              ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+              LIMIT 1
+            ),
+            'best_price', COALESCE(
+              (
+                SELECT MIN(sp.price)::numeric
+                FROM product_variants pv
+                INNER JOIN variant_store_prices sp
+                  ON sp.variant_id = pv.id
+                WHERE pv.product_id = p.id
+                  AND sp.price IS NOT NULL
+              ),
+              (
+                SELECT MIN(pv.base_price)::numeric
+                FROM product_variants pv
+                WHERE pv.product_id = p.id
+                  AND pv.base_price IS NOT NULL
+              )
+            ),
+            'launch_date', COALESCE(
+              s.launch_date::date,
+              l.created_at::date,
+              t.created_at::date,
+              n.created_at::date,
+              p.created_at::date
+            )
+          )
+          ORDER BY array_position(gc.product_ids, p.id)
+        ) AS products
+      FROM group_counts gc
+      INNER JOIN products p
+        ON p.id = ANY(gc.product_ids)
+      INNER JOIN product_publish pub
+        ON pub.product_id = p.id
+       AND pub.is_published = true
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
+      LEFT JOIN smartphones s
+        ON s.product_id = p.id
+      LEFT JOIN laptop l
+        ON l.product_id = p.id
+      LEFT JOIN tvs t
+        ON t.product_id = p.id
+      LEFT JOIN networking n
+        ON n.product_id = p.id
+      WHERE p.product_type IN ('smartphone', 'laptop', 'tv', 'networking')
+      GROUP BY gc.product_ids, gc.compare_count, gc.unique_users, gc.first_compared_at, gc.last_compared_at
+      HAVING COUNT(*) = cardinality(gc.product_ids)
+      ORDER BY gc.compare_count DESC, gc.last_compared_at DESC
+      LIMIT $2
+      `,
+      [safeDays, safeLimit],
+    );
+
+    (sessionResult.rows || []).forEach((row) => mergeRow(row, "session"));
+  } catch (err) {
+    console.warn("Admin user compare session groups skipped:", err?.message);
+  }
+
+  try {
+    const pairResult = await db.query(
+      `
+      WITH pair_counts AS (
+        SELECT
+          LEAST(pc.product_id, pc.compared_with) AS left_product_id,
+          GREATEST(pc.product_id, pc.compared_with) AS right_product_id,
+          COUNT(*)::int AS compare_count,
+          MIN(pc.compared_at) AS first_compared_at,
+          MAX(pc.compared_at) AS last_compared_at
+        FROM product_comparisons pc
+        WHERE pc.compared_at >= now() - make_interval(days => $1::int)
+        GROUP BY 1, 2
+      )
+      SELECT
+        ARRAY[p1.id, p2.id]::int[] AS product_ids,
+        pair_counts.compare_count,
+        0::int AS unique_users,
+        pair_counts.first_compared_at,
+        pair_counts.last_compared_at,
+        jsonb_build_array(
+          jsonb_build_object(
+            'product_id', p1.id,
+            'product_name', p1.name,
+            'product_type', p1.product_type,
+            'brand_name', b1.name,
+            'image_url', (
+              SELECT image_url
+              FROM product_images
+              WHERE product_id = p1.id
+              ORDER BY position ASC NULLS LAST, id ASC
+              LIMIT 1
+            ),
+            'best_price', COALESCE(
+              (
+                SELECT MIN(sp.price)::numeric
+                FROM product_variants pv
+                INNER JOIN variant_store_prices sp
+                  ON sp.variant_id = pv.id
+                WHERE pv.product_id = p1.id
+                  AND sp.price IS NOT NULL
+              ),
+              (
+                SELECT MIN(pv.base_price)::numeric
+                FROM product_variants pv
+                WHERE pv.product_id = p1.id
+                  AND pv.base_price IS NOT NULL
+              )
+            ),
+            'launch_date', COALESCE(s1.launch_date::date, l1.created_at::date, t1.created_at::date, n1.created_at::date, p1.created_at::date)
+          ),
+          jsonb_build_object(
+            'product_id', p2.id,
+            'product_name', p2.name,
+            'product_type', p2.product_type,
+            'brand_name', b2.name,
+            'image_url', (
+              SELECT image_url
+              FROM product_images
+              WHERE product_id = p2.id
+              ORDER BY position ASC NULLS LAST, id ASC
+              LIMIT 1
+            ),
+            'best_price', COALESCE(
+              (
+                SELECT MIN(sp.price)::numeric
+                FROM product_variants pv
+                INNER JOIN variant_store_prices sp
+                  ON sp.variant_id = pv.id
+                WHERE pv.product_id = p2.id
+                  AND sp.price IS NOT NULL
+              ),
+              (
+                SELECT MIN(pv.base_price)::numeric
+                FROM product_variants pv
+                WHERE pv.product_id = p2.id
+                  AND pv.base_price IS NOT NULL
+              )
+            ),
+            'launch_date', COALESCE(s2.launch_date::date, l2.created_at::date, t2.created_at::date, n2.created_at::date, p2.created_at::date)
+          )
+        ) AS products
+      FROM pair_counts
+      INNER JOIN products p1 ON p1.id = pair_counts.left_product_id
+      INNER JOIN products p2 ON p2.id = pair_counts.right_product_id
+      INNER JOIN product_publish pub1
+        ON pub1.product_id = p1.id
+       AND pub1.is_published = true
+      INNER JOIN product_publish pub2
+        ON pub2.product_id = p2.id
+       AND pub2.is_published = true
+      LEFT JOIN brands b1 ON b1.id = p1.brand_id
+      LEFT JOIN brands b2 ON b2.id = p2.brand_id
+      LEFT JOIN smartphones s1 ON s1.product_id = p1.id
+      LEFT JOIN smartphones s2 ON s2.product_id = p2.id
+      LEFT JOIN laptop l1 ON l1.product_id = p1.id
+      LEFT JOIN laptop l2 ON l2.product_id = p2.id
+      LEFT JOIN tvs t1 ON t1.product_id = p1.id
+      LEFT JOIN tvs t2 ON t2.product_id = p2.id
+      LEFT JOIN networking n1 ON n1.product_id = p1.id
+      LEFT JOIN networking n2 ON n2.product_id = p2.id
+      WHERE p1.product_type IN ('smartphone', 'laptop', 'tv', 'networking')
+        AND p2.product_type IN ('smartphone', 'laptop', 'tv', 'networking')
+      ORDER BY pair_counts.compare_count DESC, pair_counts.last_compared_at DESC
+      LIMIT $2
+      `,
+      [safeDays, safeLimit],
+    );
+
+    (pairResult.rows || []).forEach((row) => mergeRow(row, "legacy_pair"));
+  } catch (err) {
+    console.warn("Admin user compare pair groups skipped:", err?.message);
+  }
+
+  const comparePageResult = await db.query(`
+    SELECT *
+    FROM compare_pages
+    ORDER BY updated_at DESC NULLS LAST, id DESC
+  `);
+  const pagesByKey = new Map();
+  for (const row of comparePageResult.rows || []) {
+    const page = normalizeComparePageRecord(row);
+    const key = normalizeCompareGroupKey(
+      (Array.isArray(page?.items) ? page.items : []).map(
+        (item) => item?.product_id ?? item?.productId ?? item?.id,
+      ),
+    );
+    if (key && !pagesByKey.has(key)) pagesByKey.set(key, page);
+  }
+
+  return Array.from(rowsByKey.values())
+    .map((row) => {
+      const comparePage = pagesByKey.get(row.group_key) || null;
+      const launchDates = row.products
+        .map((product) => product.launch_date)
+        .filter(Boolean)
+        .sort();
+      const lastComparedAt = maxIsoTimestamp(
+        row.last_compared_at,
+        comparePage?.last_compared_at,
+      );
+      const deadAt = addDaysToIso(lastComparedAt, PUBLIC_COMPARE_WINDOW_DAYS);
+      const fallbackPage =
+        row.products.length >= 2 &&
+        row.products.length <= 3 &&
+        row.products.every(
+          (product) => product.product_type === row.products[0]?.product_type,
+        )
+          ? buildComparePagePayload(row.products, {
+              manualCompareCount: row.compare_count,
+              lastComparedAt,
+              updatedAt: lastComparedAt,
+            })
+          : null;
+      const isManual = String(comparePage?.source || "").toLowerCase() === "manual";
+
+      return {
+        ...row,
+        compare_count_180d: row.compare_count,
+        unique_users_180d: row.unique_users,
+        first_compared_at: row.first_compared_at || null,
+        last_compared_at: lastComparedAt || null,
+        alive_date: lastComparedAt || null,
+        alive_at: lastComparedAt || null,
+        dead_date: deadAt,
+        dead_at: deadAt,
+        is_alive:
+          isManual ||
+          (deadAt ? new Date(deadAt).getTime() >= Date.now() : false),
+        oldest_launch_date: launchDates[0] || null,
+        latest_launch_date: launchDates[launchDates.length - 1] || null,
+        launch_date: launchDates[launchDates.length - 1] || null,
+        compare_page_id: comparePage?.id || null,
+        compare_page: comparePage,
+        route_path: comparePage?.route_path || fallbackPage?.route_path || "/compare",
+        title: comparePage?.title || fallbackPage?.title || "User compare group",
+        status: comparePage?.status || "not_created",
+        source: comparePage?.source || "user_compare",
+        can_create_page: Boolean(
+          fallbackPage &&
+            row.products.every((product) => product.product_type === "smartphone"),
+        ),
+        analytics_window_days: safeDays,
+        public_window_days: PUBLIC_COMPARE_WINDOW_DAYS,
+      };
+    })
+    .sort((left, right) => {
+      const compareDiff =
+        (Number(right.compare_count) || 0) - (Number(left.compare_count) || 0);
+      if (compareDiff !== 0) return compareDiff;
+      return (
+        new Date(right.last_compared_at || 0).getTime() -
+        new Date(left.last_compared_at || 0).getTime()
+      );
+    })
+    .slice(0, safeLimit);
 };
 
 const buildComparePageFromBody = async (body = {}, existingPage = null) => {
@@ -21020,15 +22152,46 @@ app.get("/api/admin/compare-pages", authenticate, async (req, res) => {
     const pages = (result.rows || [])
       .map((row) => normalizeComparePageRecord(row))
       .filter(Boolean);
+    const hydratedPages = await hydrateComparePagesWithAnalytics(pages);
 
     return res.json({
       generated_at: new Date().toISOString(),
-      pages,
-      data: pages,
+      pages: hydratedPages,
+      data: hydratedPages,
     });
   } catch (err) {
     console.error("GET /api/admin/compare-pages error:", err);
     return res.status(500).json({ message: "Failed to load compare pages" });
+  }
+});
+
+app.get("/api/admin/user-compares", authenticate, async (req, res) => {
+  try {
+    if (!requireAdminAccess(req, res)) return;
+
+    const daysRaw = Number(req.query?.days ?? COMPARE_DATA_RETENTION_DAYS);
+    const limitRaw = Number(req.query?.limit ?? 500);
+    const days = Number.isFinite(daysRaw)
+      ? Math.min(COMPARE_DATA_RETENTION_DAYS, Math.max(1, Math.floor(daysRaw)))
+      : COMPARE_DATA_RETENTION_DAYS;
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(1000, Math.max(1, Math.floor(limitRaw)))
+      : 500;
+    const groups = await fetchAdminUserCompareGroups({ days, limit });
+
+    return res.json({
+      generated_at: new Date().toISOString(),
+      days,
+      limit,
+      retention_days: COMPARE_DATA_RETENTION_DAYS,
+      public_window_days: PUBLIC_COMPARE_WINDOW_DAYS,
+      user_compares: groups,
+      rows: groups,
+      data: groups,
+    });
+  } catch (err) {
+    console.error("GET /api/admin/user-compares error:", err);
+    return res.status(500).json({ message: "Failed to load user compares" });
   }
 });
 
@@ -21052,10 +22215,13 @@ app.get(
           days: Number.isFinite(daysRaw) ? daysRaw : 180,
           limit: Number.isFinite(limitRaw) ? limitRaw : 5,
         });
+      const hydratedExistingPage = existingPage
+        ? (await hydrateComparePagesWithAnalytics([existingPage]))[0]
+        : null;
 
       return res.json({
         product_id: productId,
-        existing_page: existingPage,
+        existing_page: hydratedExistingPage,
         suggestions,
         generated_at: new Date().toISOString(),
       });
@@ -21106,8 +22272,10 @@ app.get("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
       return res.status(404).json({ message: "Compare page not found" });
     }
 
+    const hydratedPage = (await hydrateComparePagesWithAnalytics([page]))[0];
+
     return res.json({
-      page,
+      page: hydratedPage,
       generated_at: new Date().toISOString(),
     });
   } catch (err) {
@@ -21132,8 +22300,10 @@ app.post("/api/admin/compare-pages", authenticate, async (req, res) => {
       return res.status(500).json({ message: "Failed to save compare page" });
     }
 
+    const hydratedPage = (await hydrateComparePagesWithAnalytics([savedPage]))[0];
+
     return res.status(201).json({
-      page: savedPage,
+      page: hydratedPage,
       generated_at: new Date().toISOString(),
     });
   } catch (err) {
@@ -21164,8 +22334,10 @@ app.put("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
       return res.status(500).json({ message: "Failed to update compare page" });
     }
 
+    const hydratedPage = (await hydrateComparePagesWithAnalytics([savedPage]))[0];
+
     return res.json({
-      page: savedPage,
+      page: hydratedPage,
       generated_at: new Date().toISOString(),
     });
   } catch (err) {
@@ -21217,8 +22389,8 @@ app.get("/api/public/compare-pages/routes", async (req, res) => {
       ? Math.min(300, Math.max(1, Math.floor(limitRaw)))
       : 100;
     const days = Number.isFinite(daysRaw)
-      ? Math.min(365, Math.max(7, Math.floor(daysRaw)))
-      : 180;
+      ? Math.min(PUBLIC_COMPARE_WINDOW_DAYS, Math.max(7, Math.floor(daysRaw)))
+      : PUBLIC_COMPARE_WINDOW_DAYS;
 
     const result = await db.query(
       `
@@ -21481,8 +22653,9 @@ app.get("/api/public/compare-pages/resolve", async (req, res) => {
           FROM product_comparisons
           WHERE LEAST(product_id, compared_with) = LEAST($1, $2)
             AND GREATEST(product_id, compared_with) = GREATEST($1, $2)
+            AND compared_at >= now() - make_interval(days => $3::int)
           `,
-          [leftId, rightId],
+          [leftId, rightId, PUBLIC_COMPARE_WINDOW_DAYS],
         );
         compareCount = Number(compareRes.rows?.[0]?.compare_count) || 0;
         lastComparedAt = compareRes.rows?.[0]?.last_compared_at || null;
