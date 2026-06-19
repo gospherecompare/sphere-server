@@ -588,6 +588,17 @@ const toPlainObject = (value) => {
   return value;
 };
 
+const mergeSmartphoneUpdateBody = (value) => {
+  const body = toPlainObject(value);
+  const product = toPlainObject(body.product);
+  const smartphone = toPlainObject(body.smartphone);
+  return {
+    ...body,
+    ...product,
+    ...smartphone,
+  };
+};
+
 const INDIA_TIME_ZONE = "Asia/Kolkata";
 
 const getIndiaDateOnly = (value = new Date()) => {
@@ -3428,11 +3439,7 @@ const SMARTPHONE_RECENCY_HALF_LIFE_DAYS = 540;
 
 const normalizeSmartphoneScoreBrand = (row) => {
   const value =
-    row?.brand_name ??
-    row?.brandName ??
-    row?.brand ??
-    row?.manufacturer ??
-    "";
+    row?.brand_name ?? row?.brandName ?? row?.brand ?? row?.manufacturer ?? "";
   const normalized = String(value || "")
     .trim()
     .toLowerCase()
@@ -3568,9 +3575,9 @@ const resolveSmartphoneContextScore = (entry, buckets) => {
     weightTotal;
   const blended = Number((percentile * 0.68 + entry.raw * 0.32).toFixed(1));
   const learned = Number(
-    (
-      Math.pow(Math.max(0, Math.min(100, blended)) / 100, 1.06) * 100
-    ).toFixed(1),
+    (Math.pow(Math.max(0, Math.min(100, blended)) / 100, 1.06) * 100).toFixed(
+      1,
+    ),
   );
 
   return {
@@ -7340,6 +7347,8 @@ app.put("/api/auth/organization-pin", authenticate, async (req, res) => {
 
 app.get("/api/auth/data-delete-pin/status", authenticate, async (req, res) => {
   try {
+    if (!requireAdminAccess(req, res)) return;
+
     const pinStatus = await getDataDeletePinStatus();
     return res.json({
       success: true,
@@ -7357,6 +7366,34 @@ app.get("/api/auth/data-delete-pin/status", authenticate, async (req, res) => {
 
 app.put("/api/auth/data-delete-pin", authenticate, async (req, res) => {
   try {
+    // enforce admin-only
+    if (!requireAdminAccess(req, res)) return;
+
+    // require admin password for sensitive action
+    const currentAdminPassword = String(
+      req.body?.currentPassword || req.body?.current_password || "",
+    ).trim();
+    if (!currentAdminPassword) {
+      return res.status(400).json({ message: "Admin password is required" });
+    }
+
+    // verify admin password
+    const userResult = await db.query(
+      'SELECT password FROM "user" WHERE id = $1',
+      [req.user.id],
+    );
+    if (!userResult.rows.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    const user = userResult.rows[0];
+    const passwordMatch = await bcrypt.compare(
+      currentAdminPassword,
+      user.password,
+    );
+    if (!passwordMatch) {
+      return res.status(401).json({ message: "Admin password is incorrect" });
+    }
+
     const currentPin = normalizeDataDeletePinInput(req.body?.currentPin);
     const newPin = normalizeDataDeletePinInput(req.body?.newPin);
     const pinStatus = await getDataDeletePinStatus();
@@ -7412,6 +7449,43 @@ app.put("/api/auth/data-delete-pin", authenticate, async (req, res) => {
     return res.status(500).json({
       message: "Unable to update the delete PIN. Please try again.",
     });
+  }
+});
+
+// Delete the configured data-delete PIN (admin + password required)
+app.delete("/api/auth/data-delete-pin", authenticate, async (req, res) => {
+  try {
+    if (!requireAdminAccess(req, res)) return;
+
+    const currentAdminPassword = String(
+      req.body?.currentPassword || req.body?.current_password || "",
+    ).trim();
+    if (!currentAdminPassword) {
+      return res.status(400).json({ message: "Admin password is required" });
+    }
+
+    const userResult = await db.query(
+      'SELECT password FROM "user" WHERE id = $1',
+      [req.user.id],
+    );
+    if (!userResult.rows.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    const user = userResult.rows[0];
+    const passwordMatch = await bcrypt.compare(
+      currentAdminPassword,
+      user.password,
+    );
+    if (!passwordMatch) {
+      return res.status(401).json({ message: "Admin password is incorrect" });
+    }
+
+    await db.query(`DELETE FROM ${DATA_DELETE_PIN_TABLE} WHERE id = 1`);
+
+    return res.json({ success: true, message: "Delete PIN removed" });
+  } catch (err) {
+    console.error("Delete data delete PIN error:", err);
+    return res.status(500).json({ message: "Unable to remove delete PIN" });
   }
 });
 
@@ -13900,6 +13974,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 
     mergeInto(req.body, first);
   }
+  req.body = mergeSmartphoneUpdateBody(req.body);
   try {
     await client.query("BEGIN");
 
@@ -13929,14 +14004,22 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     const sid = findRes.rows[0].id; // internal smartphone id
 
     const n = normalizeBodyKeys(req.body || {});
-    // Accept several name aliases: `name`, `product_name`, `productName`, or normalized variants
+    // Accept several name aliases: `name`, `product_name`, `productName`, normalized variants,
+    // and `product.name` (create-style payload) so PUT can accept the same format as POST.
     const name =
       n.name ||
       n.productname ||
       req.body.name ||
       req.body.product_name ||
       req.body.productName ||
-      req.body.productName?.toString();
+      // support create-style nested product object: { product: { name: '...' } }
+      req.body.product?.name ||
+      req.body.product?.product_name ||
+      // also accept nested smartphone.product.name when clients wrap product inside `smartphone`
+      req.body.smartphone?.product?.name ||
+      req.body.smartphone?.product_name ||
+      // fallback to stringified productName if present
+      (req.body.productName ? req.body.productName.toString() : undefined);
     if (!name) {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Name is required" });
@@ -14391,7 +14474,7 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
 
     const sid = findRes.rows[0].id;
     const productId = findRes.rows[0].product_id;
-    const b = req.body || {};
+    const b = mergeSmartphoneUpdateBody(req.body || {});
 
     // Prepare simplified payload fields (similar to /req endpoint)
     const safeJSONParse = (raw) => {
@@ -20068,9 +20151,7 @@ const buildCompareVisitorKey = (req, body = {}) => {
     req.headers["x-visitor-id"] ??
     "";
   const ipRaw =
-    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
-    req.ip ||
-    "";
+    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.ip || "";
   const userAgent = req.headers["user-agent"] || "";
   const keySource = visitorIdRaw
     ? `vid:${String(visitorIdRaw).trim()}`
@@ -20190,7 +20271,10 @@ const recordPairwiseComparisons = async (productIds = []) => {
   }
 };
 
-const toSafeCompareWindowDays = (value, fallback = FRESH_COMPARE_WIDGET_DAYS) => {
+const toSafeCompareWindowDays = (
+  value,
+  fallback = FRESH_COMPARE_WIDGET_DAYS,
+) => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(PUBLIC_COMPARE_WINDOW_DAYS, Math.max(1, Math.floor(parsed)));
@@ -21398,21 +21482,33 @@ const resolveComparePageAnalytics = async (
       ).toISOString()
     : null;
   const fallbackCompareCount =
-    Number(page?.compare_count_180d ?? page?.compare_count ?? page?.manual_compare_count) ||
-    0;
+    Number(
+      page?.compare_count_180d ??
+        page?.compare_count ??
+        page?.manual_compare_count,
+    ) || 0;
   const fallbackAnalytics = {
     ...page,
     compare_count_180d: fallbackCompareCount,
     compare_count: fallbackCompareCount,
     unique_users_180d:
-      Number(page?.unique_users_180d ?? page?.unique_user_count ?? page?.unique_users) ||
-      0,
+      Number(
+        page?.unique_users_180d ??
+          page?.unique_user_count ??
+          page?.unique_users,
+      ) || 0,
     unique_user_count:
-      Number(page?.unique_user_count ?? page?.unique_users_180d ?? page?.unique_users) ||
-      0,
+      Number(
+        page?.unique_user_count ??
+          page?.unique_users_180d ??
+          page?.unique_users,
+      ) || 0,
     unique_users:
-      Number(page?.unique_users ?? page?.unique_users_180d ?? page?.unique_user_count) ||
-      0,
+      Number(
+        page?.unique_users ??
+          page?.unique_users_180d ??
+          page?.unique_user_count,
+      ) || 0,
     last_compared_at: fallbackLastComparedAt || page?.last_compared_at || null,
     alive_date: fallbackLastComparedAt || null,
     alive_at: fallbackLastComparedAt || null,
@@ -21420,7 +21516,9 @@ const resolveComparePageAnalytics = async (
     dead_at: fallbackDeadAt,
     is_alive:
       String(page?.source || "").toLowerCase() === "manual" ||
-      (fallbackDeadAt ? new Date(fallbackDeadAt).getTime() >= Date.now() : false),
+      (fallbackDeadAt
+        ? new Date(fallbackDeadAt).getTime() >= Date.now()
+        : false),
     analytics_window_days: safeDays,
   };
 
@@ -21486,11 +21584,9 @@ const resolveComparePageAnalytics = async (
       `,
       [ids, safeDays],
     );
-    sessionCompareCount =
-      Number(sessionResult.rows?.[0]?.compare_count) || 0;
+    sessionCompareCount = Number(sessionResult.rows?.[0]?.compare_count) || 0;
     uniqueUsers = Number(sessionResult.rows?.[0]?.unique_users) || 0;
-    sessionLastComparedAt =
-      sessionResult.rows?.[0]?.last_compared_at || null;
+    sessionLastComparedAt = sessionResult.rows?.[0]?.last_compared_at || null;
   } catch (err) {
     console.warn("Compare session analytics skipped:", {
       compare_page_id: page?.id,
@@ -21558,9 +21654,7 @@ const resolveComparePageAnalytics = async (
     page?.launch_date ||
     null;
   const oldestLaunchDate =
-    launchRow.oldest_launch_date ||
-    page?.oldest_launch_date ||
-    null;
+    launchRow.oldest_launch_date || page?.oldest_launch_date || null;
 
   return {
     ...page,
@@ -21656,7 +21750,10 @@ const fetchAdminUserCompareGroups = async ({
   limit = 500,
 } = {}) => {
   const safeDays = Number.isFinite(Number(days))
-    ? Math.min(COMPARE_DATA_RETENTION_DAYS, Math.max(1, Math.floor(Number(days))))
+    ? Math.min(
+        COMPARE_DATA_RETENTION_DAYS,
+        Math.max(1, Math.floor(Number(days))),
+      )
     : COMPARE_DATA_RETENTION_DAYS;
   const safeLimit = Number.isFinite(Number(limit))
     ? Math.min(1000, Math.max(1, Math.floor(Number(limit))))
@@ -21689,7 +21786,10 @@ const fetchAdminUserCompareGroups = async ({
       return;
     }
 
-    existing.compare_count = Math.max(existing.compare_count, next.compare_count);
+    existing.compare_count = Math.max(
+      existing.compare_count,
+      next.compare_count,
+    );
     existing.unique_users = Math.max(existing.unique_users, next.unique_users);
     existing.first_compared_at =
       existing.first_compared_at && next.first_compared_at
@@ -21703,7 +21803,9 @@ const fetchAdminUserCompareGroups = async ({
       existing.last_compared_at ||
       next.last_compared_at ||
       null;
-    existing.products = existing.products.length ? existing.products : next.products;
+    existing.products = existing.products.length
+      ? existing.products
+      : next.products;
     existing.data_source =
       existing.data_source === "session" || source === "session"
         ? "session"
@@ -21965,7 +22067,8 @@ const fetchAdminUserCompareGroups = async ({
               updatedAt: lastComparedAt,
             })
           : null;
-      const isManual = String(comparePage?.source || "").toLowerCase() === "manual";
+      const isManual =
+        String(comparePage?.source || "").toLowerCase() === "manual";
 
       return {
         ...row,
@@ -21985,13 +22088,17 @@ const fetchAdminUserCompareGroups = async ({
         launch_date: launchDates[launchDates.length - 1] || null,
         compare_page_id: comparePage?.id || null,
         compare_page: comparePage,
-        route_path: comparePage?.route_path || fallbackPage?.route_path || "/compare",
-        title: comparePage?.title || fallbackPage?.title || "User compare group",
+        route_path:
+          comparePage?.route_path || fallbackPage?.route_path || "/compare",
+        title:
+          comparePage?.title || fallbackPage?.title || "User compare group",
         status: comparePage?.status || "not_created",
         source: comparePage?.source || "user_compare",
         can_create_page: Boolean(
           fallbackPage &&
-            row.products.every((product) => product.product_type === "smartphone"),
+          row.products.every(
+            (product) => product.product_type === "smartphone",
+          ),
         ),
         analytics_window_days: safeDays,
         public_window_days: PUBLIC_COMPARE_WINDOW_DAYS,
@@ -22300,7 +22407,9 @@ app.post("/api/admin/compare-pages", authenticate, async (req, res) => {
       return res.status(500).json({ message: "Failed to save compare page" });
     }
 
-    const hydratedPage = (await hydrateComparePagesWithAnalytics([savedPage]))[0];
+    const hydratedPage = (
+      await hydrateComparePagesWithAnalytics([savedPage])
+    )[0];
 
     return res.status(201).json({
       page: hydratedPage,
@@ -22334,7 +22443,9 @@ app.put("/api/admin/compare-pages/:id", authenticate, async (req, res) => {
       return res.status(500).json({ message: "Failed to update compare page" });
     }
 
-    const hydratedPage = (await hydrateComparePagesWithAnalytics([savedPage]))[0];
+    const hydratedPage = (
+      await hydrateComparePagesWithAnalytics([savedPage])
+    )[0];
 
     return res.json({
       page: hydratedPage,
@@ -24188,7 +24299,7 @@ async function start() {
     process.exit(1);
   }
 
-  app.listen(PORT, "127.0.0.1", async () => {
+  app.listen(PORT, async () => {
     console.log(`🚀 Server running at http://localhost:${PORT}`);
     try {
       const r = await db.query("SELECT now()");
