@@ -10649,9 +10649,18 @@ app.delete(
         return res.status(404).json({ message: "Blog not found" });
       }
 
+      const deletedBlog = deleteRes.rows[0];
+      req.deleteAuditTarget = {
+        target_table: "blogs",
+        target_id: deletedBlog.id,
+        target_name: deletedBlog.title || `News article ${deletedBlog.id}`,
+        target_type: "news_article",
+        target_snapshot: deletedBlog,
+      };
+
       return res.json({
         message: "Blog deleted successfully",
-        blog: deleteRes.rows[0],
+        blog: deletedBlog,
       });
     } catch (err) {
       console.error("DELETE /api/admin/blogs/:id error:", err);
