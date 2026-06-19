@@ -7364,6 +7364,71 @@ app.get("/api/auth/data-delete-pin/status", authenticate, async (req, res) => {
   }
 });
 
+app.get("/api/auth/data-delete-audit", authenticate, async (req, res) => {
+  try {
+    if (!requireAdminAccess(req, res)) return;
+
+    const limitRaw = Number(req.query?.limit ?? 50);
+    const offsetRaw = Number(req.query?.offset ?? 0);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(100, Math.max(1, Math.floor(limitRaw)))
+      : 50;
+    const offset = Number.isFinite(offsetRaw)
+      ? Math.max(0, Math.floor(offsetRaw))
+      : 0;
+
+    const [auditResult, countResult] = await Promise.all([
+      db.query(
+        `
+        SELECT
+          audit.id,
+          audit.action,
+          audit.target_route,
+          audit.target_table,
+          audit.target_id,
+          audit.target_name,
+          audit.target_type,
+          audit.reason,
+          audit.deleted_by,
+          audit.deleted_by_email,
+          audit.deleted_by_role,
+          audit.request_ip,
+          audit.user_agent,
+          audit.http_status,
+          audit.outcome,
+          audit.request_context,
+          audit.target_snapshot,
+          audit.created_at,
+          u.user_name AS deleted_by_user_name,
+          u.first_name AS deleted_by_first_name,
+          u.last_name AS deleted_by_last_name,
+          u.email AS deleted_by_current_email
+        FROM ${DATA_DELETE_AUDIT_TABLE} audit
+        LEFT JOIN "user" u
+          ON u.id = audit.deleted_by
+        ORDER BY audit.created_at DESC, audit.id DESC
+        LIMIT $1 OFFSET $2
+        `,
+        [limit, offset],
+      ),
+      db.query(`SELECT COUNT(*)::int AS total FROM ${DATA_DELETE_AUDIT_TABLE}`),
+    ]);
+
+    return res.json({
+      success: true,
+      audits: auditResult.rows || [],
+      total: Number(countResult.rows?.[0]?.total) || 0,
+      limit,
+      offset,
+    });
+  } catch (err) {
+    console.error("Get data delete audit error:", err);
+    return res.status(500).json({
+      message: "Unable to load delete audit tracking.",
+    });
+  }
+});
+
 app.put("/api/auth/data-delete-pin", authenticate, async (req, res) => {
   try {
     // enforce admin-only
