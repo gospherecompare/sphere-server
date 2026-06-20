@@ -5440,6 +5440,7 @@ async function runMigrations() {
         hero_image_alt TEXT,
         hero_image_caption TEXT,
         category TEXT,
+        brand_name TEXT,
         tags JSONB NOT NULL DEFAULT '[]'::jsonb,
         featured BOOLEAN NOT NULL DEFAULT false,
         trending BOOLEAN NOT NULL DEFAULT false,
@@ -5483,6 +5484,7 @@ async function runMigrations() {
       ADD COLUMN IF NOT EXISTS hero_image_alt TEXT,
       ADD COLUMN IF NOT EXISTS hero_image_caption TEXT,
       ADD COLUMN IF NOT EXISTS category TEXT,
+      ADD COLUMN IF NOT EXISTS brand_name TEXT,
       ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb,
       ADD COLUMN IF NOT EXISTS featured BOOLEAN NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS trending BOOLEAN NOT NULL DEFAULT false,
@@ -10343,6 +10345,11 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
     const category =
       normalizeBlogTextField(req.body?.category ?? req.body?.section, 80) ||
       null;
+    const brandName =
+      normalizeBlogTextField(
+        req.body?.brand_name ?? req.body?.brandName ?? req.body?.brand,
+        120,
+      ) || null;
     const heroImageSource =
       normalizeBlogTextField(
         req.body?.hero_image_source ?? req.body?.heroImageSource,
@@ -10488,15 +10495,16 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           hero_image_alt = $16,
           hero_image_caption = $17,
           category = $18,
-          tags = $19::jsonb,
-          featured = $20,
-          trending = $21,
-          pinned = $22,
-          author_name = $23,
-          author_user_id = $24,
-          updated_by = $25,
+          brand_name = $19,
+          tags = $20::jsonb,
+          featured = $21,
+          trending = $22,
+          pinned = $23,
+          author_name = $24,
+          author_user_id = $25,
+          updated_by = $26,
           published_at = CASE
-            WHEN $8 = 'published' THEN COALESCE(published_at, $26)
+            WHEN $8 = 'published' THEN COALESCE(published_at, $27)
             ELSE NULL
           END,
           updated_at = now()
@@ -10521,6 +10529,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           hero_image_alt,
           hero_image_caption,
           category,
+          brand_name,
           tags,
           featured,
           trending,
@@ -10550,6 +10559,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           heroImageAlt,
           heroImageCaption,
           category,
+          brandName,
           JSON.stringify(tags),
           featured,
           trending,
@@ -10585,6 +10595,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           hero_image_alt,
           hero_image_caption,
           category,
+          brand_name,
           tags,
           featured,
           trending,
@@ -10597,7 +10608,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           created_at,
           updated_at
         ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,($7 = 'published'),$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19,$20,$21,$22,$23,$24,$25,$26,now(),now()
+          $1,$2,$3,$4,$5,$6,$7,($7 = 'published'),$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22,$23,$24,$25,$26,$27,now(),now()
         )
         RETURNING
           id,
@@ -10619,6 +10630,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           hero_image_alt,
           hero_image_caption,
           category,
+          brand_name,
           tags,
           featured,
           trending,
@@ -10647,6 +10659,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           heroImageAlt,
           heroImageCaption,
           category,
+          brandName,
           JSON.stringify(tags),
           featured,
           trending,
@@ -10706,8 +10719,14 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
         bl.slug,
         bl.status,
         bl.is_published,
-        bl.author_name,
+        COALESCE(
+          NULLIF(BTRIM(bl.author_name), ''),
+          NULLIF(BTRIM(CONCAT_WS(' ', blog_author.first_name, blog_author.last_name)), ''),
+          NULLIF(BTRIM(blog_author.user_name), ''),
+          NULLIF(BTRIM(blog_author.email), '')
+        ) AS author_name,
         bl.author_user_id,
+        blog_author.role AS author_role,
         bl.category,
         bl.blog_eligible,
         COALESCE(
@@ -10731,8 +10750,10 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
         bl.updated_at,
         p.name AS product_name,
         p.product_type,
-        b.name AS brand_name
+        COALESCE(NULLIF(BTRIM(bl.brand_name), ''), b.name) AS brand_name
       FROM blogs bl
+      LEFT JOIN "user" blog_author
+        ON blog_author.id = bl.author_user_id
       LEFT JOIN products p
         ON p.id = bl.product_id
       LEFT JOIN brands b
@@ -10787,8 +10808,14 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
         bl.content_rendered,
         bl.status,
         bl.is_published,
-        bl.author_name,
+        COALESCE(
+          NULLIF(BTRIM(bl.author_name), ''),
+          NULLIF(BTRIM(CONCAT_WS(' ', blog_author.first_name, blog_author.last_name)), ''),
+          NULLIF(BTRIM(blog_author.user_name), ''),
+          NULLIF(BTRIM(blog_author.email), '')
+        ) AS author_name,
         bl.author_user_id,
+        blog_author.role AS author_role,
         bl.category,
         bl.blog_eligible,
         bl.eligibility_snapshot,
@@ -10817,8 +10844,10 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
         bl.updated_at,
         p.name AS product_name,
         p.product_type,
-        b.name AS brand_name
+        COALESCE(NULLIF(BTRIM(bl.brand_name), ''), b.name) AS brand_name
       FROM blogs bl
+      LEFT JOIN "user" blog_author
+        ON blog_author.id = bl.author_user_id
       LEFT JOIN products p
         ON p.id = bl.product_id
       LEFT JOIN brands b
@@ -11547,8 +11576,14 @@ app.get("/api/public/blogs", async (req, res) => {
         bl.title,
         bl.excerpt,
         bl.is_published,
-        bl.author_name,
+        COALESCE(
+          NULLIF(BTRIM(bl.author_name), ''),
+          NULLIF(BTRIM(CONCAT_WS(' ', public_blog_author.first_name, public_blog_author.last_name)), ''),
+          NULLIF(BTRIM(public_blog_author.user_name), ''),
+          NULLIF(BTRIM(public_blog_author.email), '')
+        ) AS author_name,
         bl.author_user_id,
+        public_blog_author.role AS author_role,
         bl.category,
         COALESCE(
           bl.hero_image,
@@ -11571,7 +11606,7 @@ app.get("/api/public/blogs", async (req, res) => {
         bl.updated_at,
         p.name AS product_name,
         p.product_type,
-        b.name AS brand_name,
+        COALESCE(NULLIF(BTRIM(bl.brand_name), ''), b.name) AS brand_name,
         COALESCE(
           linked.product_ids,
           CASE
@@ -11595,6 +11630,8 @@ app.get("/api/public/blogs", async (req, res) => {
           END
         ) AS products
       FROM blogs bl
+      LEFT JOIN "user" public_blog_author
+        ON public_blog_author.id = bl.author_user_id
       LEFT JOIN products p
         ON p.id = bl.product_id
       LEFT JOIN brands b
@@ -11654,8 +11691,14 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
         bl.slug,
         bl.excerpt,
         bl.is_published,
-        bl.author_name,
+        COALESCE(
+          NULLIF(BTRIM(bl.author_name), ''),
+          NULLIF(BTRIM(CONCAT_WS(' ', public_blog_author.first_name, public_blog_author.last_name)), ''),
+          NULLIF(BTRIM(public_blog_author.user_name), ''),
+          NULLIF(BTRIM(public_blog_author.email), '')
+        ) AS author_name,
         bl.author_user_id,
+        public_blog_author.role AS author_role,
         bl.category,
         bl.content_rendered,
         bl.meta_title,
@@ -11681,7 +11724,7 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
         bl.updated_at,
         p.name AS product_name,
         p.product_type,
-        b.name AS brand_name,
+        COALESCE(NULLIF(BTRIM(bl.brand_name), ''), b.name) AS brand_name,
         COALESCE(
           linked.product_ids,
           CASE
@@ -11705,6 +11748,8 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
           END
         ) AS products
       FROM blogs bl
+      LEFT JOIN "user" public_blog_author
+        ON public_blog_author.id = bl.author_user_id
       LEFT JOIN products p
         ON p.id = bl.product_id
       LEFT JOIN brands b
