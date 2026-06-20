@@ -3806,6 +3806,32 @@ const applySpecScoreToRows = (type, rows, profiles) => {
 const BLOG_ALLOWED_PRODUCT_TYPES = new Set(["smartphone", "laptop", "tv"]);
 const BLOG_ALLOWED_STATUSES = new Set(["draft", "published"]);
 
+const normalizeBlogTextField = (value, maxLength = 500) =>
+  String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, maxLength);
+
+const normalizeBlogTagsInput = (value) => {
+  const rawItems = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[,;\n]+/)
+      : [];
+
+  const seen = new Set();
+  const tags = [];
+  for (const item of rawItems) {
+    const label = normalizeBlogTextField(item, 48);
+    const key = label.toLowerCase();
+    if (!label || seen.has(key)) continue;
+    seen.add(key);
+    tags.push(label);
+    if (tags.length >= 30) break;
+  }
+  return tags;
+};
+
 const toSafeFiniteNumber = (value, fallback = 0) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -4335,9 +4361,24 @@ const mapBlogLinkRows = (rows = []) =>
     title: String(row.title || "").trim(),
     slug: String(row.slug || "").trim(),
     excerpt: String(row.excerpt || "").trim(),
+    category: String(row.category || "").trim(),
     status: String(row.status || "draft")
       .trim()
       .toLowerCase(),
+    is_published:
+      typeof row.is_published === "boolean"
+        ? row.is_published
+        : String(row.status || "").toLowerCase() === "published",
+    author_name: String(row.author_name || "").trim(),
+    author_user_id: Number(row.author_user_id) || null,
+    hero_image: row.hero_image || null,
+    hero_image_source: String(row.hero_image_source || "").trim(),
+    hero_image_alt: String(row.hero_image_alt || "").trim(),
+    hero_image_caption: String(row.hero_image_caption || "").trim(),
+    tags: normalizeBlogTagsInput(row.tags),
+    featured: Boolean(row.featured),
+    trending: Boolean(row.trending),
+    pinned: Boolean(row.pinned),
     published_at: row.published_at || null,
     updated_at: row.updated_at || null,
     primary_product_id: Number(row.primary_product_id) || null,
@@ -5388,12 +5429,23 @@ async function runMigrations() {
         content_template TEXT NOT NULL,
         content_rendered TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'draft',
+        is_published BOOLEAN NOT NULL DEFAULT false,
         blog_eligible BOOLEAN NOT NULL DEFAULT false,
         eligibility_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
         token_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
         meta_title TEXT,
         meta_description TEXT,
         hero_image TEXT,
+        hero_image_source TEXT,
+        hero_image_alt TEXT,
+        hero_image_caption TEXT,
+        category TEXT,
+        tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+        featured BOOLEAN NOT NULL DEFAULT false,
+        trending BOOLEAN NOT NULL DEFAULT false,
+        pinned BOOLEAN NOT NULL DEFAULT false,
+        author_name TEXT,
+        author_user_id INT REFERENCES "user"(id) ON DELETE SET NULL,
         created_by INT REFERENCES "user"(id),
         updated_by INT REFERENCES "user"(id),
         published_at TIMESTAMP,
@@ -5411,8 +5463,70 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS is_published BOOLEAN NOT NULL DEFAULT false;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS author_name TEXT;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS author_user_id INT REFERENCES "user"(id) ON DELETE SET NULL;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      ADD COLUMN IF NOT EXISTS hero_image_source TEXT,
+      ADD COLUMN IF NOT EXISTS hero_image_alt TEXT,
+      ADD COLUMN IF NOT EXISTS hero_image_caption TEXT,
+      ADD COLUMN IF NOT EXISTS category TEXT,
+      ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS featured BOOLEAN NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS trending BOOLEAN NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT false;
+    `);
+
+    await safeQuery(`
+      UPDATE blogs
+      SET tags = '[]'::jsonb
+      WHERE tags IS NULL;
+    `);
+
+    await safeQuery(`
+      UPDATE blogs
+      SET is_published = (status = 'published')
+      WHERE is_published IS DISTINCT FROM (status = 'published');
+    `);
+
+    await safeQuery(`
+      UPDATE blogs bl
+      SET
+        author_user_id = COALESCE(bl.author_user_id, bl.updated_by, bl.created_by),
+        author_name = COALESCE(
+          NULLIF(BTRIM(bl.author_name), ''),
+          NULLIF(BTRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''),
+          NULLIF(BTRIM(u.user_name), ''),
+          NULLIF(BTRIM(u.email), '')
+        )
+      FROM "user" u
+      WHERE u.id = COALESCE(bl.author_user_id, bl.updated_by, bl.created_by)
+        AND (
+          bl.author_user_id IS NULL
+          OR NULLIF(BTRIM(bl.author_name), '') IS NULL
+        );
+    `);
+
+    await safeQuery(`
       CREATE INDEX IF NOT EXISTS idx_blogs_status_published_at
       ON blogs (status, published_at DESC, updated_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_blogs_is_published
+      ON blogs (is_published, published_at DESC, updated_at DESC);
     `);
 
     await safeQuery(`
@@ -10044,11 +10158,15 @@ app.post("/api/admin/blogs/context", authenticate, async (req, res) => {
           bl.content_template,
           bl.content_rendered,
           bl.status,
+          bl.is_published,
+          bl.author_name,
+          bl.author_user_id,
           bl.blog_eligible,
           bl.eligibility_snapshot,
           bl.token_snapshot,
           bl.meta_title,
           bl.meta_description,
+          bl.category,
           COALESCE(
             bl.hero_image,
             (
@@ -10059,6 +10177,13 @@ app.post("/api/admin/blogs/context", authenticate, async (req, res) => {
               LIMIT 1
             )
           ) AS hero_image,
+          bl.hero_image_source,
+          bl.hero_image_alt,
+          bl.hero_image_caption,
+          bl.tags,
+          bl.featured,
+          bl.trending,
+          bl.pinned,
           bl.published_at,
           bl.created_at,
           bl.updated_at
@@ -10094,16 +10219,16 @@ app.post("/api/admin/blogs/context", authenticate, async (req, res) => {
             existingProductIds[0] || Number(row.product_id) || null,
           token_map: existingTokenMap,
           token_keys: Object.keys(existingTokenMap).sort(),
-          category: null,
-          author_name: "",
-          author_user_id: null,
-          hero_image_source: null,
-          hero_image_alt: "",
-          hero_image_caption: "",
-          tags: [],
-          featured: false,
-          trending: false,
-          pinned: false,
+          category: row.category || null,
+          author_name: row.author_name || "",
+          author_user_id: row.author_user_id || null,
+          hero_image_source: row.hero_image_source || null,
+          hero_image_alt: row.hero_image_alt || "",
+          hero_image_caption: row.hero_image_caption || "",
+          tags: normalizeBlogTagsInput(row.tags),
+          featured: Boolean(row.featured),
+          trending: Boolean(row.trending),
+          pinned: Boolean(row.pinned),
         };
       }
     }
@@ -10193,14 +10318,64 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
     const excerpt = String(req.body?.excerpt || "").trim();
     const contentTemplate = String(req.body?.content_template || "").trim();
     const requestedSlug = String(req.body?.slug || "").trim();
+    const hasIsPublishedInput =
+      Object.prototype.hasOwnProperty.call(req.body || {}, "is_published") ||
+      Object.prototype.hasOwnProperty.call(req.body || {}, "isPublished") ||
+      Object.prototype.hasOwnProperty.call(req.body || {}, "publish");
+    const requestedIsPublished = hasIsPublishedInput
+      ? parseBooleanInput(
+          req.body?.is_published ?? req.body?.isPublished ?? req.body?.publish,
+        )
+      : null;
     const requestedStatus = String(req.body?.status || "draft")
       .trim()
       .toLowerCase();
-    const status = BLOG_ALLOWED_STATUSES.has(requestedStatus)
-      ? requestedStatus
-      : "draft";
+    const status = hasIsPublishedInput
+      ? requestedIsPublished
+        ? "published"
+        : "draft"
+      : BLOG_ALLOWED_STATUSES.has(requestedStatus)
+        ? requestedStatus
+        : "draft";
+    const isPublished = status === "published";
     const metaTitle = String(req.body?.meta_title || "").trim();
     const metaDescription = String(req.body?.meta_description || "").trim();
+    const category =
+      normalizeBlogTextField(req.body?.category ?? req.body?.section, 80) ||
+      null;
+    const heroImageSource =
+      normalizeBlogTextField(
+        req.body?.hero_image_source ?? req.body?.heroImageSource,
+        300,
+      ) || null;
+    const heroImageAlt =
+      normalizeBlogTextField(
+        req.body?.hero_image_alt ?? req.body?.heroImageAlt,
+        180,
+      ) || null;
+    const heroImageCaption =
+      normalizeBlogTextField(
+        req.body?.hero_image_caption ?? req.body?.heroImageCaption,
+        300,
+      ) || null;
+    const tags = normalizeBlogTagsInput(req.body?.tags ?? req.body?.keywords);
+    const featured = parseBooleanInput(req.body?.featured);
+    const trending = parseBooleanInput(req.body?.trending);
+    const pinned = parseBooleanInput(req.body?.pinned);
+    const rawAuthorUserId = Number(
+      req.body?.author_user_id ?? req.body?.authorUserId,
+    );
+    const authorUserId =
+      Number.isInteger(rawAuthorUserId) && rawAuthorUserId > 0
+        ? rawAuthorUserId
+        : null;
+    let authorName = String(
+      req.body?.author_name ??
+        req.body?.authorName ??
+        req.body?.byline ??
+        req.body?.author ??
+        "",
+    ).trim();
 
     if (!title) return res.status(400).json({ message: "title is required" });
     if (!contentTemplate) {
@@ -10245,7 +10420,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       },
     );
     const unresolvedTokens = collectTemplateTokens(contentRendered);
-    if (status === "published" && unresolvedTokens.length) {
+    if (isPublished && unresolvedTokens.length) {
       return res.status(400).json({
         message: `Resolve content placeholders before publishing: ${unresolvedTokens
           .map((token) => `{{${token}}}`)
@@ -10261,11 +10436,33 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
     const heroImage = String(
       req.body?.hero_image || snapshot?.hero_image || "",
     ).trim();
-    const nowPublishedAt = status === "published" ? new Date() : null;
+    const nowPublishedAt = isPublished ? new Date() : null;
     const actorId =
       Number.isInteger(Number(req.user?.id)) && Number(req.user?.id) > 0
         ? Number(req.user.id)
         : null;
+    if (!authorName && authorUserId) {
+      const authorResult = await db.query(
+        `
+        SELECT user_name, first_name, last_name, email
+        FROM "user"
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [authorUserId],
+      );
+      const author = authorResult.rows[0] || null;
+      authorName =
+        [
+          author?.first_name,
+          author?.last_name,
+        ]
+          .map((value) => String(value || "").trim())
+          .filter(Boolean)
+          .join(" ") ||
+        String(author?.user_name || "").trim() ||
+        String(author?.email || "").trim();
+    }
 
     let writeResult;
     if (targetBlogId) {
@@ -10280,15 +10477,26 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           content_template = $6,
           content_rendered = $7,
           status = $8,
+          is_published = ($8 = 'published'),
           blog_eligible = $9,
           eligibility_snapshot = $10::jsonb,
           token_snapshot = $11::jsonb,
           meta_title = $12,
           meta_description = $13,
           hero_image = $14,
-          updated_by = $15,
+          hero_image_source = $15,
+          hero_image_alt = $16,
+          hero_image_caption = $17,
+          category = $18,
+          tags = $19::jsonb,
+          featured = $20,
+          trending = $21,
+          pinned = $22,
+          author_name = $23,
+          author_user_id = $24,
+          updated_by = $25,
           published_at = CASE
-            WHEN $8 = 'published' THEN COALESCE(published_at, $16)
+            WHEN $8 = 'published' THEN COALESCE(published_at, $26)
             ELSE NULL
           END,
           updated_at = now()
@@ -10302,12 +10510,23 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           content_template,
           content_rendered,
           status,
+          is_published,
           blog_eligible,
           eligibility_snapshot,
           token_snapshot,
           meta_title,
           meta_description,
           hero_image,
+          hero_image_source,
+          hero_image_alt,
+          hero_image_caption,
+          category,
+          tags,
+          featured,
+          trending,
+          pinned,
+          author_name,
+          author_user_id,
           published_at,
           created_at,
           updated_at
@@ -10327,6 +10546,16 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           metaTitle || null,
           metaDescription || null,
           heroImage || null,
+          heroImageSource,
+          heroImageAlt,
+          heroImageCaption,
+          category,
+          JSON.stringify(tags),
+          featured,
+          trending,
+          pinned,
+          authorName || null,
+          authorUserId,
           actorId,
           nowPublishedAt,
         ],
@@ -10345,19 +10574,30 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           content_template,
           content_rendered,
           status,
+          is_published,
           blog_eligible,
           eligibility_snapshot,
           token_snapshot,
           meta_title,
           meta_description,
           hero_image,
+          hero_image_source,
+          hero_image_alt,
+          hero_image_caption,
+          category,
+          tags,
+          featured,
+          trending,
+          pinned,
+          author_name,
+          author_user_id,
           created_by,
           updated_by,
           published_at,
           created_at,
           updated_at
         ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16,now(),now()
+          $1,$2,$3,$4,$5,$6,$7,($7 = 'published'),$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19,$20,$21,$22,$23,$24,$25,$26,now(),now()
         )
         RETURNING
           id,
@@ -10368,12 +10608,23 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           content_template,
           content_rendered,
           status,
+          is_published,
           blog_eligible,
           eligibility_snapshot,
           token_snapshot,
           meta_title,
           meta_description,
           hero_image,
+          hero_image_source,
+          hero_image_alt,
+          hero_image_caption,
+          category,
+          tags,
+          featured,
+          trending,
+          pinned,
+          author_name,
+          author_user_id,
           published_at,
           created_at,
           updated_at
@@ -10392,6 +10643,16 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           metaTitle || null,
           metaDescription || null,
           heroImage || null,
+          heroImageSource,
+          heroImageAlt,
+          heroImageCaption,
+          category,
+          JSON.stringify(tags),
+          featured,
+          trending,
+          pinned,
+          authorName || null,
+          authorUserId,
           actorId,
           actorId,
           nowPublishedAt,
@@ -10444,6 +10705,10 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
         bl.title,
         bl.slug,
         bl.status,
+        bl.is_published,
+        bl.author_name,
+        bl.author_user_id,
+        bl.category,
         bl.blog_eligible,
         COALESCE(
           bl.hero_image,
@@ -10455,6 +10720,13 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
             LIMIT 1
           )
         ) AS hero_image,
+        bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         bl.published_at,
         bl.updated_at,
         p.name AS product_name,
@@ -10514,6 +10786,10 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
         bl.content_template,
         bl.content_rendered,
         bl.status,
+        bl.is_published,
+        bl.author_name,
+        bl.author_user_id,
+        bl.category,
         bl.blog_eligible,
         bl.eligibility_snapshot,
         bl.token_snapshot,
@@ -10529,6 +10805,13 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
             LIMIT 1
           )
         ) AS hero_image,
+        bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         bl.published_at,
         bl.created_at,
         bl.updated_at,
@@ -10604,21 +10887,114 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
         token_map: tokenMap,
         token_keys: Object.keys(tokenMap).sort(),
         product_type: blog.product_type || firstProduct?.product_type || null,
-        category: null,
-        author_name: "",
-        author_user_id: null,
-        hero_image_source: null,
-        hero_image_alt: "",
-        hero_image_caption: "",
-        tags: [],
-        featured: false,
-        trending: false,
-        pinned: false,
+        category: blog.category || null,
+        author_name: blog.author_name || "",
+        author_user_id: blog.author_user_id || null,
+        hero_image_source: blog.hero_image_source || null,
+        hero_image_alt: blog.hero_image_alt || "",
+        hero_image_caption: blog.hero_image_caption || "",
+        tags: normalizeBlogTagsInput(blog.tags),
+        featured: Boolean(blog.featured),
+        trending: Boolean(blog.trending),
+        pinned: Boolean(blog.pinned),
       },
     });
   } catch (err) {
     console.error("GET /api/admin/blogs/:id error:", err);
     return res.status(500).json({ message: "Failed to fetch blog" });
+  }
+});
+
+app.patch("/api/admin/blogs/:id/publish", authenticate, async (req, res) => {
+  try {
+    if (!ensureBlogManagerAccess(req, res)) return;
+
+    const blogId = Number(req.params.id);
+    if (!Number.isInteger(blogId) || blogId <= 0) {
+      return res.status(400).json({ message: "Invalid blog id" });
+    }
+
+    const hasIsPublishedInput =
+      Object.prototype.hasOwnProperty.call(req.body || {}, "is_published") ||
+      Object.prototype.hasOwnProperty.call(req.body || {}, "isPublished") ||
+      Object.prototype.hasOwnProperty.call(req.body || {}, "publish");
+    if (!hasIsPublishedInput) {
+      return res
+        .status(400)
+        .json({ message: "is_published boolean is required" });
+    }
+
+    const isPublished = parseBooleanInput(
+      req.body?.is_published ?? req.body?.isPublished ?? req.body?.publish,
+    );
+    const existingResult = await db.query(
+      `
+      SELECT id, content_rendered, content_template
+      FROM blogs
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [blogId],
+    );
+
+    if (!existingResult.rows.length) {
+      return res.status(404).json({ message: "Blog not found" });
+    }
+
+    if (isPublished) {
+      const unresolvedTokens = collectTemplateTokens(
+        existingResult.rows[0].content_rendered ||
+          existingResult.rows[0].content_template ||
+          "",
+      );
+      if (unresolvedTokens.length) {
+        return res.status(400).json({
+          message: `Resolve content placeholders before publishing: ${unresolvedTokens
+            .map((token) => `{{${token}}}`)
+            .join(", ")}`,
+          unresolved_tokens: unresolvedTokens,
+        });
+      }
+    }
+
+    const actorId =
+      Number.isInteger(Number(req.user?.id)) && Number(req.user?.id) > 0
+        ? Number(req.user.id)
+        : null;
+    const updateResult = await db.query(
+      `
+      UPDATE blogs
+      SET
+        is_published = $2,
+        status = CASE WHEN $2 THEN 'published' ELSE 'draft' END,
+        published_at = CASE WHEN $2 THEN COALESCE(published_at, now()) ELSE NULL END,
+        updated_by = $3,
+        updated_at = now()
+      WHERE id = $1
+      RETURNING
+        id,
+        product_id,
+        title,
+        slug,
+        status,
+        is_published,
+        published_at,
+        updated_at
+      `,
+      [blogId, isPublished, actorId],
+    );
+
+    return res.json({
+      message: isPublished
+        ? "Blog published successfully"
+        : "Blog unpublished successfully",
+      blog: updateResult.rows[0],
+    });
+  } catch (err) {
+    console.error("PATCH /api/admin/blogs/:id/publish error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to update blog publish status" });
   }
 });
 
@@ -10710,6 +11086,18 @@ app.get("/api/admin/news-articles/search", authenticate, async (req, res) => {
         bl.slug,
         bl.excerpt,
         bl.status,
+        bl.is_published,
+        bl.author_name,
+        bl.author_user_id,
+        bl.category,
+        bl.hero_image,
+        bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         bl.published_at,
         bl.updated_at,
         bl.product_id AS primary_product_id,
@@ -10793,6 +11181,18 @@ app.get(
         bl.slug,
         bl.excerpt,
         bl.status,
+        bl.is_published,
+        bl.author_name,
+        bl.author_user_id,
+        bl.category,
+        bl.hero_image,
+        bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         bl.published_at,
         bl.updated_at,
         bl.product_id AS primary_product_id,
@@ -10844,6 +11244,18 @@ app.get(
         bl.slug,
         bl.excerpt,
         bl.status,
+        bl.is_published,
+        bl.author_name,
+        bl.author_user_id,
+        bl.category,
+        bl.hero_image,
+        bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         bl.published_at,
         bl.updated_at,
         bl.product_id AS primary_product_id,
@@ -11014,6 +11426,18 @@ app.put(
         bl.slug,
         bl.excerpt,
         bl.status,
+        bl.is_published,
+        bl.author_name,
+        bl.author_user_id,
+        bl.category,
+        bl.hero_image,
+        bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         bl.published_at,
         bl.updated_at,
         bl.product_id AS primary_product_id,
@@ -11074,7 +11498,7 @@ app.get("/api/public/blogs", async (req, res) => {
     )
       .trim()
       .toLowerCase();
-    const whereClauses = ["bl.status = 'published'"];
+    const whereClauses = ["bl.is_published = true"];
     const queryParams = [];
 
     if (hasProductFilter) {
@@ -11122,6 +11546,10 @@ app.get("/api/public/blogs", async (req, res) => {
         bl.slug,
         bl.title,
         bl.excerpt,
+        bl.is_published,
+        bl.author_name,
+        bl.author_user_id,
+        bl.category,
         COALESCE(
           bl.hero_image,
           (
@@ -11132,6 +11560,13 @@ app.get("/api/public/blogs", async (req, res) => {
             LIMIT 1
           )
         ) AS hero_image,
+        bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         bl.published_at,
         bl.updated_at,
         p.name AS product_name,
@@ -11218,6 +11653,10 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
         bl.title,
         bl.slug,
         bl.excerpt,
+        bl.is_published,
+        bl.author_name,
+        bl.author_user_id,
+        bl.category,
         bl.content_rendered,
         bl.meta_title,
         bl.meta_description,
@@ -11231,6 +11670,13 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
             LIMIT 1
           )
         ) AS hero_image,
+        bl.hero_image_source,
+        bl.hero_image_alt,
+        bl.hero_image_caption,
+        bl.tags,
+        bl.featured,
+        bl.trending,
+        bl.pinned,
         bl.published_at,
         bl.updated_at,
         p.name AS product_name,
@@ -11284,7 +11730,7 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
         WHERE bpl.blog_id = bl.id
       ) linked ON true
       WHERE bl.slug = $1
-        AND bl.status = 'published'
+        AND bl.is_published = true
       LIMIT $2
     `,
       [slug, 1],
