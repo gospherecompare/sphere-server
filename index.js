@@ -10725,7 +10725,7 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
           NULLIF(BTRIM(blog_author.user_name), ''),
           NULLIF(BTRIM(blog_author.email), '')
         ) AS author_name,
-        bl.author_user_id,
+        COALESCE(bl.author_user_id, bl.updated_by, bl.created_by) AS author_user_id,
         blog_author.role AS author_role,
         bl.category,
         bl.blog_eligible,
@@ -10814,7 +10814,7 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
           NULLIF(BTRIM(blog_author.user_name), ''),
           NULLIF(BTRIM(blog_author.email), '')
         ) AS author_name,
-        bl.author_user_id,
+        COALESCE(bl.author_user_id, bl.updated_by, bl.created_by) AS author_user_id,
         blog_author.role AS author_role,
         bl.category,
         bl.blog_eligible,
@@ -11582,7 +11582,7 @@ app.get("/api/public/blogs", async (req, res) => {
           NULLIF(BTRIM(public_blog_author.user_name), ''),
           NULLIF(BTRIM(public_blog_author.email), '')
         ) AS author_name,
-        bl.author_user_id,
+        COALESCE(bl.author_user_id, bl.updated_by, bl.created_by) AS author_user_id,
         public_blog_author.role AS author_role,
         bl.category,
         COALESCE(
@@ -11631,7 +11631,7 @@ app.get("/api/public/blogs", async (req, res) => {
         ) AS products
       FROM blogs bl
       LEFT JOIN "user" public_blog_author
-        ON public_blog_author.id = bl.author_user_id
+        ON public_blog_author.id = COALESCE(bl.author_user_id, bl.updated_by, bl.created_by)
       LEFT JOIN products p
         ON p.id = bl.product_id
       LEFT JOIN brands b
@@ -11697,7 +11697,7 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
           NULLIF(BTRIM(public_blog_author.user_name), ''),
           NULLIF(BTRIM(public_blog_author.email), '')
         ) AS author_name,
-        bl.author_user_id,
+        COALESCE(bl.author_user_id, bl.updated_by, bl.created_by) AS author_user_id,
         public_blog_author.role AS author_role,
         bl.category,
         bl.content_rendered,
@@ -11749,7 +11749,7 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
         ) AS products
       FROM blogs bl
       LEFT JOIN "user" public_blog_author
-        ON public_blog_author.id = bl.author_user_id
+        ON public_blog_author.id = COALESCE(bl.author_user_id, bl.updated_by, bl.created_by)
       LEFT JOIN products p
         ON p.id = bl.product_id
       LEFT JOIN brands b
