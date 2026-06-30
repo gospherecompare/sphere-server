@@ -10460,10 +10460,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
       );
       const author = authorResult.rows[0] || null;
       authorName =
-        [
-          author?.first_name,
-          author?.last_name,
-        ]
+        [author?.first_name, author?.last_name]
           .map((value) => String(value || "").trim())
           .filter(Boolean)
           .join(" ") ||

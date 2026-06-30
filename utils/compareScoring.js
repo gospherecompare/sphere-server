@@ -1,4 +1,10 @@
-const WEIGHT_KEYS = ["performance", "display", "camera", "battery", "priceValue"];
+const WEIGHT_KEYS = [
+  "performance",
+  "display",
+  "camera",
+  "battery",
+  "priceValue",
+];
 
 const DEFAULT_COMPARE_WEIGHTS = Object.freeze({
   performance: 0.36,
@@ -42,7 +48,9 @@ const roundOne = (value) => Math.round((value + Number.EPSILON) * 10) / 10;
 const toFiniteNumber = (value) => {
   if (value == null || value === "") return null;
   if (typeof value === "number" && Number.isFinite(value)) return value;
-  const match = String(value).replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+  const match = String(value)
+    .replace(/,/g, "")
+    .match(/-?\d+(?:\.\d+)?/);
   if (!match) return null;
   const parsed = Number(match[0]);
   return Number.isFinite(parsed) ? parsed : null;
@@ -83,7 +91,8 @@ const normalizeWeights = (input) => {
     const value = toFiniteNumber(
       source[key] ?? (key === "priceValue" ? source.price_value : null),
     );
-    raw[key] = value != null && value >= 0 ? value : DEFAULT_COMPARE_WEIGHTS[key];
+    raw[key] =
+      value != null && value >= 0 ? value : DEFAULT_COMPARE_WEIGHTS[key];
   }
 
   let total = WEIGHT_KEYS.reduce((acc, key) => acc + raw[key], 0);
@@ -162,10 +171,13 @@ const scoreChipset = (processorText, chipsetRules) => {
 
   for (const rule of chipsetRules) {
     if (!rule?.keyword) continue;
-    if (text.includes(rule.keyword)) return clamp(Number(rule.score) || 0, 0, 100);
+    if (text.includes(rule.keyword))
+      return clamp(Number(rule.score) || 0, 0, 100);
   }
 
-  const snapdragonGenMatch = text.match(/snapdragon\s*([0-9])\s*gen\s*([0-9]+)/i);
+  const snapdragonGenMatch = text.match(
+    /snapdragon\s*([0-9])\s*gen\s*([0-9]+)/i,
+  );
   if (snapdragonGenMatch) {
     const series = Number(snapdragonGenMatch[1]);
     const gen = Number(snapdragonGenMatch[2]);
@@ -183,7 +195,9 @@ const scoreChipset = (processorText, chipsetRules) => {
     return 58;
   }
 
-  const appleMatch = text.match(/apple\s*a([0-9]{2})|a([0-9]{2})\s*(pro|bionic)?/i);
+  const appleMatch = text.match(
+    /apple\s*a([0-9]{2})|a([0-9]{2})\s*(pro|bionic)?/i,
+  );
   if (appleMatch) {
     const chipNum = Number(appleMatch[1] || appleMatch[2]);
     return clamp(74 + (chipNum - 14) * 4, 70, 99);
@@ -259,7 +273,9 @@ const collectMegapixelValues = (value, bucket) => {
     return;
   }
   if (typeof value === "object") {
-    Object.values(value).forEach((nested) => collectMegapixelValues(nested, bucket));
+    Object.values(value).forEach((nested) =>
+      collectMegapixelValues(nested, bucket),
+    );
   }
 };
 
@@ -278,7 +294,8 @@ const countCameraSensors = (camera) => {
   const source = toObject(camera);
   const rear = source.rear_camera;
   if (rear && typeof rear === "object" && !Array.isArray(rear)) {
-    return Object.entries(rear).filter(([, val]) => val != null && val !== "").length;
+    return Object.entries(rear).filter(([, val]) => val != null && val !== "")
+      .length;
   }
   if (Array.isArray(rear)) return rear.filter(Boolean).length;
 
@@ -333,7 +350,9 @@ const pickVariant = (variants, selection) => {
     if (byId) return byId;
   }
 
-  const variantIndex = Number(selection?.variant_index ?? selection?.variantIndex);
+  const variantIndex = Number(
+    selection?.variant_index ?? selection?.variantIndex,
+  );
   if (Number.isInteger(variantIndex) && variantIndex >= 0) {
     return list[variantIndex] || list[0];
   }
@@ -393,7 +412,11 @@ const extractProcessorText = (device) => {
   return "";
 };
 
-const buildCompareRanking = (devices = [], variantSelection = {}, config = {}) => {
+const buildCompareRanking = (
+  devices = [],
+  variantSelection = {},
+  config = {},
+) => {
   const normalizedConfig = normalizeCompareScoreConfig(config);
   const weights = normalizedConfig.weights;
   const chipsetRules = normalizedConfig.chipsetRules;
@@ -456,7 +479,9 @@ const buildCompareRanking = (devices = [], variantSelection = {}, config = {}) =
       valueScore = 45;
     } else if (minValue != null && maxValue != null) {
       if (maxValue === minValue) valueScore = 70;
-      else valueScore = 35 + ((row.valueRaw - minValue) / (maxValue - minValue)) * 65;
+      else
+        valueScore =
+          35 + ((row.valueRaw - minValue) / (maxValue - minValue)) * 65;
     }
 
     const totalScore =
@@ -473,7 +498,8 @@ const buildCompareRanking = (devices = [], variantSelection = {}, config = {}) =
   });
 
   const ranked = [...scoredWithValue].sort((a, b) => {
-    if (b.overallScore !== a.overallScore) return b.overallScore - a.overallScore;
+    if (b.overallScore !== a.overallScore)
+      return b.overallScore - a.overallScore;
     const aPrice = a.price ?? Number.POSITIVE_INFINITY;
     const bPrice = b.price ?? Number.POSITIVE_INFINITY;
     if (aPrice !== bPrice) return aPrice - bPrice;
