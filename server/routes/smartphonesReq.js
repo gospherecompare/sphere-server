@@ -131,7 +131,9 @@ function normalizeSingleSmartphoneBody(rawBody) {
 
 const LAUNCH_STATUS_VALUES = new Set(["upcoming", "preorder", "released"]);
 function normalizeLaunchStatusOverride(value) {
-  const raw = String(value || "").trim().toLowerCase();
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase();
   return LAUNCH_STATUS_VALUES.has(raw) ? raw : null;
 }
 
@@ -213,7 +215,11 @@ router.post("/req", authenticate, async (req, res) => {
     // prepare JSON fields
     const images =
       toArrayValue(pickFirstPresent(b.images, b.images_json)) || [];
-    const build_design = pickSectionObject(b, "build_design", "build_design_json");
+    const build_design = pickSectionObject(
+      b,
+      "build_design",
+      "build_design_json",
+    );
     const display = pickSectionObject(b, "display", "display_json");
     const performance = pickSectionObject(b, "performance", "performance_json");
     const camera = pickSectionObject(b, "camera", "camera_json");
@@ -268,7 +274,7 @@ router.post("/req", authenticate, async (req, res) => {
         ? Boolean(b.published)
         : hasOwn(b, "is_published")
           ? Boolean(b.is_published)
-        : false;
+          : false;
 
     // prevent duplicates
     const modelKey = model.replace(/\s+/g, "").toLowerCase();
@@ -399,10 +405,7 @@ router.post("/req", authenticate, async (req, res) => {
             for (const sp of storePrices) {
               try {
                 const storeName =
-                  sp.store_name ||
-                  sp.store ||
-                  sp.storeName ||
-                  "Store";
+                  sp.store_name || sp.store || sp.storeName || "Store";
                 await client.query(
                   `INSERT INTO variant_store_prices (variant_id, store_name, price, url, offer_text, delivery_info, sale_start_date)
                    VALUES ($1,$2,$3,$4,$5,$6,$7)
@@ -421,7 +424,10 @@ router.post("/req", authenticate, async (req, res) => {
                     sp.offer_text ?? sp.offerText ?? null,
                     sp.delivery_info ?? sp.deliveryInfo ?? null,
                     parseDateForImport(
-                      sp.sale_start_date ?? sp.sale_date ?? sp.saleStartDate ?? null,
+                      sp.sale_start_date ??
+                        sp.sale_date ??
+                        sp.saleStartDate ??
+                        null,
                     ),
                   ],
                 );

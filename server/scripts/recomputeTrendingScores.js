@@ -4,7 +4,7 @@ const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const { db, pool } = require("../db");
-const { recomputeProductTrendingScores } = require("../utils/trendingScore");
+const { recomputeProductTrendingScores } = require("../../utils/trendingScore");
 
 async function main() {
   await db.waitForConnection(
@@ -30,4 +30,3 @@ main()
     }
     process.exit(1);
   });
-
