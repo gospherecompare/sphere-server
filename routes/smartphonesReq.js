@@ -129,9 +129,17 @@ function normalizeSingleSmartphoneBody(rawBody) {
   return { body: base, error: null };
 }
 
-const LAUNCH_STATUS_VALUES = new Set(["upcoming", "preorder", "released"]);
+const LAUNCH_STATUS_VALUES = new Set([
+  "rumored",
+  "announced",
+  "upcoming",
+  "released",
+  "available",
+]);
 function normalizeLaunchStatusOverride(value) {
   const raw = String(value || "").trim().toLowerCase();
+  if (/(upcoming|coming soon|expected|scheduled)/i.test(raw))
+    return "upcoming";
   return LAUNCH_STATUS_VALUES.has(raw) ? raw : null;
 }
 
@@ -247,12 +255,6 @@ router.post("/req", authenticate, async (req, res) => {
         safeJSONParse(b.colors_json),
       ),
     );
-    const officialPreorderUrl =
-      pickFirstPresent(
-        b.official_preorder_url,
-        b.officialPreorderUrl,
-        basicInfo.official_preorder_url,
-      ) || null;
     const launchStatusOverride = normalizeLaunchStatusOverride(
       pickFirstPresent(
         b.launch_status_override,
@@ -283,15 +285,14 @@ router.post("/req", authenticate, async (req, res) => {
 
     await client.query(
       `INSERT INTO smartphones
-         (product_id, category, brand, model, launch_date, official_preorder_url, launch_status_override, images, colors, build_design, display, performance, camera, battery, connectivity, network, ports, audio, multimedia, sensors)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+         (product_id, category, brand, model, launch_date, launch_status_override, images, colors, build_design, display, performance, camera, battery, connectivity, network, ports, audio, multimedia, sensors)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
       [
         productId,
         b.category || null,
         brand_name,
         model,
         parseDateForImport(b.launch_date),
-        officialPreorderUrl,
         launchStatusOverride,
         JSON.stringify(images),
         JSON.stringify(colors),
