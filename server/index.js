@@ -64,6 +64,71 @@ const PROXY_EXTERNAL_BODY_LIMIT =
 const COMPARE_DATA_RETENTION_DAYS = 548;
 const PUBLIC_COMPARE_WINDOW_DAYS = 180;
 const FRESH_COMPARE_WIDGET_DAYS = 7;
+const COMPETITOR_ANALYSIS_REFRESH_DELAY_MS = 1500;
+const COMPETITOR_ANALYSIS_MAX_AGE_MS = Math.max(
+  30 * 60 * 1000,
+  Number(process.env.COMPETITOR_ANALYSIS_MAX_AGE_MS) || 6 * 60 * 60 * 1000,
+);
+
+let competitorAnalysisRefreshTimer = null;
+let competitorAnalysisRefreshRunning = false;
+let competitorAnalysisRefreshPending = false;
+const competitorAnalysisRefreshReasons = new Set();
+
+const runScheduledSmartphoneCompetitorRefresh = async () => {
+  if (competitorAnalysisRefreshRunning) {
+    competitorAnalysisRefreshPending = true;
+    return;
+  }
+
+  competitorAnalysisRefreshRunning = true;
+  competitorAnalysisRefreshPending = false;
+  const reasons = Array.from(competitorAnalysisRefreshReasons);
+  competitorAnalysisRefreshReasons.clear();
+
+  try {
+    const limitRaw = Number(process.env.COMPETITOR_ANALYSIS_LIMIT);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(10, Math.max(1, Math.floor(limitRaw)))
+      : 5;
+    const result = await recomputeSmartphoneCompetitorAnalysis(db, { limit });
+    console.log("Automatic competitor refresh:", { reasons, ...result });
+  } catch (err) {
+    console.error("Automatic competitor refresh failed:", err);
+  } finally {
+    competitorAnalysisRefreshRunning = false;
+    if (
+      competitorAnalysisRefreshPending ||
+      competitorAnalysisRefreshReasons.size > 0
+    ) {
+      competitorAnalysisRefreshTimer = setTimeout(
+        runScheduledSmartphoneCompetitorRefresh,
+        COMPETITOR_ANALYSIS_REFRESH_DELAY_MS,
+      );
+      if (typeof competitorAnalysisRefreshTimer.unref === "function") {
+        competitorAnalysisRefreshTimer.unref();
+      }
+    }
+  }
+};
+
+const scheduleSmartphoneCompetitorRefresh = (reason = "smartphone_changed") => {
+  competitorAnalysisRefreshReasons.add(String(reason || "smartphone_changed"));
+  if (competitorAnalysisRefreshRunning) {
+    competitorAnalysisRefreshPending = true;
+    return;
+  }
+  if (competitorAnalysisRefreshTimer) {
+    clearTimeout(competitorAnalysisRefreshTimer);
+  }
+  competitorAnalysisRefreshTimer = setTimeout(
+    runScheduledSmartphoneCompetitorRefresh,
+    COMPETITOR_ANALYSIS_REFRESH_DELAY_MS,
+  );
+  if (typeof competitorAnalysisRefreshTimer.unref === "function") {
+    competitorAnalysisRefreshTimer.unref();
+  }
+};
 
 const app = express();
 
@@ -408,8 +473,7 @@ function normalizeLaunchStatusOverride(value) {
   if (!raw) return null;
   if (/rumou?r/.test(raw)) return "rumored";
   if (/announce/.test(raw)) return "announced";
-  if (/(upcoming|coming soon|expected|scheduled)/i.test(raw))
-    return "upcoming";
+  if (/(upcoming|coming soon|expected|scheduled)/i.test(raw)) return "upcoming";
   if (/(available|on sale|in stock)/i.test(raw)) return "available";
   if (/(released|launched|out now)/i.test(raw)) return "released";
   if (!LAUNCH_STATUS_VALUES.has(raw)) return null;
@@ -461,8 +525,87 @@ const resolveSmartphoneLaunchStage = (
 
 const SMARTPHONE_COMPARE_LIMIT_DEFAULT = 4;
 const SMARTPHONE_COMPETITOR_LIMIT_DEFAULT = 5;
+const SMARTPHONE_SPEC_SCORE_MIN_IMPORTANT_INPUTS = 10;
+const SMARTPHONE_IMPORTANT_SPEC_PATHS = {
+  processor: ["performance.processor", "processor", "specs.processor"],
+  gpu: ["performance.gpu", "performance.graphics", "specs.gpu"],
+  ram: ["performance.ram", "variants[].ram", "specs.ram"],
+  storage: ["performance.storage", "variants[].storage", "specs.storage"],
+  display_size: ["display.size", "display.display_size", "specs.display_size"],
+  display_resolution: ["display.resolution", "specs.resolution"],
+  refresh_rate: [
+    "display.refresh_rate",
+    "display.refreshRate",
+    "specs.refresh_rate",
+  ],
+  display_type: ["display.type", "display.panel_type", "display.display_type"],
+  rear_camera: [
+    "camera.rear_camera.main_camera.resolution",
+    "camera.rear_camera.main.resolution",
+    "camera.main_camera_megapixels",
+    "camera.main_camera",
+  ],
+  front_camera: [
+    "camera.front_camera.resolution",
+    "camera.front_camera.megapixels",
+    "camera.front_camera_megapixels",
+    "camera.selfie_camera",
+  ],
+  battery_capacity: [
+    "battery.capacity",
+    "battery.battery_capacity",
+    "battery.battery_capacity_mah",
+  ],
+  charging: [
+    "battery.fast_charging",
+    "battery.charging_speed",
+    "battery.charging",
+  ],
+  operating_system: [
+    "performance.operating_system",
+    "performance.operatingSystem",
+    "performance.os",
+  ],
+  network: [
+    "connectivity.network_type",
+    "network.network_type",
+    "network.5g_support",
+  ],
+  weight: ["build_design.weight", "build_design.weight_g", "weight"],
+  protection: [
+    "build_design.ip_rating",
+    "build_design.water_resistance",
+    "display.protection",
+  ],
+};
 
-const resolveSmartphoneLaunchPolicy = (launchStage) => {
+const countSmartphoneImportantSpecInputs = (device) => {
+  if (!device || typeof device !== "object") return 0;
+  return Object.values(SMARTPHONE_IMPORTANT_SPEC_PATHS).filter(
+    (paths) => resolveProfileValueByPaths(device, paths) != null,
+  ).length;
+};
+
+const canShowUpcomingSmartphoneSpecScore = (
+  device,
+  todayIndia = getIndiaDateOnly(),
+) => {
+  const launchDate = normalizeDateOnlyInput(
+    device?.launch_date ?? device?.launchDate ?? null,
+  );
+  if (!launchDate || !todayIndia || launchDate > todayIndia) return false;
+
+  return (
+    countSmartphoneImportantSpecInputs(device) >=
+    SMARTPHONE_SPEC_SCORE_MIN_IMPORTANT_INPUTS
+  );
+};
+
+const resolveSmartphoneLaunchPolicy = (
+  launchStage,
+  device = null,
+  todayIndia = getIndiaDateOnly(),
+) => {
   const stage = normalizeLaunchStatusOverride(launchStage) || "released";
   const base = {
     allow_compare: true,
@@ -472,7 +615,7 @@ const resolveSmartphoneLaunchPolicy = (launchStage) => {
     allow_spec_score: true,
   };
 
-  if (stage === "rumored" || stage === "upcoming") {
+  if (stage === "rumored") {
     return {
       ...base,
       allow_compare: false,
@@ -483,12 +626,23 @@ const resolveSmartphoneLaunchPolicy = (launchStage) => {
     };
   }
 
+  if (stage === "upcoming") {
+    return {
+      ...base,
+      allow_compare: false,
+      allow_competitors: false,
+      compare_limit: 0,
+      competitor_limit: 0,
+      allow_spec_score: canShowUpcomingSmartphoneSpecScore(device, todayIndia),
+    };
+  }
+
   if (stage === "announced") {
     return {
       ...base,
       compare_limit: 2,
       competitor_limit: 2,
-      allow_spec_score: false,
+      allow_spec_score: canShowUpcomingSmartphoneSpecScore(device, todayIndia),
     };
   }
 
@@ -498,7 +652,7 @@ const resolveSmartphoneLaunchPolicy = (launchStage) => {
 const applySmartphoneLaunchPolicy = (item, launchStage) => {
   if (!item) return item;
   const stage = normalizeLaunchStatusOverride(launchStage) || "released";
-  const policy = resolveSmartphoneLaunchPolicy(stage);
+  const policy = resolveSmartphoneLaunchPolicy(stage, item);
   item.allow_compare = policy.allow_compare;
   item.allowCompare = policy.allow_compare;
   item.allow_competitors = policy.allow_competitors;
@@ -708,17 +862,17 @@ const hasSmartphoneStoreEntrySignal = (storePrice) => {
   const item = toPlainObject(storePrice);
   return Boolean(
     hasSmartphonePurchaseSignal(item) ||
-      String(
-        item.store_name ??
-          item.storeName ??
-          item.store ??
-          item.display_store_name ??
-          item.displayStoreName ??
-          item.logo ??
-          item.store_logo ??
-          item.storeLogo ??
-          "",
-      ).trim(),
+    String(
+      item.store_name ??
+        item.storeName ??
+        item.store ??
+        item.display_store_name ??
+        item.displayStoreName ??
+        item.logo ??
+        item.store_logo ??
+        item.storeLogo ??
+        "",
+    ).trim(),
   );
 };
 
@@ -766,9 +920,17 @@ const decorateStorePriceAvailability = (
   return {
     ...item,
     sale_start_date: saleStartDate,
-    availability_status: isUpcomingSale ? "upcoming" : isLive ? "live" : "listed",
+    availability_status: isUpcomingSale
+      ? "upcoming"
+      : isLive
+        ? "live"
+        : "listed",
     is_live: isLive,
-    cta_label: isUpcomingSale ? "Upcoming" : isLive ? "Buy Now" : "View Details",
+    cta_label: isUpcomingSale
+      ? "Upcoming"
+      : isLive
+        ? "Buy Now"
+        : "View Details",
   };
 };
 
@@ -1106,10 +1268,7 @@ const resolveSmartphoneAvailabilityFields = (
       null,
   );
   const saleStartDate = getSmartphoneSaleStartDate(device);
-  const isUpcomingSale = hasFutureSmartphoneSaleDate(
-    saleStartDate,
-    todayIndia,
-  );
+  const isUpcomingSale = hasFutureSmartphoneSaleDate(saleStartDate, todayIndia);
   const availableDate =
     saleStartDate && saleStartDate <= todayIndia ? saleStartDate : null;
   const predictedAvailableDate = isUpcomingSale ? saleStartDate : null;
@@ -12408,6 +12567,7 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
     }
 
     await client.query("COMMIT");
+    scheduleSmartphoneCompetitorRefresh(`smartphone_created:${productId}`);
 
     res.status(201).json({
       message: "Smartphone created successfully",
@@ -15005,6 +15165,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     }
 
     await client.query("COMMIT");
+    scheduleSmartphoneCompetitorRefresh(`smartphone_updated:${productId}`);
     return res.json({
       message: "Smartphone updated successfully",
       data: phoneRes.rows[0],
@@ -15219,6 +15380,7 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
     }
 
     await client.query("COMMIT");
+    scheduleSmartphoneCompetitorRefresh(`smartphone_updated:${productId}`);
     return res.json({
       message: "Smartphone updated successfully",
       data: phoneRes.rows[0],
@@ -16546,9 +16708,10 @@ app.patch("/api/products/:id/publish", authenticate, async (req, res) => {
       return res.status(403).json({ message: "Admin access required" });
     }
 
-    const product = await db.query("SELECT id FROM products WHERE id = $1", [
-      productId,
-    ]);
+    const product = await db.query(
+      "SELECT id, product_type FROM products WHERE id = $1",
+      [productId],
+    );
 
     if (product.rowCount === 0) {
       return res.status(404).json({ message: "Product not found" });
@@ -16567,6 +16730,12 @@ app.patch("/api/products/:id/publish", authenticate, async (req, res) => {
       `,
       [productId, is_published, req.user.id],
     );
+
+    if (product.rows[0]?.product_type === "smartphone") {
+      scheduleSmartphoneCompetitorRefresh(
+        `smartphone_${is_published ? "published" : "unpublished"}:${productId}`,
+      );
+    }
 
     return res.json({
       message: "Publish status updated successfully",
@@ -18590,7 +18759,8 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
     const upcoming = items
       .filter((item) => isSmartphoneUpcomingFeedItem(item, todayIndia))
       .sort((left, right) => {
-        const leftDate = getSmartphoneFeedStartDate(left) || left.launch_date || "";
+        const leftDate =
+          getSmartphoneFeedStartDate(left) || left.launch_date || "";
         const rightDate =
           getSmartphoneFeedStartDate(right) || right.launch_date || "";
         if (leftDate && rightDate && leftDate !== rightDate) {
@@ -23778,8 +23948,19 @@ app.get("/api/public/product/:id/competitors", async (req, res) => {
       return result.rows || [];
     };
 
+    const areCompetitorRowsStale = (items) => {
+      if (!Array.isArray(items) || !items.length) return true;
+      return items.some((row) => {
+        const computedAt = new Date(row?.computed_at || 0).getTime();
+        return (
+          !Number.isFinite(computedAt) ||
+          Date.now() - computedAt > COMPETITOR_ANALYSIS_MAX_AGE_MS
+        );
+      });
+    };
+
     let rows = await fetchRows();
-    if (!rows.length) {
+    if (!rows.length || areCompetitorRowsStale(rows)) {
       try {
         await recomputeSmartphoneCompetitorAnalysis(db, {
           limit,

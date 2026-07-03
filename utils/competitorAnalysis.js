@@ -229,7 +229,7 @@ const parseStorageGb = (value) => {
 
 const scoreProcessorTier = (processorText) => {
   const text = normalizeText(processorText);
-  if (!text) return 45;
+  if (!text) return null;
 
   for (const rule of PROCESSOR_SCORE_RULES) {
     if (rule.pattern.test(text)) return rule.score;
@@ -265,26 +265,44 @@ const scoreProcessorTier = (processorText) => {
 };
 
 const scoreDisplayComposite = (profile) => {
-  const refreshScore =
-    profile.display_refresh_hz == null
-      ? 55
-      : clamp(((profile.display_refresh_hz - 60) / (165 - 60)) * 100, 0, 100);
+  const parts = [];
+  if (profile.display_refresh_hz != null) {
+    parts.push({
+      score: clamp(
+        ((profile.display_refresh_hz - 60) / (165 - 60)) * 100,
+        0,
+        100,
+      ),
+      weight: 0.5,
+    });
+  }
+  if (profile.display_brightness_nits != null) {
+    parts.push({
+      score: clamp(
+        ((profile.display_brightness_nits - 300) / (6000 - 300)) * 100,
+        0,
+        100,
+      ),
+      weight: 0.35,
+    });
+  }
+  if (profile.display_size_in != null) {
+    parts.push({
+      score: clamp(
+        ((profile.display_size_in - 5) / (8 - 5)) * 100,
+        0,
+        100,
+      ),
+      weight: 0.15,
+    });
+  }
 
-  const brightnessScore =
-    profile.display_brightness_nits == null
-      ? 50
-      : clamp(
-          ((profile.display_brightness_nits - 300) / (6000 - 300)) * 100,
-          0,
-          100,
-        );
-
-  const sizeScore =
-    profile.display_size_in == null
-      ? 50
-      : clamp(((profile.display_size_in - 5) / (8 - 5)) * 100, 0, 100);
-
-  return roundOne(refreshScore * 0.5 + brightnessScore * 0.35 + sizeScore * 0.15);
+  if (!parts.length) return null;
+  const weightTotal = parts.reduce((sum, part) => sum + part.weight, 0);
+  return roundOne(
+    parts.reduce((sum, part) => sum + part.score * part.weight, 0) /
+      weightTotal,
+  );
 };
 
 const extractMainCameraMp = (camera) => {
@@ -435,49 +453,62 @@ const buildProfile = (row) => {
   return profile;
 };
 
-const similarityFromDistance = (left, right, scale, fallback = 50) => {
-  if (left == null || right == null) return fallback;
+const similarityFromDistance = (left, right, scale) => {
+  if (left == null || right == null) return null;
   const distance = Math.abs(left - right);
   const score = 100 - (distance / Math.max(scale, 1)) * 100;
   return clamp(score, 0, 100);
 };
 
-const calculateSpecSimilarityScore = (base, candidate) => {
-  const processorSimilarity = similarityFromDistance(
-    base.processor_score,
-    candidate.processor_score,
-    40,
-    50,
-  );
-  const batterySimilarity = similarityFromDistance(
-    base.battery_mah,
-    candidate.battery_mah,
-    2500,
-    50,
-  );
-  const displaySimilarity = similarityFromDistance(
-    base.display_score,
-    candidate.display_score,
-    40,
-    55,
-  );
-  const cameraSimilarity = similarityFromDistance(
-    base.main_camera_mp,
-    candidate.main_camera_mp,
-    150,
-    50,
-  );
+const calculateSpecSimilarity = (base, candidate) => {
+  const parts = [
+    {
+      score: similarityFromDistance(
+        base.processor_score,
+        candidate.processor_score,
+        40,
+      ),
+      weight: SPEC_SIMILARITY_WEIGHTS.processor,
+    },
+    {
+      score: similarityFromDistance(
+        base.battery_mah,
+        candidate.battery_mah,
+        2500,
+      ),
+      weight: SPEC_SIMILARITY_WEIGHTS.battery,
+    },
+    {
+      score: similarityFromDistance(
+        base.display_score,
+        candidate.display_score,
+        40,
+      ),
+      weight: SPEC_SIMILARITY_WEIGHTS.display,
+    },
+    {
+      score: similarityFromDistance(
+        base.main_camera_mp,
+        candidate.main_camera_mp,
+        150,
+      ),
+      weight: SPEC_SIMILARITY_WEIGHTS.camera,
+    },
+  ].filter((part) => Number.isFinite(part.score));
 
-  return roundOne(
-    processorSimilarity * SPEC_SIMILARITY_WEIGHTS.processor +
-      batterySimilarity * SPEC_SIMILARITY_WEIGHTS.battery +
-      displaySimilarity * SPEC_SIMILARITY_WEIGHTS.display +
-      cameraSimilarity * SPEC_SIMILARITY_WEIGHTS.camera,
-  );
+  if (!parts.length) return { score: null, matchedFeatureCount: 0 };
+  const weightTotal = parts.reduce((sum, part) => sum + part.weight, 0);
+  return {
+    score: roundOne(
+      parts.reduce((sum, part) => sum + part.score * part.weight, 0) /
+        weightTotal,
+    ),
+    matchedFeatureCount: parts.length,
+  };
 };
 
 const calculatePriceProximityScore = (basePrice, candidatePrice) => {
-  if (basePrice == null || candidatePrice == null) return 40;
+  if (basePrice == null || candidatePrice == null) return null;
   const distance = Math.abs(basePrice - candidatePrice);
   const tolerance = Math.max(basePrice * 0.22, 5000);
   return roundOne(clamp(100 - (distance / tolerance) * 100, 0, 100));
@@ -590,10 +621,18 @@ const buildReason = (base, candidate, scores) => {
   return parts.slice(0, 2).join(" • ");
 };
 
-const shouldIncludeCandidate = (base, candidate, specSimilarity, compareCount) => {
+const shouldIncludeCandidate = (
+  base,
+  candidate,
+  specSimilarity,
+  matchedFeatureCount,
+  compareCount,
+) => {
   if (base.id === candidate.id) return false;
 
   const hasBothPrices = base.price != null && candidate.price != null;
+  if (matchedFeatureCount < 2 && compareCount <= 0) return false;
+  if (specSimilarity == null && !hasBothPrices && compareCount <= 0) return false;
   if (!hasBothPrices) return true;
 
   const priceGap = Math.abs(base.price - candidate.price);
@@ -614,19 +653,43 @@ const buildTopCompetitors = (base, profiles, compareMap, limit = 3) => {
 
   for (const peer of peers) {
     const pairCount = compareMap.get(compareKey(base.id, peer.id)) || 0;
-    const specSimilarityScore = calculateSpecSimilarityScore(base, peer);
-    if (!shouldIncludeCandidate(base, peer, specSimilarityScore, pairCount)) {
+    const specSimilarity = calculateSpecSimilarity(base, peer);
+    const specSimilarityScore = specSimilarity.score;
+    if (
+      !shouldIncludeCandidate(
+        base,
+        peer,
+        specSimilarityScore,
+        specSimilarity.matchedFeatureCount,
+        pairCount,
+      )
+    ) {
       continue;
     }
 
     const priceProximityScore = calculatePriceProximityScore(base.price, peer.price);
     const compareFrequencyScore =
       maxCompareCount > 0 ? roundOne((pairCount / maxCompareCount) * 100) : 0;
+    const scoreParts = [
+      {
+        score: specSimilarityScore,
+        weight: SCORE_WEIGHTS.specSimilarity,
+      },
+      {
+        score: priceProximityScore,
+        weight: SCORE_WEIGHTS.priceProximity,
+      },
+      {
+        score: maxCompareCount > 0 ? compareFrequencyScore : null,
+        weight: SCORE_WEIGHTS.compareFrequency,
+      },
+    ].filter((part) => Number.isFinite(part.score));
+    if (!scoreParts.length) continue;
 
+    const activeWeight = scoreParts.reduce((sum, part) => sum + part.weight, 0);
     let competitionScore =
-      specSimilarityScore * SCORE_WEIGHTS.specSimilarity +
-      priceProximityScore * SCORE_WEIGHTS.priceProximity +
-      compareFrequencyScore * SCORE_WEIGHTS.compareFrequency;
+      scoreParts.reduce((sum, part) => sum + part.score * part.weight, 0) /
+      activeWeight;
 
     if (base.category && peer.category && base.category === peer.category) {
       competitionScore += 2;
@@ -651,6 +714,8 @@ const buildTopCompetitors = (base, profiles, compareMap, limit = 3) => {
       analysis_json: {
         ...featureInsights,
         compare_count: pairCount,
+        matched_spec_features: specSimilarity.matchedFeatureCount,
+        active_score_weight: roundOne(activeWeight),
         feature_values: {
           base: {
             processor_score: base.processor_score,
