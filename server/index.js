@@ -4015,6 +4015,20 @@ const normalizeBlogTagsInput = (value) => {
   return tags;
 };
 
+const normalizeBlogPublishedAtInput = (value) => {
+  const raw = String(value ?? "").trim();
+  if (!raw) return { value: null, valid: true };
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return { value: null, valid: false };
+  }
+
+  // Keep datetime-local values as text so Postgres TIMESTAMP preserves the
+  // admin-selected wall-clock date/time instead of shifting time zones.
+  return { value: raw, valid: true };
+};
+
 const toSafeFiniteNumber = (value, fallback = 0) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -10552,6 +10566,12 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
     const featured = parseBooleanInput(req.body?.featured);
     const trending = parseBooleanInput(req.body?.trending);
     const pinned = parseBooleanInput(req.body?.pinned);
+    const requestedPublishedAt = normalizeBlogPublishedAtInput(
+      req.body?.published_at ?? req.body?.publishedAt,
+    );
+    if (!requestedPublishedAt.valid) {
+      return res.status(400).json({ message: "published_at is invalid" });
+    }
     const rawAuthorUserId = Number(
       req.body?.author_user_id ?? req.body?.authorUserId,
     );
@@ -10626,7 +10646,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
     const heroImage = String(
       req.body?.hero_image || snapshot?.hero_image || "",
     ).trim();
-    const nowPublishedAt = isPublished ? new Date() : null;
+    const publishedAtForWrite = isPublished ? requestedPublishedAt.value : null;
     const actorId =
       Number.isInteger(Number(req.user?.id)) && Number(req.user?.id) > 0
         ? Number(req.user.id)
@@ -10684,7 +10704,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           author_user_id = $25,
           updated_by = $26,
           published_at = CASE
-            WHEN $8 = 'published' THEN COALESCE(published_at, $27)
+            WHEN $8 = 'published' THEN COALESCE($27::timestamp, published_at, now())
             ELSE NULL
           END,
           updated_at = now()
@@ -10747,7 +10767,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           authorName || null,
           authorUserId,
           actorId,
-          nowPublishedAt,
+          publishedAtForWrite,
         ],
       );
       if (!writeResult.rows.length) {
@@ -10788,7 +10808,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           created_at,
           updated_at
         ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,($7 = 'published'),$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22,$23,$24,$25,$26,$27,now(),now()
+          $1,$2,$3,$4,$5,$6,$7,($7 = 'published'),$8,$9::jsonb,$10::jsonb,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22,$23,$24,$25,$26,CASE WHEN $7 = 'published' THEN COALESCE($27::timestamp, now()) ELSE NULL END,now(),now()
         )
         RETURNING
           id,
@@ -10848,7 +10868,7 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
           authorUserId,
           actorId,
           actorId,
-          nowPublishedAt,
+          publishedAtForWrite,
         ],
       );
     }
@@ -11136,6 +11156,12 @@ app.patch("/api/admin/blogs/:id/publish", authenticate, async (req, res) => {
     const isPublished = parseBooleanInput(
       req.body?.is_published ?? req.body?.isPublished ?? req.body?.publish,
     );
+    const requestedPublishedAt = normalizeBlogPublishedAtInput(
+      req.body?.published_at ?? req.body?.publishedAt,
+    );
+    if (!requestedPublishedAt.valid) {
+      return res.status(400).json({ message: "published_at is invalid" });
+    }
     const existingResult = await db.query(
       `
       SELECT id, content_rendered, content_template
@@ -11176,7 +11202,10 @@ app.patch("/api/admin/blogs/:id/publish", authenticate, async (req, res) => {
       SET
         is_published = $2,
         status = CASE WHEN $2 THEN 'published' ELSE 'draft' END,
-        published_at = CASE WHEN $2 THEN COALESCE(published_at, now()) ELSE NULL END,
+        published_at = CASE
+          WHEN $2 THEN COALESCE($4::timestamp, published_at, now())
+          ELSE NULL
+        END,
         updated_by = $3,
         updated_at = now()
       WHERE id = $1
@@ -11190,7 +11219,7 @@ app.patch("/api/admin/blogs/:id/publish", authenticate, async (req, res) => {
         published_at,
         updated_at
       `,
-      [blogId, isPublished, actorId],
+      [blogId, isPublished, actorId, isPublished ? requestedPublishedAt.value : null],
     );
 
     return res.json({
