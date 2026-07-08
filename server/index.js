@@ -4429,7 +4429,6 @@ const resolveUniqueBlogSlug = async (
     if (!existing.rows.length) return slug;
 
     const existingId = Number(existing.rows[0]?.id);
-    const existingProductId = Number(existing.rows[0]?.product_id);
     if (
       Number.isInteger(Number(blogId)) &&
       Number(blogId) > 0 &&
@@ -4437,7 +4436,6 @@ const resolveUniqueBlogSlug = async (
     ) {
       return slug;
     }
-    if (hasProductId && existingProductId === Number(productId)) return slug;
     slug = `${baseSlug}-${counter}`;
     counter += 1;
   }
@@ -5617,7 +5615,7 @@ async function runMigrations() {
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS blogs (
         id SERIAL PRIMARY KEY,
-        product_id INT UNIQUE
+        product_id INT
           REFERENCES products(id)
           ON DELETE CASCADE,
         title TEXT NOT NULL,
@@ -5658,6 +5656,15 @@ async function runMigrations() {
     await safeQuery(`
       ALTER TABLE blogs
       ALTER COLUMN product_id DROP NOT NULL;
+    `);
+
+    await safeQuery(`
+      ALTER TABLE blogs
+      DROP CONSTRAINT IF EXISTS blogs_product_id_key;
+    `);
+
+    await safeQuery(`
+      DROP INDEX IF EXISTS blogs_product_id_key;
     `);
 
     await safeQuery(`
@@ -10590,14 +10597,6 @@ app.post("/api/admin/blogs", authenticate, async (req, res) => {
     if (!title) return res.status(400).json({ message: "title is required" });
     if (!contentTemplate) {
       return res.status(400).json({ message: "content_template is required" });
-    }
-
-    if (!targetBlogId && productId) {
-      const existingByProduct = await db.query(
-        "SELECT id FROM blogs WHERE product_id = $1 LIMIT 1",
-        [productId],
-      );
-      targetBlogId = Number(existingByProduct.rows[0]?.id) || null;
     }
 
     let snapshot = null;
