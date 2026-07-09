@@ -11218,7 +11218,12 @@ app.patch("/api/admin/blogs/:id/publish", authenticate, async (req, res) => {
         published_at,
         updated_at
       `,
-      [blogId, isPublished, actorId, isPublished ? requestedPublishedAt.value : null],
+      [
+        blogId,
+        isPublished,
+        actorId,
+        isPublished ? requestedPublishedAt.value : null,
+      ],
     );
 
     return res.json({
@@ -11721,6 +11726,196 @@ app.put(
     }
   },
 );
+
+const NEWS_PUBLICATION_NAME = "Hooks";
+const NEWS_PUBLICATION_LANGUAGE = "en";
+const NEWS_FEED_LIMIT = 50;
+
+const getPublicSiteOrigin = () =>
+  normalizeOrigin(
+    process.env.PUBLIC_SITE_ORIGIN ||
+      process.env.CLIENT_SITE_ORIGIN ||
+      "https://tryhook.shop",
+  ) || "https://tryhook.shop";
+
+const escapeXmlText = (value = "") =>
+  String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+const stripMarkupForXml = (value = "") =>
+  String(value || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const clipXmlDescription = (value = "", maxLength = 280) => {
+  const text = stripMarkupForXml(value);
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 3)).replace(/\s+\S*$/, "")}...`;
+};
+
+const toNewsArticleUrl = (slug = "") => {
+  const cleanSlug = String(slug || "").trim().toLowerCase();
+  const origin = getPublicSiteOrigin();
+  return cleanSlug
+    ? `${origin}/news/${encodeURIComponent(cleanSlug)}/`
+    : `${origin}/news/`;
+};
+
+const toAbsolutePublicUrl = (value = "") => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.startsWith("//")) return `https:${raw}`;
+  const origin = getPublicSiteOrigin();
+  return raw.startsWith("/") ? `${origin}${raw}` : `${origin}/${raw}`;
+};
+
+const fetchPublishedNewsRows = async ({ limit = NEWS_FEED_LIMIT, recentOnly = false } = {}) => {
+  const safeLimit = Math.min(1000, Math.max(1, Number(limit) || NEWS_FEED_LIMIT));
+  const whereClauses = ["bl.is_published = true", "NULLIF(BTRIM(bl.slug), '') IS NOT NULL"];
+  const params = [];
+
+  if (recentOnly) {
+    whereClauses.push(
+      "COALESCE(bl.published_at, bl.updated_at, NOW()) >= NOW() - INTERVAL '2 days'",
+    );
+  }
+
+  params.push(safeLimit);
+  const limitParam = params.length;
+
+  const result = await db.query(
+    `
+    SELECT
+      bl.slug,
+      bl.title,
+      bl.excerpt,
+      bl.content_rendered,
+      bl.meta_description,
+      COALESCE(
+        NULLIF(BTRIM(bl.author_name), ''),
+        NULLIF(BTRIM(CONCAT_WS(' ', public_blog_author.first_name, public_blog_author.last_name)), ''),
+        NULLIF(BTRIM(public_blog_author.user_name), ''),
+        NULLIF(BTRIM(public_blog_author.email), '')
+      ) AS author_name,
+      bl.category,
+      bl.hero_image,
+      bl.published_at,
+      bl.updated_at
+    FROM blogs bl
+    LEFT JOIN "user" public_blog_author
+      ON public_blog_author.id = COALESCE(bl.author_user_id, bl.updated_by, bl.created_by)
+    WHERE ${whereClauses.join("\n      AND ")}
+    ORDER BY bl.published_at DESC NULLS LAST, bl.updated_at DESC NULLS LAST
+    LIMIT $${limitParam}
+    `,
+    params,
+  );
+
+  return result.rows || [];
+};
+
+app.get("/news-sitemap.xml", async (_req, res) => {
+  try {
+    const rows = await fetchPublishedNewsRows({ limit: 1000, recentOnly: true });
+    const urls = rows
+      .map((row) => {
+        const title = stripMarkupForXml(row.title);
+        const publishedAt = row.published_at || row.updated_at;
+        if (!row.slug || !title || !publishedAt) return "";
+
+        return `  <url>
+    <loc>${escapeXmlText(toNewsArticleUrl(row.slug))}</loc>
+    <news:news>
+      <news:publication>
+        <news:name>${escapeXmlText(NEWS_PUBLICATION_NAME)}</news:name>
+        <news:language>${NEWS_PUBLICATION_LANGUAGE}</news:language>
+      </news:publication>
+      <news:publication_date>${escapeXmlText(new Date(publishedAt).toISOString())}</news:publication_date>
+      <news:title>${escapeXmlText(title)}</news:title>
+    </news:news>
+  </url>`;
+      })
+      .filter(Boolean)
+      .join("\n");
+
+    res.set("Content-Type", "application/xml; charset=utf-8");
+    res.set("Cache-Control", "public, max-age=300");
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">
+${urls}
+</urlset>
+`);
+  } catch (err) {
+    console.error("GET /news-sitemap.xml error:", err);
+    return res.status(500).type("text/plain").send("Failed to generate news sitemap");
+  }
+});
+
+app.get(["/news.xml", "/news/rss.xml", "/rss.xml"], async (_req, res) => {
+  try {
+    const rows = await fetchPublishedNewsRows({ limit: NEWS_FEED_LIMIT });
+    const origin = getPublicSiteOrigin();
+    const items = rows
+      .map((row) => {
+        const title = stripMarkupForXml(row.title);
+        if (!row.slug || !title) return "";
+
+        const articleUrl = toNewsArticleUrl(row.slug);
+        const description = clipXmlDescription(
+          row.meta_description || row.excerpt || row.content_rendered || title,
+        );
+        const publishedAt = row.published_at || row.updated_at || new Date();
+        const imageUrl = toAbsolutePublicUrl(row.hero_image);
+        const enclosure = imageUrl
+          ? `\n      <enclosure url="${escapeXmlText(imageUrl)}" type="image/jpeg" />`
+          : "";
+
+        return `    <item>
+      <title>${escapeXmlText(title)}</title>
+      <link>${escapeXmlText(articleUrl)}</link>
+      <guid isPermaLink="true">${escapeXmlText(articleUrl)}</guid>
+      <description>${escapeXmlText(description)}</description>
+      <pubDate>${new Date(publishedAt).toUTCString()}</pubDate>
+      <author>${escapeXmlText(row.author_name || NEWS_PUBLICATION_NAME)}</author>
+      <category>${escapeXmlText(row.category || "News")}</category>${enclosure}
+    </item>`;
+      })
+      .filter(Boolean)
+      .join("\n");
+
+    res.set("Content-Type", "application/rss+xml; charset=utf-8");
+    res.set("Cache-Control", "public, max-age=300");
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>${escapeXmlText(NEWS_PUBLICATION_NAME)} News</title>
+    <link>${escapeXmlText(`${origin}/news/`)}</link>
+    <description>Latest technology news, product launches, science updates, and practical guides from Hooks.</description>
+    <language>${NEWS_PUBLICATION_LANGUAGE}</language>
+    <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
+${items}
+  </channel>
+</rss>
+`);
+  } catch (err) {
+    console.error("GET news RSS error:", err);
+    return res.status(500).type("text/plain").send("Failed to generate news feed");
+  }
+});
 
 app.get("/api/public/blogs", async (req, res) => {
   try {
