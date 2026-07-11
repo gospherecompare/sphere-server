@@ -11730,11 +11730,39 @@ app.put(
 const NEWS_PUBLICATION_NAME = "Hooks";
 const NEWS_PUBLICATION_LANGUAGE = "en";
 const NEWS_FEED_LIMIT = 50;
+const SITEMAP_ROUTE_LIMIT = 50000;
+const SITEMAP_CACHE_SECONDS = 300;
+const STATIC_SITEMAP_ROUTES = [
+  "/",
+  "/about",
+  "/careers",
+  "/compare",
+  "/contact",
+  "/news",
+  "/popular-comparisons",
+  "/privacy-policy",
+  "/terms",
+  "/smartphones",
+  "/smartphones/upcoming",
+  "/smartphones/filter/under-10000",
+  "/smartphones/filter/under-15000",
+  "/smartphones/filter/under-20000",
+  "/smartphones/filter/under-30000",
+  "/smartphones/filter/under-50000",
+  "/smartphones/filter/above-50000",
+  "/laptops",
+  "/laptops/latest",
+  "/tvs",
+  "/tvs/latest",
+  "/networking",
+  "/trending/smartphones",
+  "/trending/tvs",
+  "/trending/networking",
+];
 
 const getPublicSiteOrigin = () =>
   normalizeOrigin(
     process.env.PUBLIC_SITE_ORIGIN ||
-      process.env.CLIENT_SITE_ORIGIN ||
       "https://tryhook.shop",
   ) || "https://tryhook.shop";
 
@@ -11744,6 +11772,82 @@ const escapeXmlText = (value = "") =>
     .replace(/"/g, "&quot;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+
+const normalizeSitemapPath = (value = "/") => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+
+  let pathname = raw;
+  try {
+    if (/^https?:\/\//i.test(pathname)) {
+      pathname = new URL(pathname).pathname;
+    }
+  } catch {
+    return "";
+  }
+
+  pathname = pathname.split("#")[0].split("?")[0].trim();
+  if (!pathname) return "";
+  if (!pathname.startsWith("/")) pathname = `/${pathname}`;
+  pathname = pathname.replace(/\/{2,}/g, "/");
+  if (pathname !== "/" && !pathname.endsWith("/")) pathname = `${pathname}/`;
+  return pathname;
+};
+
+const toSitemapPageUrl = (pathValue = "/") => {
+  const origin = getPublicSiteOrigin();
+  const pathname = normalizeSitemapPath(pathValue);
+  if (!pathname) return "";
+  return pathname === "/" ? `${origin}/` : `${origin}${pathname}`;
+};
+
+const toSitemapLastMod = (value = null) => {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) {
+    return new Date().toISOString().slice(0, 10);
+  }
+  return date.toISOString().slice(0, 10);
+};
+
+const getSitemapPriority = (pathValue = "/") => {
+  const pathname = normalizeSitemapPath(pathValue);
+  if (pathname === "/") return "1.0";
+  if (
+    /^\/(smartphones|laptops|tvs|networking|news)\//i.test(pathname) ||
+    /^\/compare\/[^/]+\/$/i.test(pathname)
+  ) {
+    return "0.8";
+  }
+  return "0.7";
+};
+
+const buildSitemapXmlFromEntries = (entries = []) => {
+  const seen = new Set();
+  const urls = [];
+
+  for (const entry of entries) {
+    if (urls.length >= SITEMAP_ROUTE_LIMIT) break;
+    const pathname = normalizeSitemapPath(entry?.path || entry?.route_path || "/");
+    if (!pathname || seen.has(pathname)) continue;
+    seen.add(pathname);
+
+    const loc = toSitemapPageUrl(pathname);
+    if (!loc) continue;
+
+    urls.push(`  <url>
+    <loc>${escapeXmlText(loc)}</loc>
+    <lastmod>${escapeXmlText(toSitemapLastMod(entry?.lastmod || entry?.updated_at || entry?.published_at))}</lastmod>
+    <changefreq>${escapeXmlText(entry?.changefreq || "daily")}</changefreq>
+    <priority>${escapeXmlText(entry?.priority || getSitemapPriority(pathname))}</priority>
+  </url>`);
+  }
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urls.join("\n")}
+</urlset>
+`;
+};
 
 const stripMarkupForXml = (value = "") =>
   String(value || "")
@@ -11827,7 +11931,102 @@ const fetchPublishedNewsRows = async ({ limit = NEWS_FEED_LIMIT, recentOnly = fa
   return result.rows || [];
 };
 
-app.get("/news-sitemap.xml", async (_req, res) => {
+const fetchPublishedProductSitemapRows = async () => {
+  const result = await db.query(
+    `
+    SELECT
+      p.id,
+      p.name,
+      p.product_type,
+      COALESCE(pp.updated_at, p.created_at, NOW()) AS lastmod
+    FROM products p
+    INNER JOIN product_publish pp
+      ON pp.product_id = p.id
+     AND pp.is_published = true
+    WHERE p.product_type IN ('smartphone', 'laptop', 'tv', 'networking')
+      AND NULLIF(BTRIM(p.name), '') IS NOT NULL
+    ORDER BY COALESCE(pp.updated_at, p.created_at, NOW()) DESC, p.id DESC
+    LIMIT $1
+    `,
+    [5000],
+  );
+
+  return (result.rows || [])
+    .map((row) => ({
+      path: buildPublicProductDetailPath(row.product_type, row.name, row.id),
+      lastmod: row.lastmod,
+      priority: "0.8",
+    }))
+    .filter((entry) => entry.path);
+};
+
+const fetchPublishedCompareSitemapRows = async () => {
+  const result = await db.query(
+    `
+    SELECT
+      route_path,
+      COALESCE(published_at, updated_at, generated_at, NOW()) AS lastmod
+    FROM compare_pages
+    WHERE status = 'published'
+      AND NULLIF(BTRIM(route_path), '') IS NOT NULL
+    ORDER BY COALESCE(published_at, updated_at, generated_at, NOW()) DESC, id DESC
+    LIMIT $1
+    `,
+    [300],
+  );
+
+  return (result.rows || [])
+    .map((row) => ({
+      path: row.route_path,
+      lastmod: row.lastmod,
+      priority: "0.8",
+    }))
+    .filter((entry) => entry.path);
+};
+
+const buildDynamicSitemapEntries = async () => {
+  const now = new Date();
+  const staticEntries = STATIC_SITEMAP_ROUTES.map((path) => ({
+    path,
+    lastmod: now,
+    priority: getSitemapPriority(path),
+  }));
+
+  const [newsRows, productEntries, compareEntries] = await Promise.all([
+    fetchPublishedNewsRows({ limit: 5000 }),
+    fetchPublishedProductSitemapRows(),
+    fetchPublishedCompareSitemapRows(),
+  ]);
+
+  const newsEntries = newsRows
+    .map((row) => ({
+      path: normalizeSitemapPath(`/news/${String(row.slug || "").trim().toLowerCase()}`),
+      lastmod: row.updated_at || row.published_at,
+      priority: "0.8",
+    }))
+    .filter((entry) => entry.path);
+
+  return [
+    ...staticEntries,
+    ...newsEntries,
+    ...productEntries,
+    ...compareEntries,
+  ];
+};
+
+app.get(["/sitemap.xml", "/api/sitemap.xml"], async (_req, res) => {
+  try {
+    const entries = await buildDynamicSitemapEntries();
+    res.set("Content-Type", "application/xml; charset=utf-8");
+    res.set("Cache-Control", `public, max-age=${SITEMAP_CACHE_SECONDS}`);
+    return res.send(buildSitemapXmlFromEntries(entries));
+  } catch (err) {
+    console.error("GET /sitemap.xml error:", err);
+    return res.status(500).type("text/plain").send("Failed to generate sitemap");
+  }
+});
+
+app.get(["/news-sitemap.xml", "/api/news-sitemap.xml"], async (_req, res) => {
   try {
     const rows = await fetchPublishedNewsRows({ limit: 1000, recentOnly: true });
     const urls = rows
