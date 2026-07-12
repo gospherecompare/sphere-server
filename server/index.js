@@ -1035,6 +1035,272 @@ const resolveEffectiveSmartphonePrice = (variants, fallbackPrice = null) => {
   return toOfferPriceNumber(fallbackPrice);
 };
 
+const normalizeSmartphoneExpectedPrice = (...values) => {
+  for (const value of values) {
+    const numeric = toOfferPriceNumber(value);
+    if (numeric !== null && numeric > 0) return numeric;
+  }
+  return null;
+};
+
+const normalizeSmartphoneMatchToken = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+const SMARTPHONE_SERIES_STOP_WORDS = new Set([
+  "smartphone",
+  "mobile",
+  "phone",
+  "phones",
+  "india",
+  "edition",
+  "dual",
+  "sim",
+  "5g",
+  "4g",
+  "lte",
+]);
+
+const extractSmartphoneSeriesKey = (device = {}) => {
+  const brand = normalizeSmartphoneMatchToken(
+    device.brand_name || device.brand || "",
+  );
+  const brandWords = new Set(brand.split(/\s+/).filter(Boolean));
+  const haystack = normalizeSmartphoneMatchToken(
+    `${device.model || ""} ${device.name || ""} ${device.product_name || ""}`,
+  );
+  const tokens = haystack
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(
+      (token) =>
+        token &&
+        !brandWords.has(token) &&
+        !SMARTPHONE_SERIES_STOP_WORDS.has(token),
+    );
+
+  return (
+    tokens.find((token) => /[a-z]/.test(token)) || tokens.find(Boolean) || ""
+  );
+};
+
+const resolveSmartphonePriceSegmentKey = (device = {}) => {
+  const explicit = normalizeSmartphoneMatchToken(
+    device.price_segment ||
+      device.priceSegment ||
+      device.segment ||
+      device.category ||
+      "",
+  );
+  if (/\b(entry|basic|starter)\b/.test(explicit)) return "entry";
+  if (/\b(budget|value|affordable)\b/.test(explicit)) return "budget";
+  if (/\b(mid|mainstream)\b/.test(explicit)) return "mid";
+  if (/\b(premium|flagship|ultra)\b/.test(explicit)) return "premium";
+
+  const text = normalizeSmartphoneMatchToken(
+    `${device.brand_name || device.brand || ""} ${device.model || ""} ${
+      device.name || device.product_name || ""
+    }`,
+  );
+  if (/\b(go|core|pop|spark|play)\b/.test(text)) return "entry";
+  if (/\b(lite|narzo|hot|a[0-9]|c[0-9]|y[0-9]|m[0-9])\b/.test(text)) {
+    return "budget";
+  }
+  if (/\b(ultra|fold|flip|pro max|find x|gt pro)\b/.test(text)) {
+    return "premium";
+  }
+  if (/\b(pro|plus|max|edge|reno|nord|gt)\b/.test(text)) return "mid_plus";
+  return "mid";
+};
+
+const roundSmartphoneExpectedPrice = (value) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  const step = numeric >= 50000 ? 5000 : numeric >= 10000 ? 1000 : 500;
+  return Math.max(step, Math.round(numeric / step) * step);
+};
+
+const medianSmartphonePrice = (prices) => {
+  const sorted = prices
+    .map((price) => Number(price))
+    .filter((price) => Number.isFinite(price) && price > 0)
+    .sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
+};
+
+const fetchSmartphoneExpectedPriceCandidates = async () => {
+  const result = await db.query(`
+    SELECT
+      p.id AS product_id,
+      p.name,
+      COALESCE(b.name, s.brand) AS brand_name,
+      s.category,
+      s.model,
+      MIN(NULLIF(sp.price, 0)) AS store_price,
+      MIN(NULLIF(v.base_price, 0)) AS base_price
+    FROM products p
+    INNER JOIN smartphones s
+      ON s.product_id = p.id
+    LEFT JOIN brands b
+      ON b.id = p.brand_id
+    LEFT JOIN product_variants v
+      ON v.product_id = p.id
+    LEFT JOIN variant_store_prices sp
+      ON sp.variant_id = v.id
+    WHERE p.product_type = 'smartphone'
+    GROUP BY p.id, p.name, b.name, s.brand, s.category, s.model
+  `);
+
+  return (result.rows || [])
+    .map((row) => {
+      const price = normalizeSmartphoneExpectedPrice(
+        row.store_price,
+        row.base_price,
+      );
+      if (price === null) return null;
+      return {
+        ...row,
+        price,
+        brandKey: normalizeSmartphoneMatchToken(row.brand_name),
+        seriesKey: extractSmartphoneSeriesKey(row),
+        segmentKey: resolveSmartphonePriceSegmentKey(row),
+      };
+    })
+    .filter(Boolean);
+};
+
+const resolveAlgorithmicSmartphoneExpectedPrice = (
+  device = {},
+  candidates = [],
+) => {
+  const target = {
+    ...device,
+    brandKey: normalizeSmartphoneMatchToken(
+      device.brand_name || device.brand || "",
+    ),
+    seriesKey: extractSmartphoneSeriesKey(device),
+    segmentKey: resolveSmartphonePriceSegmentKey(device),
+  };
+
+  const scored = (Array.isArray(candidates) ? candidates : [])
+    .filter((candidate) => candidate?.product_id !== device?.product_id)
+    .map((candidate) => {
+      let score = 0;
+      if (target.brandKey && candidate.brandKey === target.brandKey) score += 4;
+      if (target.seriesKey && candidate.seriesKey === target.seriesKey) {
+        score += 4;
+      }
+      if (target.segmentKey && candidate.segmentKey === target.segmentKey) {
+        score += 2;
+      }
+      if (
+        target.brandKey &&
+        target.seriesKey &&
+        candidate.brandKey === target.brandKey &&
+        candidate.seriesKey === target.seriesKey
+      ) {
+        score += 2;
+      }
+      return { ...candidate, score };
+    })
+    .filter((candidate) => candidate.score >= 2)
+    .sort((a, b) => b.score - a.score || a.price - b.price);
+
+  if (!scored.length) return null;
+
+  const maxScore = scored[0].score;
+  const selected = scored
+    .filter((candidate) => candidate.score >= Math.max(2, maxScore - 1))
+    .slice(0, 12);
+  const rounded = roundSmartphoneExpectedPrice(
+    medianSmartphonePrice(selected.map((candidate) => candidate.price)),
+  );
+  if (!rounded) return null;
+
+  return {
+    value: rounded,
+    source: "algorithm",
+    basis:
+      maxScore >= 10
+        ? "brand_series_segment"
+        : maxScore >= 8
+          ? "brand_series"
+          : maxScore >= 6
+            ? "brand_segment"
+            : "market_segment",
+    confidence: maxScore >= 8 ? "medium" : "low",
+    matches: selected.length,
+  };
+};
+
+const applySmartphoneExpectedPrice = (
+  item,
+  { effectivePrice = null, candidates = [] } = {},
+) => {
+  if (!item || typeof item !== "object") return item;
+
+  const originalPrice = normalizeSmartphoneExpectedPrice(
+    effectivePrice,
+    item.price,
+    item.starting_price,
+    item.best_price,
+    item.lowest_price,
+  );
+  if (originalPrice !== null) {
+    item.original_price = originalPrice;
+    item.has_original_price = true;
+    item.price_source = "original";
+    return item;
+  }
+
+  const manualExpectedPrice = normalizeSmartphoneExpectedPrice(
+    item.expected_price,
+    item.expectedPrice,
+    item.manual_expected_price,
+    item.manualExpectedPrice,
+  );
+  if (manualExpectedPrice !== null) {
+    item.expected_price = manualExpectedPrice;
+    item.expectedPrice = manualExpectedPrice;
+    item.expected_price_source = "manual";
+    item.expectedPriceSource = "manual";
+    item.expected_price_basis = "editor_override";
+    item.expectedPriceBasis = "editor_override";
+    item.price_is_expected = true;
+    item.priceIsExpected = true;
+    item.price_source = "manual_expected";
+    return item;
+  }
+
+  const estimate = resolveAlgorithmicSmartphoneExpectedPrice(item, candidates);
+  if (estimate) {
+    item.expected_price = estimate.value;
+    item.expectedPrice = estimate.value;
+    item.expected_price_source = estimate.source;
+    item.expectedPriceSource = estimate.source;
+    item.expected_price_basis = estimate.basis;
+    item.expectedPriceBasis = estimate.basis;
+    item.expected_price_confidence = estimate.confidence;
+    item.expectedPriceConfidence = estimate.confidence;
+    item.expected_price_matches = estimate.matches;
+    item.expectedPriceMatches = estimate.matches;
+    item.price_is_expected = true;
+    item.priceIsExpected = true;
+    item.price_is_estimated = true;
+    item.priceIsEstimated = true;
+    item.price_source = "algorithm_expected";
+  }
+
+  return item;
+};
+
 function collectSmartphoneStoreRows(device = {}) {
   const rows = [];
 
@@ -4767,6 +5033,7 @@ async function runMigrations() {
         launch_date DATE,
         official_preorder_url TEXT,
         launch_status_override TEXT,
+        expected_price NUMERIC,
         images JSONB,
         colors JSONB,
         build_design JSONB,
@@ -4796,6 +5063,9 @@ async function runMigrations() {
     );
     await safeQuery(
       `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS launch_status_override TEXT;`,
+    );
+    await safeQuery(
+      `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS expected_price NUMERIC;`,
     );
 
     // If older `connectivity_network` column exists, copy its data into `connectivity` (preserve existing connectivity)
@@ -11761,10 +12031,8 @@ const STATIC_SITEMAP_ROUTES = [
 ];
 
 const getPublicSiteOrigin = () =>
-  normalizeOrigin(
-    process.env.PUBLIC_SITE_ORIGIN ||
-      "https://tryhook.shop",
-  ) || "https://tryhook.shop";
+  normalizeOrigin(process.env.PUBLIC_SITE_ORIGIN || "https://tryhook.shop") ||
+  "https://tryhook.shop";
 
 const escapeXmlText = (value = "") =>
   String(value || "")
@@ -11827,7 +12095,9 @@ const buildSitemapXmlFromEntries = (entries = []) => {
 
   for (const entry of entries) {
     if (urls.length >= SITEMAP_ROUTE_LIMIT) break;
-    const pathname = normalizeSitemapPath(entry?.path || entry?.route_path || "/");
+    const pathname = normalizeSitemapPath(
+      entry?.path || entry?.route_path || "/",
+    );
     if (!pathname || seen.has(pathname)) continue;
     seen.add(pathname);
 
@@ -11870,7 +12140,9 @@ const clipXmlDescription = (value = "", maxLength = 280) => {
 };
 
 const toNewsArticleUrl = (slug = "") => {
-  const cleanSlug = String(slug || "").trim().toLowerCase();
+  const cleanSlug = String(slug || "")
+    .trim()
+    .toLowerCase();
   const origin = getPublicSiteOrigin();
   return cleanSlug
     ? `${origin}/news/${encodeURIComponent(cleanSlug)}/`
@@ -11886,9 +12158,18 @@ const toAbsolutePublicUrl = (value = "") => {
   return raw.startsWith("/") ? `${origin}${raw}` : `${origin}/${raw}`;
 };
 
-const fetchPublishedNewsRows = async ({ limit = NEWS_FEED_LIMIT, recentOnly = false } = {}) => {
-  const safeLimit = Math.min(1000, Math.max(1, Number(limit) || NEWS_FEED_LIMIT));
-  const whereClauses = ["bl.is_published = true", "NULLIF(BTRIM(bl.slug), '') IS NOT NULL"];
+const fetchPublishedNewsRows = async ({
+  limit = NEWS_FEED_LIMIT,
+  recentOnly = false,
+} = {}) => {
+  const safeLimit = Math.min(
+    1000,
+    Math.max(1, Number(limit) || NEWS_FEED_LIMIT),
+  );
+  const whereClauses = [
+    "bl.is_published = true",
+    "NULLIF(BTRIM(bl.slug), '') IS NOT NULL",
+  ];
   const params = [];
 
   if (recentOnly) {
@@ -12000,7 +12281,11 @@ const buildDynamicSitemapEntries = async () => {
 
   const newsEntries = newsRows
     .map((row) => ({
-      path: normalizeSitemapPath(`/news/${String(row.slug || "").trim().toLowerCase()}`),
+      path: normalizeSitemapPath(
+        `/news/${String(row.slug || "")
+          .trim()
+          .toLowerCase()}`,
+      ),
       lastmod: row.updated_at || row.published_at,
       priority: "0.8",
     }))
@@ -12022,13 +12307,19 @@ app.get(["/sitemap.xml", "/api/sitemap.xml"], async (_req, res) => {
     return res.send(buildSitemapXmlFromEntries(entries));
   } catch (err) {
     console.error("GET /sitemap.xml error:", err);
-    return res.status(500).type("text/plain").send("Failed to generate sitemap");
+    return res
+      .status(500)
+      .type("text/plain")
+      .send("Failed to generate sitemap");
   }
 });
 
 app.get(["/news-sitemap.xml", "/api/news-sitemap.xml"], async (_req, res) => {
   try {
-    const rows = await fetchPublishedNewsRows({ limit: 1000, recentOnly: true });
+    const rows = await fetchPublishedNewsRows({
+      limit: 1000,
+      recentOnly: true,
+    });
     const urls = rows
       .map((row) => {
         const title = stripMarkupForXml(row.title);
@@ -12060,7 +12351,10 @@ ${urls}
 `);
   } catch (err) {
     console.error("GET /news-sitemap.xml error:", err);
-    return res.status(500).type("text/plain").send("Failed to generate news sitemap");
+    return res
+      .status(500)
+      .type("text/plain")
+      .send("Failed to generate news sitemap");
   }
 });
 
@@ -12112,7 +12406,10 @@ ${items}
 `);
   } catch (err) {
     console.error("GET news RSS error:", err);
-    return res.status(500).type("text/plain").send("Failed to generate news feed");
+    return res
+      .status(500)
+      .type("text/plain")
+      .send("Failed to generate news feed");
   }
 });
 
@@ -12840,6 +13137,16 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
         req.body.launchStatusOverride,
     );
 
+    // Manual "expected price" override supplied by the editor when creating a
+    // device (e.g. an unreleased phone with no confirmed price yet). If left
+    // blank, GET endpoints fall back to the brand/series/segment algorithm.
+    const manualExpectedPriceInput = normalizeSmartphoneExpectedPrice(
+      smartphone?.expected_price,
+      smartphone?.expectedPrice,
+      req.body.expected_price,
+      req.body.expectedPrice,
+    );
+
     /* ---------- 2. INSERT SMARTPHONE ---------- */
     const smartphoneRes = await client.query(
       `
@@ -12848,13 +13155,13 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
         launch_status_override,
         images, colors, build_design, display, performance,
         camera, battery, connectivity, network,
-        ports, audio, multimedia, sensors
+        ports, audio, multimedia, sensors, expected_price
       )
       VALUES (
         $1,$2,$3,$4,$5,
         $6,
         $7,$8,$9,$10,$11,
-        $12,$13,$14,$15,$16,$17,$18,$19
+        $12,$13,$14,$15,$16,$17,$18,$19,$20
       )
       RETURNING id
       `,
@@ -12881,6 +13188,7 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
         smartphone.sensors === null
           ? null
           : JSON.stringify(smartphone.sensors || []),
+        manualExpectedPriceInput,
       ],
     );
 
@@ -13083,6 +13391,7 @@ app.get("/api/smartphones", async (req, res) => {
         s.multimedia,
         s.sensors,
         s.created_at,
+        s.expected_price,
 
         /* ---------- Hook Dynamic Score ---------- */
         MAX(ds.hook_score) AS hook_score,
@@ -13157,7 +13466,8 @@ app.get("/api/smartphones", async (req, res) => {
         s.category, s.model, s.launch_date, s.launch_status_override,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
-        s.ports, s.audio, s.multimedia, s.sensors, s.created_at
+        s.ports, s.audio, s.multimedia, s.sensors, s.created_at,
+        s.expected_price
 
       ORDER BY COALESCE(MAX(ds.hook_score), 0) DESC, p.id DESC;
     `);
@@ -13184,6 +13494,8 @@ app.get("/api/smartphones", async (req, res) => {
 
     const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
     const todayIndia = getIndiaDateOnly();
+    const expectedPriceCandidates =
+      await fetchSmartphoneExpectedPriceCandidates();
     const smartphones = applySpecScoreToRows(
       "smartphone",
       (result.rows || []).map((row) => {
@@ -13205,10 +13517,15 @@ app.get("/api/smartphones", async (req, res) => {
         }));
         item.variants = variants;
         item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
-        item.price = resolveEffectiveSmartphonePrice(
+        const effectivePrice = resolveEffectiveSmartphonePrice(
           variants,
           item.price ?? null,
         );
+        item.price = effectivePrice;
+        applySmartphoneExpectedPrice(item, {
+          effectivePrice,
+          candidates: expectedPriceCandidates,
+        });
         applySmartphoneAvailabilityDetails(
           item,
           availabilityForecast,
@@ -13310,6 +13627,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         s.multimedia,
         s.sensors,
         s.created_at,
+        s.expected_price,
 
         COALESCE(pub.is_published, false) AS is_published,
 
@@ -13378,13 +13696,16 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         s.category, s.model, s.launch_date, s.launch_status_override,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
-        s.ports, s.audio, s.multimedia, s.sensors, s.created_at, pub.is_published
+        s.ports, s.audio, s.multimedia, s.sensors, s.created_at, pub.is_published,
+        s.expected_price
 
       ORDER BY p.id DESC;
     `);
 
     const todayIndia = getIndiaDateOnly();
     const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
+    const expectedPriceCandidates =
+      await fetchSmartphoneExpectedPriceCandidates();
     const smartphones = applySpecScoreToRows(
       "smartphone",
       (result.rows || []).map((row) => {
@@ -13399,10 +13720,15 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         }));
         item.variants = variants;
         item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
-        item.price = resolveEffectiveSmartphonePrice(
+        const effectivePrice = resolveEffectiveSmartphonePrice(
           variants,
           item.price ?? null,
         );
+        item.price = effectivePrice;
+        applySmartphoneExpectedPrice(item, {
+          effectivePrice,
+          candidates: expectedPriceCandidates,
+        });
         applySmartphoneAvailabilityDetails(
           item,
           availabilityForecast,
@@ -13549,10 +13875,17 @@ app.get("/api/smartphone/:id", async (req, res) => {
     sanitized.brand_website = productBrandWebsite || null;
     sanitized.launch_date = smartphone.launch_date || null;
     sanitized.created_at = smartphone.created_at || null;
-    sanitized.price = resolveEffectiveSmartphonePrice(
+    const detailEffectivePrice = resolveEffectiveSmartphonePrice(
       variants,
       sanitized.price,
     );
+    sanitized.price = detailEffectivePrice;
+    const expectedPriceCandidates =
+      await fetchSmartphoneExpectedPriceCandidates();
+    applySmartphoneExpectedPrice(sanitized, {
+      effectivePrice: detailEffectivePrice,
+      candidates: expectedPriceCandidates,
+    });
     const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
     applySmartphoneAvailabilityDetails(
       sanitized,
@@ -15195,6 +15528,17 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
         req.body.smartphone?.launchStatusOverride,
     );
 
+    // Manual "expected price" override from the edit form. Sending an empty
+    // string / null clears the override so the algorithm takes back over;
+    // omitting the field entirely leaves the existing stored value untouched.
+    const expectedPriceProvided =
+      req.body.expected_price !== undefined ||
+      req.body.expectedPrice !== undefined;
+    const manualExpectedPriceInput = normalizeSmartphoneExpectedPrice(
+      req.body.expected_price,
+      req.body.expectedPrice,
+    );
+
     /* ---------- UPDATE SMARTPHONE (PARENT) ---------- */
     const updatePhoneSQL = `
       UPDATE smartphones SET
@@ -15202,8 +15546,9 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
         launch_status_override=$5,
         images=$6, colors=$7, build_design=$8, display=$9, performance=$10,
         camera=$11, battery=$12, connectivity=$13, network=$14, ports=$15,
-        audio=$16, multimedia=$17, sensors=$18
-      WHERE id=$19
+        audio=$16, multimedia=$17, sensors=$18,
+        expected_price = CASE WHEN $20 THEN $19 ELSE expected_price END
+      WHERE id=$21
       RETURNING *;
     `;
 
@@ -15226,6 +15571,8 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       JSON.stringify(req.body.audio || {}),
       JSON.stringify(req.body.multimedia || {}),
       req.body.sensors === null ? null : JSON.stringify(req.body.sensors || []),
+      manualExpectedPriceInput,
+      expectedPriceProvided,
       sid,
     ]);
 
@@ -15685,6 +16032,13 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
     const launchStatusOverride = normalizeLaunchStatusOverride(
       b.launch_status_override || b.launchStatusOverride,
     );
+    const expectedPriceProvided =
+      Object.prototype.hasOwnProperty.call(b, "expected_price") ||
+      Object.prototype.hasOwnProperty.call(b, "expectedPrice");
+    const manualExpectedPriceInput = normalizeSmartphoneExpectedPrice(
+      b.expected_price,
+      b.expectedPrice,
+    );
 
     const images =
       safeJSONParse(b.images_json) || safeJSONParse(b.images) || [];
@@ -15733,8 +16087,9 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
         launch_status_override=$5,
         images=$6, colors=$7, build_design=$8, display=$9, performance=$10,
         camera=$11, battery=$12, connectivity=$13, network=$14, ports=$15,
-        audio=$16, multimedia=$17, sensors=$18
-      WHERE id=$19
+        audio=$16, multimedia=$17, sensors=$18,
+        expected_price = CASE WHEN $20 THEN $19 ELSE expected_price END
+      WHERE id=$21
       RETURNING *;
     `;
 
@@ -15757,6 +16112,8 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
       JSON.stringify(audio),
       JSON.stringify(multimedia),
       sensors,
+      manualExpectedPriceInput,
+      expectedPriceProvided,
       sid,
     ]);
 
@@ -18819,6 +19176,7 @@ const handleTrendingSmartphones = async (req, res) => {
         s.audio,
         s.multimedia,
         s.sensors,
+        s.expected_price,
         MAX(ts.trending_score) AS trending_score,
         MAX(ts.views_7d) AS views_7d,
         MAX(ts.views_prev_7d) AS views_prev_7d,
@@ -18923,7 +19281,8 @@ const handleTrendingSmartphones = async (req, res) => {
         s.build_design,
         s.audio,
         s.multimedia,
-        s.sensors
+        s.sensors,
+        s.expected_price
       ORDER BY
         COALESCE(MAX(ts.manual_priority), 0) DESC,
         COALESCE(MAX((ts.manual_boost)::int), 0) DESC,
@@ -18972,6 +19331,7 @@ const handleTrendingSmartphones = async (req, res) => {
           variants: [],
           price: row.starting_price ?? null,
           starting_price: row.starting_price ?? null,
+          expected_price: row.expected_price ?? null,
           ram: combineMemoryValues(row.ram_values || []),
           storage: combineMemoryValues(row.storage_values || []),
           trend_score: trendScore,
@@ -19005,6 +19365,8 @@ const handleTrendingSmartphones = async (req, res) => {
 
     const todayIndia = getIndiaDateOnly();
     const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
+    const expectedPriceCandidates =
+      await fetchSmartphoneExpectedPriceCandidates();
     for (const item of trending) {
       const variantsRes = await db.query(
         `SELECT id, variant_key, attributes->>'ram' AS ram, attributes->>'storage' AS storage, base_price
@@ -19035,6 +19397,10 @@ const handleTrendingSmartphones = async (req, res) => {
       item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
       item.price = effectivePrice;
       item.starting_price = effectivePrice;
+      applySmartphoneExpectedPrice(item, {
+        effectivePrice,
+        candidates: expectedPriceCandidates,
+      });
       applySmartphoneAvailabilityDetails(
         item,
         availabilityForecast,
@@ -19101,6 +19467,7 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
         s.battery,
         s.connectivity,
         s.network,
+        s.expected_price,
         (
           SELECT pi.image_url
           FROM product_images pi
@@ -19134,6 +19501,8 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
 
     const todayIndia = getIndiaDateOnly();
     const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
+    const expectedPriceCandidates =
+      await fetchSmartphoneExpectedPriceCandidates();
     for (const item of items) {
       const variantsRes = await db.query(
         `SELECT id, variant_key, attributes->>'ram' AS ram, attributes->>'storage' AS storage, base_price
@@ -19164,6 +19533,12 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
       item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
       item.price = effectivePrice;
       item.starting_price = effectivePrice;
+      // No confirmed price yet (common for upcoming/unreleased phones):
+      // fall back to a brand + series + segment matched estimate.
+      applySmartphoneExpectedPrice(item, {
+        effectivePrice,
+        candidates: expectedPriceCandidates,
+      });
       applySmartphoneAvailabilityDetails(
         item,
         availabilityForecast,
@@ -19990,6 +20365,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
         s.battery,
         s.connectivity,
         s.network,
+        s.expected_price,
         (
           SELECT pi.image_url
           FROM product_images pi
@@ -20024,6 +20400,8 @@ app.get("/api/public/new/smartphones", async (req, res) => {
 
     const todayIndia = getIndiaDateOnly();
     const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
+    const expectedPriceCandidates =
+      await fetchSmartphoneExpectedPriceCandidates();
     for (const item of launches) {
       const variantsRes = await db.query(
         `SELECT id, variant_key, attributes->>'ram' AS ram, attributes->>'storage' AS storage, base_price
@@ -20054,6 +20432,10 @@ app.get("/api/public/new/smartphones", async (req, res) => {
       item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
       item.price = effectivePrice;
       item.starting_price = effectivePrice;
+      applySmartphoneExpectedPrice(item, {
+        effectivePrice,
+        candidates: expectedPriceCandidates,
+      });
       applySmartphoneAvailabilityDetails(
         item,
         availabilityForecast,

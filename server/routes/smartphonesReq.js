@@ -153,6 +153,7 @@ router.post("/req", authenticate, async (req, res) => {
 
   const b = normalizedRequest.body || {};
   const product = isPlainObject(b.product) ? b.product : {};
+  const smartphonePayload = isPlainObject(b.smartphone) ? b.smartphone : {};
   const basicInfo = pickSectionObject(b, "basic_info_json");
 
   const product_name = String(
@@ -267,6 +268,20 @@ router.post("/req", authenticate, async (req, res) => {
         b.launchStatusOverride,
         b.launch_status,
         b.launchStatus,
+        smartphonePayload.launch_status_override,
+        smartphonePayload.launchStatusOverride,
+      ),
+    );
+    const expectedPrice = toNumericPrice(
+      pickFirstPresent(
+        b.expected_price,
+        b.expectedPrice,
+        b.manual_expected_price,
+        b.manualExpectedPrice,
+        smartphonePayload.expected_price,
+        smartphonePayload.expectedPrice,
+        smartphonePayload.manual_expected_price,
+        smartphonePayload.manualExpectedPrice,
       ),
     );
 
@@ -291,8 +306,8 @@ router.post("/req", authenticate, async (req, res) => {
 
     await client.query(
       `INSERT INTO smartphones
-         (product_id, category, brand, model, launch_date, launch_status_override, images, colors, build_design, display, performance, camera, battery, connectivity, network, ports, audio, multimedia, sensors)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+         (product_id, category, brand, model, launch_date, launch_status_override, expected_price, images, colors, build_design, display, performance, camera, battery, connectivity, network, ports, audio, multimedia, sensors)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
       [
         productId,
         b.category || null,
@@ -300,6 +315,7 @@ router.post("/req", authenticate, async (req, res) => {
         model,
         parseDateForImport(b.launch_date),
         launchStatusOverride,
+        expectedPrice && expectedPrice > 0 ? expectedPrice : null,
         JSON.stringify(images),
         JSON.stringify(colors),
         JSON.stringify(build_design),
