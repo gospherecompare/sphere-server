@@ -4816,6 +4816,57 @@ const readBlogPrimaryProductId = async (clientOrDb, blogId) => {
   return Number(result.rows[0]?.product_id) || null;
 };
 
+const syncComparePagesForPrimaryProduct = async (
+  productId,
+  { days = 365, limit = 18 } = {},
+) => {
+  const normalizedProductId = Number(productId);
+  if (!Number.isInteger(normalizedProductId) || normalizedProductId <= 0) {
+    return null;
+  }
+
+  const productResult = await db.query(
+    `
+    SELECT p.id
+    FROM products p
+    INNER JOIN product_publish pub
+      ON pub.product_id = p.id
+     AND pub.is_published = true
+    WHERE p.product_type = 'smartphone'
+      AND p.id = $1
+    LIMIT 1
+    `,
+    [normalizedProductId],
+  );
+  const primaryProductId = Number(productResult.rows?.[0]?.id);
+  if (!Number.isInteger(primaryProductId) || primaryProductId <= 0) return null;
+
+  return syncAutomaticComparePages({
+    days,
+    limit,
+    primaryProductId,
+  });
+};
+
+const syncComparePagesForPublishedBlog = async (
+  blogId,
+  fallbackProductId = null,
+) => {
+  const linkedProductIds = await readBlogLinkedProductIds(
+    db,
+    blogId,
+    fallbackProductId,
+  );
+  if (!linkedProductIds.length) return null;
+
+  for (const productId of linkedProductIds) {
+    const result = await syncComparePagesForPrimaryProduct(productId);
+    if (result) return result;
+  }
+
+  return null;
+};
+
 const mapBlogLinkRows = (rows = []) =>
   (rows || []).map((row) => ({
     id: Number(row.id) || null,
@@ -11100,11 +11151,31 @@ app.patch("/api/admin/blogs/:id/publish", authenticate, async (req, res) => {
       ],
     );
 
+    let compareSyncResult = null;
+    if (isPublished) {
+      try {
+        compareSyncResult = await syncComparePagesForPublishedBlog(
+          blogId,
+          updateResult.rows[0]?.product_id,
+        );
+      } catch (syncErr) {
+        console.error(
+          "Failed to sync compare pages for published blog:",
+          syncErr,
+        );
+        compareSyncResult = {
+          ok: false,
+          message: "Article published, but compare sync needs retry",
+        };
+      }
+    }
+
     return res.json({
       message: isPublished
         ? "Blog published successfully"
         : "Blog unpublished successfully",
       blog: updateResult.rows[0],
+      compare_sync: compareSyncResult,
     });
   } catch (err) {
     console.error("PATCH /api/admin/blogs/:id/publish error:", err);
@@ -17019,15 +17090,31 @@ app.patch("/api/products/:id/publish", authenticate, async (req, res) => {
       [productId, is_published, req.user.id],
     );
 
+    let compareSyncResult = null;
     if (product.rows[0]?.product_type === "smartphone") {
       scheduleSmartphoneCompetitorRefresh(
         `smartphone_${is_published ? "published" : "unpublished"}:${productId}`,
       );
+      if (is_published) {
+        try {
+          compareSyncResult = await syncComparePagesForPrimaryProduct(productId);
+        } catch (syncErr) {
+          console.error(
+            "Failed to sync compare pages for published smartphone:",
+            syncErr,
+          );
+          compareSyncResult = {
+            ok: false,
+            message: "Product published, but compare sync needs retry",
+          };
+        }
+      }
     }
 
     return res.json({
       message: "Publish status updated successfully",
       data: result.rows[0],
+      compare_sync: compareSyncResult,
     });
   } catch (err) {
     console.error("PATCH publish error:", err);
@@ -22016,16 +22103,845 @@ const fetchComparePageProductsByIds = async (productIds = []) => {
   }));
 };
 
-const fetchAutomaticComparePageCandidates = async ({
+const AUTO_COMPARE_MAX_DEVICES = 3;
+const AUTO_COMPARE_MARKET_POOL_LIMIT = 240;
+const AUTO_COMPARE_PRIMARY_LIMIT = 70;
+const AUTO_COMPARE_CANDIDATES_PER_PRIMARY = 2;
+const AUTO_COMPARE_MIN_PAIR_SCORE = 46;
+const AUTO_COMPARE_STRONG_PAIR_SCORE = 60;
+
+const normalizeCompareMarketDate = (value) => {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setHours(0, 0, 0, 0);
+  return date;
+};
+
+const compareMarketDaysBetween = (left, right) => {
+  const leftDate = normalizeCompareMarketDate(left);
+  const rightDate = normalizeCompareMarketDate(right);
+  if (!leftDate || !rightDate) return null;
+  return Math.abs(leftDate.getTime() - rightDate.getTime()) / 86400000;
+};
+
+const compareMarketDaysSince = (value) => {
+  const date = normalizeCompareMarketDate(value);
+  if (!date) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return (today.getTime() - date.getTime()) / 86400000;
+};
+
+const normalizeCompareMarketBrandKey = (value) =>
+  normalizeSmartphoneMatchToken(value).replace(/\s+/g, " ");
+
+const resolveCompareMarketSegmentKey = (device = {}) => {
+  const price = toSafeNumeric(
+    device.match_price ??
+      device.best_price ??
+      device.expected_price ??
+      device.price ??
+      device.base_price,
+  );
+  if (price) {
+    if (price <= 10000) return "entry";
+    if (price <= 20000) return "budget";
+    if (price <= 30000) return "lower_mid";
+    if (price <= 45000) return "mid";
+    if (price <= 65000) return "upper_mid";
+    if (price <= 90000) return "premium";
+    if (price <= 130000) return "flagship";
+    return "ultra_flagship";
+  }
+
+  const fallback = resolveSmartphonePriceSegmentKey(device);
+  if (fallback === "mid_plus") return "upper_mid";
+  if (fallback === "premium") return "flagship";
+  return fallback || "unknown";
+};
+
+const compareMarketSegmentDistance = (left, right) => {
+  const order = [
+    "entry",
+    "budget",
+    "lower_mid",
+    "mid",
+    "upper_mid",
+    "premium",
+    "flagship",
+    "ultra_flagship",
+  ];
+  const leftIndex = order.indexOf(left);
+  const rightIndex = order.indexOf(right);
+  if (leftIndex === -1 || rightIndex === -1) return null;
+  return Math.abs(leftIndex - rightIndex);
+};
+
+const extractCompareMarketProcessorKey = (device = {}) => {
+  const performance = toPlainObject(device.performance || device.performance_json);
+  const text = normalizeSmartphoneMatchToken(
+    performance.processor ||
+      performance.cpu ||
+      performance.chipset ||
+      device.processor ||
+      "",
+  );
+  if (!text) return "";
+
+  const snapdragon = text.match(/snapdragon\s*(\d)\s*(?:gen\s*)?(\d+)?/);
+  if (snapdragon) {
+    return `snapdragon-${snapdragon[1]}-${snapdragon[2] || ""}`.replace(
+      /-$/,
+      "",
+    );
+  }
+
+  const dimensity = text.match(/dimensity\s*(\d{3,4})/);
+  if (dimensity) return `dimensity-${dimensity[1].slice(0, 1)}`;
+
+  const helio = text.match(/helio\s*([a-z]\d+)/);
+  if (helio) return `helio-${helio[1]}`;
+
+  return text
+    .split(/\s+/)
+    .filter((token) => !SMARTPHONE_SERIES_STOP_WORDS.has(token))
+    .slice(0, 3)
+    .join("-");
+};
+
+const resolveCompareMarketIntentTags = (device = {}) => {
+  const performance = toPlainObject(device.performance || device.performance_json);
+  const display = toPlainObject(device.display || device.display_json);
+  const camera = toPlainObject(device.camera || device.camera_json);
+  const battery = toPlainObject(device.battery || device.battery_json);
+  const text = normalizeSmartphoneMatchToken(
+    [
+      device.product_name,
+      device.name,
+      device.model,
+      device.category,
+      device.article_text,
+      performance.processor,
+      performance.cpu,
+      performance.chipset,
+      display.type,
+      display.panel_type,
+      display.refresh_rate,
+      camera.main_camera,
+      battery.capacity,
+      battery.battery_capacity,
+      battery.fast_charging,
+    ]
+      .filter(Boolean)
+      .join(" "),
+  );
+
+  const tags = new Set();
+  if (/\b(battery|mah|charging|charge|power)\b/.test(text)) {
+    tags.add("battery");
+  }
+  if (/\b(camera|mp|sony|zeiss|sensor|portrait|selfie)\b/.test(text)) {
+    tags.add("camera");
+  }
+  if (/\b(gaming|performance|snapdragon|dimensity|processor|chipset|gpu)\b/.test(text)) {
+    tags.add("performance");
+  }
+  if (/\b(display|screen|amoled|oled|refresh|hz|brightness)\b/.test(text)) {
+    tags.add("display");
+  }
+  return Array.from(tags);
+};
+
+const buildCompareMarketTechProfile = (device = {}) => ({
+  processorKey: extractCompareMarketProcessorKey(device),
+  processorTier: readSmartphoneProcessorTier(device),
+  ramGb: readSmartphoneRamGb(device),
+  storageGb: readSmartphoneStorageGb(device),
+  batteryMah: readSmartphoneBatteryMah(device),
+  refreshHz: readSmartphoneRefreshRateHz(device),
+  cameraMp: readSmartphoneMainCameraMp(device),
+  intentTags: resolveCompareMarketIntentTags(device),
+});
+
+const countCompareMarketSpecOverlap = (primary = {}, candidate = {}) => {
+  let overlap = 0;
+
+  if (
+    primary.processorKey &&
+    candidate.processorKey &&
+    primary.processorKey === candidate.processorKey
+  ) {
+    overlap += 1;
+  } else if (
+    Number.isFinite(primary.processorTier) &&
+    Number.isFinite(candidate.processorTier) &&
+    Math.abs(primary.processorTier - candidate.processorTier) <= 16
+  ) {
+    overlap += 1;
+  }
+
+  const ramClose =
+    Number.isFinite(primary.ramGb) &&
+    Number.isFinite(candidate.ramGb) &&
+    Math.abs(primary.ramGb - candidate.ramGb) <= 2;
+  const storageClose =
+    Number.isFinite(primary.storageGb) &&
+    Number.isFinite(candidate.storageGb) &&
+    Math.abs(primary.storageGb - candidate.storageGb) <= 128;
+  if (ramClose || storageClose) overlap += 1;
+
+  if (
+    Number.isFinite(primary.batteryMah) &&
+    Number.isFinite(candidate.batteryMah)
+  ) {
+    const diffRatio =
+      Math.abs(primary.batteryMah - candidate.batteryMah) /
+      Math.max(primary.batteryMah, candidate.batteryMah);
+    if (diffRatio <= 0.15) overlap += 1;
+  }
+
+  if (
+    Number.isFinite(primary.refreshHz) &&
+    Number.isFinite(candidate.refreshHz) &&
+    Math.abs(primary.refreshHz - candidate.refreshHz) <= 30
+  ) {
+    overlap += 1;
+  }
+
+  return Math.min(4, overlap);
+};
+
+const scoreCompareMarketCandidate = (primary = {}, candidate = {}, pairStats) => {
+  const primaryId = Number(primary.product_id);
+  const candidateId = Number(candidate.product_id);
+  if (!primaryId || !candidateId || primaryId === candidateId) return null;
+
+  const primaryBrand = normalizeCompareMarketBrandKey(primary.brand_name);
+  const candidateBrand = normalizeCompareMarketBrandKey(candidate.brand_name);
+  const sameBrand = Boolean(primaryBrand && primaryBrand === candidateBrand);
+  const crossBrand = Boolean(primaryBrand && candidateBrand && !sameBrand);
+
+  const primaryPrice = toSafeNumeric(primary.match_price);
+  const candidatePrice = toSafeNumeric(candidate.match_price);
+  const hasBothPrices = Boolean(primaryPrice && candidatePrice);
+  const priceDiffRatio = hasBothPrices
+    ? Math.abs(primaryPrice - candidatePrice) /
+      Math.max(primaryPrice, candidatePrice)
+    : null;
+  let priceScore = 0;
+  if (priceDiffRatio != null) {
+    if (priceDiffRatio <= 0.2) {
+      priceScore = 35 - (priceDiffRatio / 0.2) * 8;
+    } else if (priceDiffRatio <= 0.3) {
+      priceScore = 22 - ((priceDiffRatio - 0.2) / 0.1) * 10;
+    } else if (priceDiffRatio <= 0.45) {
+      priceScore = 8 - ((priceDiffRatio - 0.3) / 0.15) * 8;
+    }
+  }
+
+  const primarySegment = primary.market_segment_key;
+  const candidateSegment = candidate.market_segment_key;
+  const segmentDistance = compareMarketSegmentDistance(
+    primarySegment,
+    candidateSegment,
+  );
+  const segmentScore =
+    segmentDistance === 0 ? 20 : segmentDistance === 1 ? 9 : 0;
+
+  const launchDiffDays = compareMarketDaysBetween(
+    primary.launch_date,
+    candidate.launch_date,
+  );
+  let launchScore = 0;
+  if (launchDiffDays != null) {
+    if (launchDiffDays <= 90) launchScore = 20;
+    else if (launchDiffDays <= 180) launchScore = 12;
+    else if (launchDiffDays <= 365) launchScore = 6;
+  }
+
+  const specOverlapCount = countCompareMarketSpecOverlap(
+    primary.tech_profile,
+    candidate.tech_profile,
+  );
+  const specScore = (specOverlapCount / 4) * 15;
+
+  const crossBrandScore = crossBrand ? 10 : 0;
+  const primarySeries = primary.series_key || "";
+  const candidateSeries = candidate.series_key || "";
+  const seriesBonus =
+    primarySeries && candidateSeries && primarySeries === candidateSeries ? 6 : 0;
+  const userDemandBonus = pairStats
+    ? Math.min(12, Math.log1p(Number(pairStats.compare_count) || 0) * 5)
+    : 0;
+  const intentOverlap = (primary.tech_profile.intentTags || []).filter((tag) =>
+    (candidate.tech_profile.intentTags || []).includes(tag),
+  ).length;
+  const intentBonus = Math.min(4, intentOverlap * 2);
+
+  const score = Math.min(
+    100,
+    priceScore +
+      segmentScore +
+      launchScore +
+      specScore +
+      crossBrandScore +
+      seriesBonus +
+      userDemandBonus +
+      intentBonus,
+  );
+
+  const reasons = [];
+  if (priceDiffRatio != null && priceDiffRatio <= 0.2) {
+    reasons.push("close price");
+  } else if (priceDiffRatio != null && priceDiffRatio <= 0.3) {
+    reasons.push("widened price band");
+  }
+  if (segmentScore >= 20) reasons.push("same segment");
+  if (launchScore >= 20) reasons.push("recent launch window");
+  if (specOverlapCount >= 2) reasons.push("spec overlap");
+  if (crossBrand) reasons.push("cross-brand option");
+  if (seriesBonus) reasons.push("same series");
+  if (pairStats?.compare_count) reasons.push("user demand");
+  if (intentOverlap) reasons.push("same reader intent");
+
+  return {
+    candidate,
+    score: Number(score.toFixed(2)),
+    priceDiffRatio,
+    sameBrand,
+    crossBrand,
+    specOverlapCount,
+    pairStats,
+    reasons,
+  };
+};
+
+const getCompareMarketPairKey = (leftId, rightId) =>
+  [Number(leftId), Number(rightId)]
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .sort((a, b) => a - b)
+    .join("-");
+
+const getCompareMarketPageKey = (productType, items = []) => {
+  const ids = (Array.isArray(items) ? items : [])
+    .map((item) => Number(item?.product_id))
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .sort((a, b) => a - b);
+  return ids.length >= 2 ? `${productType}:${ids.join("-")}` : "";
+};
+
+const getCompareMarketPrimaryPriority = (
+  primary = {},
+  { isFocusedPrimary = false } = {},
+) => {
+  const recencyDays = Number(primary.launch_recency_days);
+  let freshness = 45;
+  if (Number.isFinite(recencyDays)) {
+    if (recencyDays <= 0) freshness = 140;
+    else if (recencyDays <= 14) freshness = 130;
+    else if (recencyDays <= 30) freshness = 115;
+    else if (recencyDays <= 90) freshness = 95;
+    else if (recencyDays <= 180) freshness = 70;
+  }
+
+  const trendBoost = Math.min(15, Number(primary.trend_score || 0) / 10);
+  const compareBoost = Math.min(15, Number(primary.compares_7d || 0) * 3);
+  return (isFocusedPrimary ? 1000 : 0) + freshness + trendBoost + compareBoost;
+};
+
+const selectCompareMarketMatches = (primary = {}, scored = []) => {
+  const strict = scored.filter(
+    (entry) =>
+      entry.score >= AUTO_COMPARE_MIN_PAIR_SCORE &&
+      (entry.priceDiffRatio == null || entry.priceDiffRatio <= 0.2),
+  );
+  const wide = scored.filter(
+    (entry) =>
+      entry.score >= AUTO_COMPARE_MIN_PAIR_SCORE &&
+      (entry.priceDiffRatio == null || entry.priceDiffRatio <= 0.3),
+  );
+  const pool =
+    strict.length >= AUTO_COMPARE_CANDIDATES_PER_PRIMARY
+      ? strict
+      : wide.length >= AUTO_COMPARE_CANDIDATES_PER_PRIMARY
+        ? wide
+        : scored.filter((entry) => entry.score >= AUTO_COMPARE_MIN_PAIR_SCORE);
+  const needsManualReview = pool.length < AUTO_COMPARE_CANDIDATES_PER_PRIMARY;
+  const fallbackPool = pool.length
+    ? pool
+    : scored.filter((entry) => entry.priceDiffRatio == null || entry.priceDiffRatio <= 0.45);
+  const crossBrandQualified = fallbackPool.filter(
+    (entry) => entry.crossBrand && entry.score >= AUTO_COMPARE_MIN_PAIR_SCORE,
+  ).length;
+  const selected = [];
+  let sameBrandCount = 0;
+
+  for (const entry of fallbackPool) {
+    if (
+      entry.sameBrand &&
+      sameBrandCount >= 1 &&
+      crossBrandQualified >= AUTO_COMPARE_CANDIDATES_PER_PRIMARY
+    ) {
+      continue;
+    }
+
+    selected.push(entry);
+    if (entry.sameBrand) sameBrandCount += 1;
+    if (selected.length >= AUTO_COMPARE_CANDIDATES_PER_PRIMARY) break;
+  }
+
+  return {
+    selected,
+    needsManualReview:
+      needsManualReview ||
+      selected.some((entry) => entry.score < AUTO_COMPARE_STRONG_PAIR_SCORE),
+  };
+};
+
+const normalizeCompareMarketPhoneRow = (row = {}, expectedPriceCandidates = []) => {
+  const officialPrice = normalizeSmartphoneExpectedPrice(
+    row.store_price,
+    row.base_price,
+  );
+  const manualExpectedPrice = normalizeSmartphoneExpectedPrice(row.expected_price);
+  let algorithmExpectedPrice = null;
+  let algorithmPriceMeta = null;
+
+  if (officialPrice === null && manualExpectedPrice === null) {
+    algorithmPriceMeta = resolveAlgorithmicSmartphoneExpectedPrice(
+      {
+        product_id: Number(row.product_id),
+        name: row.product_name,
+        product_name: row.product_name,
+        brand_name: row.brand_name || row.smartphone_brand,
+        brand: row.brand_name || row.smartphone_brand,
+        category: row.category,
+        model: row.model,
+      },
+      expectedPriceCandidates,
+    );
+    algorithmExpectedPrice = normalizeSmartphoneExpectedPrice(
+      algorithmPriceMeta?.value,
+    );
+  }
+
+  const matchPrice = officialPrice ?? manualExpectedPrice ?? algorithmExpectedPrice;
+  const priceSource =
+    officialPrice !== null
+      ? "official"
+      : manualExpectedPrice !== null
+        ? "manual_expected"
+        : algorithmExpectedPrice !== null
+          ? "algorithm_expected"
+          : "unknown";
+
+  const device = {
+    product_id: Number(row.product_id),
+    product_name: row.product_name || "Device",
+    name: row.product_name || "Device",
+    product_type: row.product_type || "smartphone",
+    brand_name: row.brand_name || row.smartphone_brand || "",
+    brand: row.brand_name || row.smartphone_brand || "",
+    category: row.category || "",
+    model: row.model || "",
+    launch_date: row.launch_date ? String(row.launch_date).slice(0, 10) : null,
+    best_price: matchPrice,
+    match_price: matchPrice,
+    price_source: priceSource,
+    expected_price:
+      manualExpectedPrice ?? algorithmExpectedPrice ?? row.expected_price ?? null,
+    image_url: row.image_url || null,
+    display: toPlainObject(row.display),
+    performance: toPlainObject(row.performance),
+    camera: toPlainObject(row.camera),
+    battery: toPlainObject(row.battery),
+    variants: Array.isArray(row.variants) ? row.variants : [],
+    article_text: row.article_text || "",
+    trend_score: toSafeNumeric(row.trending_score) || 0,
+    compares_7d: Number(row.compares_7d) || 0,
+    hook_score: toSafeNumeric(row.hook_score) || 0,
+    algorithm_price_meta: algorithmPriceMeta,
+  };
+
+  device.brand_key = normalizeCompareMarketBrandKey(device.brand_name);
+  device.series_key = extractSmartphoneSeriesKey(device);
+  device.market_segment_key = resolveCompareMarketSegmentKey(device);
+  device.tech_profile = buildCompareMarketTechProfile(device);
+  device.launch_recency_days = compareMarketDaysSince(device.launch_date);
+
+  return device;
+};
+
+const fetchCompareMarketSmartphones = async ({
   days = 180,
-  limit = 100,
+  primaryProductId = null,
 } = {}) => {
   const safeDays = Number.isFinite(Number(days))
-    ? Math.min(365, Math.max(7, Math.floor(Number(days))))
+    ? Math.min(730, Math.max(1, Math.floor(Number(days))))
+    : 180;
+  const normalizedPrimaryProductId = Number(primaryProductId);
+  const expectedPriceCandidates = await fetchSmartphoneExpectedPriceCandidates();
+  const result = await db.query(
+    `
+    SELECT
+      p.id AS product_id,
+      p.name AS product_name,
+      p.product_type,
+      b.name AS brand_name,
+      s.brand AS smartphone_brand,
+      s.category,
+      s.model,
+      s.launch_date::date AS launch_date,
+      s.expected_price,
+      s.display,
+      s.performance,
+      s.camera,
+      s.battery,
+      COALESCE(
+        (
+          SELECT MIN(sp.price)::numeric
+          FROM product_variants pv
+          INNER JOIN variant_store_prices sp
+            ON sp.variant_id = pv.id
+          WHERE pv.product_id = p.id
+            AND sp.price IS NOT NULL
+            AND sp.price > 0
+        ),
+        NULL
+      ) AS store_price,
+      (
+        SELECT MIN(pv.base_price)::numeric
+        FROM product_variants pv
+        WHERE pv.product_id = p.id
+          AND pv.base_price IS NOT NULL
+          AND pv.base_price > 0
+      ) AS base_price,
+      (
+        SELECT pi.image_url
+        FROM product_images pi
+        WHERE pi.product_id = p.id
+        ORDER BY pi.position ASC NULLS LAST, pi.id ASC
+        LIMIT 1
+      ) AS image_url,
+      COALESCE(
+        (
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'variant_key', pv.variant_key,
+              'ram', COALESCE(pv.attributes->>'ram', pv.attributes->>'RAM', pv.attributes->>'memory'),
+              'storage', COALESCE(pv.attributes->>'storage', pv.attributes->>'rom', pv.attributes->>'ROM_storage', pv.attributes->>'internal_storage'),
+              'base_price', pv.base_price
+            )
+            ORDER BY pv.id ASC
+          )
+          FROM product_variants pv
+          WHERE pv.product_id = p.id
+        ),
+        '[]'::jsonb
+      ) AS variants,
+      (
+        SELECT string_agg(
+          CONCAT_WS(
+            ' ',
+            bl.title,
+            bl.excerpt,
+            bl.category,
+            COALESCE(bl.tags::text, '')
+          ),
+          ' '
+          ORDER BY bl.published_at DESC NULLS LAST, bl.updated_at DESC
+        )
+        FROM blog_product_links bpl
+        INNER JOIN blogs bl
+          ON bl.id = bpl.blog_id
+         AND bl.is_published = true
+         AND bl.status = 'published'
+        WHERE bpl.product_id = p.id
+      ) AS article_text,
+      COALESCE(ts.compares_7d, 0) AS compares_7d,
+      COALESCE(ts.trending_score, 0) AS trending_score,
+      COALESCE(ds.hook_score, 0) AS hook_score
+    FROM products p
+    INNER JOIN product_publish pub
+      ON pub.product_id = p.id
+     AND pub.is_published = true
+    INNER JOIN smartphones s
+      ON s.product_id = p.id
+    LEFT JOIN brands b
+      ON b.id = p.brand_id
+    LEFT JOIN product_trending_score ts
+      ON ts.product_id = p.id
+    LEFT JOIN product_dynamic_score ds
+      ON ds.product_id = p.id
+    WHERE p.product_type = 'smartphone'
+      AND (
+        $2::int IS NULL
+        OR p.id = $2::int
+        OR s.launch_date IS NULL
+        OR s.launch_date >= CURRENT_DATE - make_interval(days => $1::int)
+      )
+    ORDER BY
+      CASE WHEN p.id = $2::int THEN 0 ELSE 1 END,
+      s.launch_date DESC NULLS LAST,
+      COALESCE(ts.trending_score, 0) DESC,
+      p.id DESC
+    LIMIT $3
+    `,
+    [
+      safeDays,
+      Number.isInteger(normalizedPrimaryProductId) &&
+      normalizedPrimaryProductId > 0
+        ? normalizedPrimaryProductId
+        : null,
+      AUTO_COMPARE_MARKET_POOL_LIMIT,
+    ],
+  );
+
+  return (result.rows || [])
+    .map((row) => normalizeCompareMarketPhoneRow(row, expectedPriceCandidates))
+    .filter((row) => row.product_id);
+};
+
+const fetchCompareMarketPairStats = async (productIds = [], days = 180) => {
+  const ids = normalizePositiveIntegerList(productIds);
+  if (ids.length < 2) return new Map();
+  const safeDays = Number.isFinite(Number(days))
+    ? Math.min(730, Math.max(1, Math.floor(Number(days))))
+    : 180;
+  const result = await db.query(
+    `
+    SELECT
+      LEAST(pc.product_id, pc.compared_with) AS left_product_id,
+      GREATEST(pc.product_id, pc.compared_with) AS right_product_id,
+      COUNT(*)::int AS compare_count,
+      MAX(pc.compared_at) AS last_compared_at
+    FROM product_comparisons pc
+    WHERE pc.compared_at >= now() - make_interval(days => $2::int)
+      AND pc.product_id = ANY($1::int[])
+      AND pc.compared_with = ANY($1::int[])
+    GROUP BY 1, 2
+    `,
+    [ids, safeDays],
+  );
+
+  const stats = new Map();
+  for (const row of result.rows || []) {
+    stats.set(getCompareMarketPairKey(row.left_product_id, row.right_product_id), {
+      compare_count: Number(row.compare_count) || 0,
+      last_compared_at: row.last_compared_at || null,
+    });
+  }
+  return stats;
+};
+
+const buildCompareMarketReason = ({
+  primary,
+  matches = [],
+  needsManualReview = false,
+  isTrio = false,
+} = {}) => {
+  const reasonTokens = Array.from(
+    new Set(
+      matches
+        .flatMap((entry) => entry.reasons || [])
+        .filter(Boolean)
+        .slice(0, 5),
+    ),
+  );
+  const base = isTrio
+    ? "Market Match: primary plus top two rivals"
+    : "Market Match";
+  const detail = reasonTokens.length ? ` (${reasonTokens.join(", ")})` : "";
+  const review = needsManualReview ? " | Review suggested" : "";
+  const anchor = primary?.product_name ? ` for ${primary.product_name}` : "";
+  return `${base}${anchor}${detail}${review}`;
+};
+
+const fetchMarketComparePageCandidates = async ({
+  days = 180,
+  limit = 100,
+  primaryProductId = null,
+} = {}) => {
+  const safeLimit = Number.isFinite(Number(limit))
+    ? Math.min(300, Math.max(1, Math.floor(Number(limit))))
+    : 100;
+  const phones = await fetchCompareMarketSmartphones({ days, primaryProductId });
+  if (phones.length < 2) return [];
+
+  const pairStats = await fetchCompareMarketPairStats(
+    phones.map((phone) => phone.product_id),
+    days,
+  );
+  const normalizedPrimaryProductId = Number(primaryProductId);
+  const primaryPool =
+    Number.isInteger(normalizedPrimaryProductId) && normalizedPrimaryProductId > 0
+      ? phones.filter((phone) => phone.product_id === normalizedPrimaryProductId)
+      : phones
+          .filter((phone) => {
+            const recency = phone.launch_recency_days;
+            return (
+              recency == null ||
+              recency <= Number(days) ||
+              Number(phone.compares_7d) > 0
+            );
+          })
+          .slice(0, AUTO_COMPARE_PRIMARY_LIMIT);
+  const pages = [];
+  const seenPageKeys = new Set();
+  const generatedAt = new Date().toISOString();
+
+  for (const primary of primaryPool) {
+    const primaryPriority = getCompareMarketPrimaryPriority(primary, {
+      isFocusedPrimary:
+        Number.isInteger(normalizedPrimaryProductId) &&
+        normalizedPrimaryProductId === primary.product_id,
+    });
+    const scored = phones
+      .filter((candidate) => candidate.product_id !== primary.product_id)
+      .map((candidate) =>
+        scoreCompareMarketCandidate(
+          primary,
+          candidate,
+          pairStats.get(
+            getCompareMarketPairKey(primary.product_id, candidate.product_id),
+          ),
+        ),
+      )
+      .filter(Boolean)
+      .filter((entry) => {
+        const hasPriceFit =
+          entry.priceDiffRatio == null || entry.priceDiffRatio <= 0.45;
+        return (
+          hasPriceFit ||
+          entry.specOverlapCount >= 3 ||
+          Number(entry.pairStats?.compare_count) > 0
+        );
+      })
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          Number(right.pairStats?.compare_count || 0) -
+            Number(left.pairStats?.compare_count || 0) ||
+          Number(right.candidate.trend_score || 0) -
+            Number(left.candidate.trend_score || 0),
+      );
+
+    const { selected, needsManualReview } = selectCompareMarketMatches(
+      primary,
+      scored,
+    );
+    if (!selected.length) continue;
+
+    for (const entry of selected) {
+      const items = [primary, entry.candidate].slice(0, AUTO_COMPARE_MAX_DEVICES);
+      const compareKey = getCompareMarketPageKey("smartphone", items);
+      if (!compareKey || seenPageKeys.has(compareKey)) continue;
+      seenPageKeys.add(compareKey);
+
+      const page = buildComparePagePayload(items, {
+        compareKey,
+        source: "automatic",
+        generationReason: buildCompareMarketReason({
+          primary,
+          matches: [entry],
+          needsManualReview:
+            needsManualReview || entry.score < AUTO_COMPARE_STRONG_PAIR_SCORE,
+        }),
+        manualCompareCount: Number(entry.pairStats?.compare_count) || 0,
+        lastComparedAt: entry.pairStats?.last_compared_at || null,
+        generatedAt,
+        updatedAt: entry.pairStats?.last_compared_at || generatedAt,
+        publishedAt: generatedAt,
+        systemScore: entry.score,
+        primaryProductId: primary.product_id,
+        status:
+          needsManualReview && entry.score < AUTO_COMPARE_MIN_PAIR_SCORE
+            ? "draft"
+            : "published",
+      });
+      if (page) {
+        page.auto_priority = Number(
+          (primaryPriority + entry.score / 100).toFixed(2),
+        );
+        pages.push(page);
+      }
+    }
+
+    if (selected.length >= AUTO_COMPARE_CANDIDATES_PER_PRIMARY) {
+      const trioItems = [primary, ...selected.map((entry) => entry.candidate)].slice(
+        0,
+        AUTO_COMPARE_MAX_DEVICES,
+      );
+      const trioScore =
+        selected.reduce((sum, entry) => sum + entry.score, 0) / selected.length;
+      const compareKey = getCompareMarketPageKey("smartphone", trioItems);
+      if (compareKey && !seenPageKeys.has(compareKey)) {
+        seenPageKeys.add(compareKey);
+        const page = buildComparePagePayload(trioItems, {
+          compareKey,
+          source: "automatic",
+          generationReason: buildCompareMarketReason({
+            primary,
+            matches: selected,
+            needsManualReview,
+            isTrio: true,
+          }),
+          manualCompareCount: selected.reduce(
+            (sum, entry) => sum + (Number(entry.pairStats?.compare_count) || 0),
+            0,
+          ),
+          lastComparedAt:
+            selected
+              .map((entry) => entry.pairStats?.last_compared_at)
+              .filter(Boolean)
+              .sort()
+              .slice(-1)[0] || null,
+          generatedAt,
+          updatedAt: generatedAt,
+          publishedAt: generatedAt,
+          systemScore: Number(trioScore.toFixed(2)),
+          primaryProductId: primary.product_id,
+          status:
+            needsManualReview && trioScore < AUTO_COMPARE_STRONG_PAIR_SCORE
+              ? "draft"
+              : "published",
+        });
+        if (page) {
+          page.auto_priority = Number(
+            (primaryPriority + 2 + trioScore / 100).toFixed(2),
+          );
+          pages.push(page);
+        }
+      }
+    }
+
+    if (pages.length >= safeLimit) break;
+  }
+
+  return pages
+    .sort(
+      (left, right) =>
+        Number(right.auto_priority || 0) - Number(left.auto_priority || 0) ||
+        Number(right.system_score || 0) - Number(left.system_score || 0) ||
+        Number(right.manual_compare_count || 0) -
+          Number(left.manual_compare_count || 0),
+    )
+    .slice(0, safeLimit);
+};
+
+const fetchUserTrendComparePageCandidates = async ({
+  days = 180,
+  limit = 100,
+  primaryProductId = null,
+} = {}) => {
+  const safeDays = Number.isFinite(Number(days))
+    ? Math.min(365, Math.max(1, Math.floor(Number(days))))
     : 180;
   const safeLimit = Number.isFinite(Number(limit))
     ? Math.min(300, Math.max(1, Math.floor(Number(limit))))
     : 100;
+  const normalizedPrimaryProductId = Number(primaryProductId);
 
   const result = await db.query(
     `
@@ -22037,6 +22953,11 @@ const fetchAutomaticComparePageCandidates = async ({
         MAX(pc.compared_at) AS last_compared_at
       FROM product_comparisons pc
       WHERE pc.compared_at >= now() - make_interval(days => $1::int)
+        AND (
+          $3::int IS NULL
+          OR pc.product_id = $3::int
+          OR pc.compared_with = $3::int
+        )
       GROUP BY 1, 2
     )
     SELECT
@@ -22120,12 +23041,21 @@ const fetchAutomaticComparePageCandidates = async ({
       p2.id DESC
     LIMIT $2
     `,
-    [safeDays, safeLimit],
+    [
+      safeDays,
+      safeLimit,
+      Number.isInteger(normalizedPrimaryProductId) &&
+      normalizedPrimaryProductId > 0
+        ? normalizedPrimaryProductId
+        : null,
+    ],
   );
 
+  const generatedAt = new Date().toISOString();
+
   return (result.rows || [])
-    .map((row) =>
-      buildComparePagePayload(
+    .map((row) => {
+      const page = buildComparePagePayload(
         [
           {
             product_id: row.left_product_id,
@@ -22149,15 +23079,91 @@ const fetchAutomaticComparePageCandidates = async ({
           generationReason: "User Comparison Trend",
           manualCompareCount: row.compare_count,
           lastComparedAt: row.last_compared_at,
-          generatedAt: new Date().toISOString(),
-          updatedAt: row.last_compared_at,
-          publishedAt: row.last_compared_at,
+          generatedAt,
+          updatedAt: generatedAt,
+          publishedAt: row.last_compared_at || generatedAt,
           systemScore: row.compare_count,
+          compareKey: getCompareMarketPageKey("smartphone", [
+            { product_id: row.left_product_id },
+            { product_id: row.right_product_id },
+          ]),
         },
-      ),
-    )
+      );
+      if (page) {
+        page.auto_priority =
+          30 + Math.min(40, (Number(row.compare_count) || 0) * 4);
+      }
+      return page;
+    })
     .filter(Boolean)
     .slice(0, safeLimit);
+};
+
+const mergeAutomaticComparePages = (pageGroups = [], limit = 100) => {
+  const safeLimit = Number.isFinite(Number(limit))
+    ? Math.min(300, Math.max(1, Math.floor(Number(limit))))
+    : 100;
+  const byKey = new Map();
+
+  for (const page of pageGroups.flat()) {
+    if (!page?.compare_key) continue;
+    const ids = (Array.isArray(page.items) ? page.items : [])
+      .map((item) => Number(item?.product_id))
+      .filter((value) => Number.isInteger(value) && value > 0);
+    if (ids.length < 2 || ids.length > AUTO_COMPARE_MAX_DEVICES) continue;
+
+    const key = String(page.compare_key).trim();
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, page);
+      continue;
+    }
+
+    const existingScore =
+      Number(existing.auto_priority || 0) * 1000 +
+      Number(existing.system_score || 0) +
+      Number(existing.manual_compare_count || 0) * 3;
+    const nextScore =
+      Number(page.auto_priority || 0) * 1000 +
+      Number(page.system_score || 0) + Number(page.manual_compare_count || 0) * 3;
+    if (nextScore > existingScore) {
+      byKey.set(key, {
+        ...page,
+        manual_compare_count: Math.max(
+          Number(page.manual_compare_count) || 0,
+          Number(existing.manual_compare_count) || 0,
+        ),
+        last_compared_at:
+          page.last_compared_at || existing.last_compared_at || null,
+      });
+    }
+  }
+
+  return Array.from(byKey.values())
+    .sort(
+      (left, right) =>
+        Number(right.auto_priority || 0) - Number(left.auto_priority || 0) ||
+        Number(right.manual_compare_count || 0) -
+          Number(left.manual_compare_count || 0) ||
+        Number(right.system_score || 0) - Number(left.system_score || 0),
+    )
+    .slice(0, safeLimit);
+};
+
+const fetchAutomaticComparePageCandidates = async ({
+  days = 180,
+  limit = 100,
+  primaryProductId = null,
+} = {}) => {
+  const safeLimit = Number.isFinite(Number(limit))
+    ? Math.min(300, Math.max(1, Math.floor(Number(limit))))
+    : 100;
+  const [trendPages, marketPages] = await Promise.all([
+    fetchUserTrendComparePageCandidates({ days, limit: safeLimit, primaryProductId }),
+    fetchMarketComparePageCandidates({ days, limit: safeLimit, primaryProductId }),
+  ]);
+
+  return mergeAutomaticComparePages([trendPages, marketPages], safeLimit);
 };
 
 const toComparePageDbValues = (page, nowIso = new Date().toISOString()) => [
@@ -22291,8 +23297,73 @@ const persistComparePageRecord = async (page) => {
   return normalizeComparePageRecord(fallback.rows?.[0] || null);
 };
 
-const syncAutomaticComparePages = async ({ days = 180, limit = 100 } = {}) => {
-  const pages = await fetchAutomaticComparePageCandidates({ days, limit });
+const draftInvalidAutomaticComparePages = async () => {
+  const result = await db.query(
+    `
+    UPDATE compare_pages cp
+    SET
+      status = 'draft',
+      updated_at = now(),
+      generation_reason = CONCAT_WS(
+        ' | ',
+        NULLIF(cp.generation_reason, ''),
+        'Drafted: compare items unavailable'
+      )
+    WHERE cp.source = 'automatic'
+      AND cp.status = 'published'
+      AND (
+        jsonb_typeof(cp.items) <> 'array'
+        OR jsonb_array_length(
+          CASE
+            WHEN jsonb_typeof(cp.items) = 'array' THEN cp.items
+            ELSE '[]'::jsonb
+          END
+        ) < 2
+        OR jsonb_array_length(
+          CASE
+            WHEN jsonb_typeof(cp.items) = 'array' THEN cp.items
+            ELSE '[]'::jsonb
+          END
+        ) > $1
+        OR EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(
+            CASE
+              WHEN jsonb_typeof(cp.items) = 'array' THEN cp.items
+              ELSE '[]'::jsonb
+            END
+          ) AS item
+          LEFT JOIN products p
+            ON p.id = CASE
+              WHEN item->>'product_id' ~ '^[0-9]+$'
+              THEN (item->>'product_id')::int
+              ELSE NULL
+            END
+          LEFT JOIN product_publish pub
+            ON pub.product_id = p.id
+          WHERE p.id IS NULL
+            OR p.product_type <> 'smartphone'
+            OR COALESCE(pub.is_published, false) <> true
+        )
+      )
+    RETURNING id
+    `,
+    [AUTO_COMPARE_MAX_DEVICES],
+  );
+
+  return Number(result.rowCount) || 0;
+};
+
+const syncAutomaticComparePages = async ({
+  days = 180,
+  limit = 100,
+  primaryProductId = null,
+} = {}) => {
+  const pages = await fetchAutomaticComparePageCandidates({
+    days,
+    limit,
+    primaryProductId,
+  });
   const generatedKeys = pages
     .map((page) => String(page.compare_key || "").trim())
     .filter(Boolean);
@@ -22303,33 +23374,17 @@ const syncAutomaticComparePages = async ({ days = 180, limit = 100 } = {}) => {
     await persistComparePageRecord(page);
   }
 
-  if (generatedKeys.length) {
-    await db.query(
-      `
-      UPDATE compare_pages
-      SET
-        status = 'draft',
-        updated_at = now()
-      WHERE source = 'automatic'
-        AND NOT (compare_key = ANY($1::text[]))
-      `,
-      [generatedKeys],
-    );
-  } else {
-    await db.query(
-      `
-      UPDATE compare_pages
-      SET
-        status = 'draft',
-        updated_at = now()
-      WHERE source = 'automatic'
-      `,
-    );
-  }
+  const draftedInvalid = await draftInvalidAutomaticComparePages();
 
   return {
     generated: pages.length,
     keys: generatedKeys,
+    drafted_invalid: draftedInvalid,
+    retained_existing_automatic: true,
+    primary_product_id:
+      Number.isInteger(Number(primaryProductId)) && Number(primaryProductId) > 0
+        ? Number(primaryProductId)
+        : null,
   };
 };
 
@@ -23178,24 +24233,131 @@ app.get("/api/admin/compare-pages", authenticate, async (req, res) => {
     const limit = Number.isFinite(limitRaw)
       ? Math.min(500, Math.max(1, Math.floor(limitRaw)))
       : 100;
+    const queryText = String(req.query?.q || req.query?.query || "").trim();
+    const sourceFilter = String(req.query?.source || "").trim().toLowerCase();
+    const statusFilter = String(req.query?.status || "").trim().toLowerCase();
+    const segmentFilter = String(req.query?.segment || "").trim();
+    const daysRaw = Number(req.query?.days);
+    const fromDateRaw = String(req.query?.from_date || req.query?.fromDate || "")
+      .trim()
+      .slice(0, 10);
+    const filterParams = [];
+    const whereClauses = [];
+    const latestTimestampSql =
+      "COALESCE(updated_at, generated_at, published_at, last_compared_at)";
+    const addFilterParam = (value) => {
+      filterParams.push(value);
+      return `$${filterParams.length}`;
+    };
+
+    if (queryText) {
+      const placeholder = addFilterParam(`%${queryText}%`);
+      whereClauses.push(`
+        (
+          title ILIKE ${placeholder}
+          OR slug ILIKE ${placeholder}
+          OR route_path ILIKE ${placeholder}
+          OR segment_label ILIKE ${placeholder}
+          OR smartphone_type_label ILIKE ${placeholder}
+          OR items::text ILIKE ${placeholder}
+        )
+      `);
+    }
+
+    if (["automatic", "manual"].includes(sourceFilter)) {
+      whereClauses.push(`source = ${addFilterParam(sourceFilter)}`);
+    }
+
+    if (["published", "draft"].includes(statusFilter)) {
+      whereClauses.push(`status = ${addFilterParam(statusFilter)}`);
+    }
+
+    if (segmentFilter) {
+      whereClauses.push(`segment_label = ${addFilterParam(segmentFilter)}`);
+    }
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(fromDateRaw)) {
+      whereClauses.push(
+        `${latestTimestampSql} >= ${addFilterParam(fromDateRaw)}::date`,
+      );
+    } else if (Number.isFinite(daysRaw) && daysRaw > 0) {
+      const safeDays = Math.min(730, Math.max(1, Math.floor(daysRaw)));
+      whereClauses.push(
+        `${latestTimestampSql} >= now() - make_interval(days => ${addFilterParam(
+          safeDays,
+        )}::int)`,
+      );
+    }
+
+    const whereSql = whereClauses.length
+      ? `WHERE ${whereClauses.join("\n        AND ")}`
+      : "";
+    const limitParam = `$${filterParams.length + 1}`;
 
     const result = await db.query(
       `
       SELECT *
       FROM compare_pages
-      ORDER BY updated_at DESC NULLS LAST, id DESC
-      LIMIT $1
+      ${whereSql}
+      ORDER BY ${latestTimestampSql} DESC NULLS LAST, id DESC
+      LIMIT ${limitParam}
       `,
-      [limit],
+      [...filterParams, limit],
+    );
+
+    const filteredStatsResult = await db.query(
+      `
+      SELECT
+        COUNT(*)::int AS filtered_total,
+        MAX(${latestTimestampSql}) AS filtered_latest_updated_at
+      FROM compare_pages
+      ${whereSql}
+      `,
+      filterParams,
+    );
+
+    const statsResult = await db.query(
+      `
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE status = 'published')::int AS published,
+        COUNT(*) FILTER (WHERE status = 'draft')::int AS draft,
+        COUNT(*) FILTER (WHERE source = 'automatic')::int AS automatic,
+        COUNT(*) FILTER (WHERE source = 'manual')::int AS manual,
+        COUNT(*) FILTER (
+          WHERE source = 'automatic' AND status = 'published'
+        )::int AS automatic_published,
+        COUNT(*) FILTER (
+          WHERE source = 'automatic' AND status = 'draft'
+        )::int AS automatic_draft,
+        MAX(updated_at) AS latest_updated_at
+      FROM compare_pages
+      `,
     );
 
     const pages = (result.rows || [])
       .map((row) => normalizeComparePageRecord(row))
       .filter(Boolean);
     const hydratedPages = await hydrateComparePagesWithAnalytics(pages);
+    const statsRow = statsResult.rows?.[0] || {};
+    const filteredStatsRow = filteredStatsResult.rows?.[0] || {};
 
     return res.json({
       generated_at: new Date().toISOString(),
+      loaded_count: hydratedPages.length,
+      stats: {
+        total: Number(statsRow.total) || 0,
+        published: Number(statsRow.published) || 0,
+        draft: Number(statsRow.draft) || 0,
+        automatic: Number(statsRow.automatic) || 0,
+        manual: Number(statsRow.manual) || 0,
+        automatic_published: Number(statsRow.automatic_published) || 0,
+        automatic_draft: Number(statsRow.automatic_draft) || 0,
+        latest_updated_at: statsRow.latest_updated_at || null,
+        filtered_total: Number(filteredStatsRow.filtered_total) || 0,
+        filtered_latest_updated_at:
+          filteredStatsRow.filtered_latest_updated_at || null,
+      },
       pages: hydratedPages,
       data: hydratedPages,
     });
