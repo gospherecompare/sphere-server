@@ -21871,6 +21871,11 @@ const normalizeComparePageItem = (item, positionFallback = 1) => {
     best_price: toSafeNumeric(
       item?.best_price ?? item?.bestPrice ?? item?.price,
     ),
+    launch_date: item?.launch_date
+      ? String(item.launch_date).slice(0, 10)
+      : item?.launchDate
+        ? String(item.launchDate).slice(0, 10)
+        : null,
     image_url: String(item?.image_url || item?.image || "").trim() || null,
     detail_path:
       String(item?.detail_path || item?.detailPath || "").trim() ||
@@ -22469,8 +22474,8 @@ const resolveComparePageAnalytics = async (
           MAX(compared_at) AS last_compared_at
         FROM product_comparisons
         WHERE compared_at >= now() - make_interval(days => $3::int)
-          AND LEAST(product_id, compared_with) = LEAST($1, $2)
-          AND GREATEST(product_id, compared_with) = GREATEST($1, $2)
+          AND LEAST(product_id, compared_with) = LEAST($1::int, $2::int)
+          AND GREATEST(product_id, compared_with) = GREATEST($1::int, $2::int)
         `,
         [ids[0], ids[1], safeDays],
       );
@@ -23583,8 +23588,8 @@ app.get("/api/public/compare-pages/resolve", async (req, res) => {
             COUNT(*)::int AS compare_count,
             MAX(compared_at) AS last_compared_at
           FROM product_comparisons
-          WHERE LEAST(product_id, compared_with) = LEAST($1, $2)
-            AND GREATEST(product_id, compared_with) = GREATEST($1, $2)
+          WHERE LEAST(product_id, compared_with) = LEAST($1::int, $2::int)
+            AND GREATEST(product_id, compared_with) = GREATEST($1::int, $2::int)
             AND compared_at >= now() - make_interval(days => $3::int)
           `,
           [leftId, rightId, PUBLIC_COMPARE_WINDOW_DAYS],
