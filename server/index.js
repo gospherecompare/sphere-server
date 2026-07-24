@@ -1135,45 +1135,79 @@ const medianSmartphonePrice = (prices) => {
     : (sorted[middle - 1] + sorted[middle]) / 2;
 };
 
-const fetchSmartphoneExpectedPriceCandidates = async () => {
-  const result = await db.query(`
-    SELECT
-      p.id AS product_id,
-      p.name,
-      COALESCE(b.name, s.brand) AS brand_name,
-      s.category,
-      s.model,
-      MIN(NULLIF(sp.price, 0)) AS store_price,
-      MIN(NULLIF(v.base_price, 0)) AS base_price
-    FROM products p
-    INNER JOIN smartphones s
-      ON s.product_id = p.id
-    LEFT JOIN brands b
-      ON b.id = p.brand_id
-    LEFT JOIN product_variants v
-      ON v.product_id = p.id
-    LEFT JOIN variant_store_prices sp
-      ON sp.variant_id = v.id
-    WHERE p.product_type = 'smartphone'
-    GROUP BY p.id, p.name, b.name, s.brand, s.category, s.model
-  `);
+const SMARTPHONE_EXPECTED_PRICE_CANDIDATES_TTL_MS = 5 * 60 * 1000;
+let smartphoneExpectedPriceCandidatesCache = {
+  loadedAt: 0,
+  rows: [],
+};
+let smartphoneExpectedPriceCandidatesPromise = null;
 
-  return (result.rows || [])
-    .map((row) => {
-      const price = normalizeSmartphoneExpectedPrice(
-        row.store_price,
-        row.base_price,
-      );
-      if (price === null) return null;
-      return {
-        ...row,
-        price,
-        brandKey: normalizeSmartphoneMatchToken(row.brand_name),
-        seriesKey: extractSmartphoneSeriesKey(row),
-        segmentKey: resolveSmartphonePriceSegmentKey(row),
+const fetchSmartphoneExpectedPriceCandidates = async () => {
+  const now = Date.now();
+  if (
+    smartphoneExpectedPriceCandidatesCache.loadedAt &&
+    now - smartphoneExpectedPriceCandidatesCache.loadedAt <
+      SMARTPHONE_EXPECTED_PRICE_CANDIDATES_TTL_MS
+  ) {
+    return smartphoneExpectedPriceCandidatesCache.rows;
+  }
+
+  if (smartphoneExpectedPriceCandidatesPromise) {
+    return smartphoneExpectedPriceCandidatesPromise;
+  }
+
+  smartphoneExpectedPriceCandidatesPromise = (async () => {
+    try {
+      const result = await db.query(`
+        SELECT
+          p.id AS product_id,
+          p.name,
+          COALESCE(b.name, s.brand) AS brand_name,
+          s.category,
+          s.model,
+          MIN(NULLIF(sp.price, 0)) AS store_price,
+          MIN(NULLIF(v.base_price, 0)) AS base_price
+        FROM products p
+        INNER JOIN smartphones s
+          ON s.product_id = p.id
+        LEFT JOIN brands b
+          ON b.id = p.brand_id
+        LEFT JOIN product_variants v
+          ON v.product_id = p.id
+        LEFT JOIN variant_store_prices sp
+          ON sp.variant_id = v.id
+        WHERE p.product_type = 'smartphone'
+        GROUP BY p.id, p.name, b.name, s.brand, s.category, s.model
+      `);
+
+      const rows = (result.rows || [])
+        .map((row) => {
+          const price = normalizeSmartphoneExpectedPrice(
+            row.store_price,
+            row.base_price,
+          );
+          if (price === null) return null;
+          return {
+            ...row,
+            price,
+            brandKey: normalizeSmartphoneMatchToken(row.brand_name),
+            seriesKey: extractSmartphoneSeriesKey(row),
+            segmentKey: resolveSmartphonePriceSegmentKey(row),
+          };
+        })
+        .filter(Boolean);
+
+      smartphoneExpectedPriceCandidatesCache = {
+        loadedAt: Date.now(),
+        rows,
       };
-    })
-    .filter(Boolean);
+      return rows;
+    } finally {
+      smartphoneExpectedPriceCandidatesPromise = null;
+    }
+  })();
+
+  return smartphoneExpectedPriceCandidatesPromise;
 };
 
 const resolveAlgorithmicSmartphoneExpectedPrice = (
@@ -19682,30 +19716,66 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
     );
 
     const todayIndia = getIndiaDateOnly();
-    const availabilityForecast = await fetchSmartphoneAvailabilityForecast();
-    const expectedPriceCandidates =
-      await fetchSmartphoneExpectedPriceCandidates();
-    for (const item of items) {
-      const variantsRes = await db.query(
-        `SELECT id, variant_key, attributes->>'ram' AS ram, attributes->>'storage' AS storage, base_price
-         FROM product_variants
-         WHERE product_id = $1
-         ORDER BY id ASC`,
-        [item.product_id],
-      );
+    const [availabilityForecast, expectedPriceCandidates] = await Promise.all([
+      fetchSmartphoneAvailabilityForecast(),
+      fetchSmartphoneExpectedPriceCandidates(),
+    ]);
 
-      const variants = [];
-      for (const variant of variantsRes.rows) {
-        const storesRes = await db.query(
-          "SELECT * FROM variant_store_prices WHERE variant_id = $1 ORDER BY price ASC NULLS LAST, id ASC",
-          [variant.id],
-        );
-        variants.push({
-          ...variant,
-          variant_id: variant.id,
-          store_prices: decorateStorePriceList(storesRes.rows, todayIndia),
-        });
-      }
+    const productIds = items
+      .map((item) => Number(item.product_id))
+      .filter((id) => Number.isInteger(id) && id > 0);
+    const variantRows = productIds.length
+      ? (
+          await db.query(
+            `SELECT id, product_id, variant_key,
+                    attributes->>'ram' AS ram,
+                    attributes->>'storage' AS storage,
+                    base_price
+             FROM product_variants
+             WHERE product_id = ANY($1::int[])
+             ORDER BY product_id ASC, id ASC`,
+            [productIds],
+          )
+        ).rows
+      : [];
+    const variantIds = variantRows
+      .map((variant) => Number(variant.id))
+      .filter((id) => Number.isInteger(id) && id > 0);
+    const storePriceRows = variantIds.length
+      ? (
+          await db.query(
+            `SELECT *
+             FROM variant_store_prices
+             WHERE variant_id = ANY($1::int[])
+             ORDER BY variant_id ASC, price ASC NULLS LAST, id ASC`,
+            [variantIds],
+          )
+        ).rows
+      : [];
+    const storesByVariantId = new Map();
+    for (const storePrice of storePriceRows) {
+      const variantId = Number(storePrice.variant_id);
+      const stores = storesByVariantId.get(variantId) || [];
+      stores.push(storePrice);
+      storesByVariantId.set(variantId, stores);
+    }
+    const variantsByProductId = new Map();
+    for (const variant of variantRows) {
+      const productId = Number(variant.product_id);
+      const variants = variantsByProductId.get(productId) || [];
+      variants.push({
+        ...variant,
+        variant_id: variant.id,
+        store_prices: decorateStorePriceList(
+          storesByVariantId.get(Number(variant.id)) || [],
+          todayIndia,
+        ),
+      });
+      variantsByProductId.set(productId, variants);
+    }
+    for (const item of items) {
+      const variants =
+        variantsByProductId.get(Number(item.product_id)) || [];
 
       const effectivePrice = resolveEffectiveSmartphonePrice(
         variants,
