@@ -55,6 +55,12 @@ const {
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
+const {
+  SEMI_STATIC_CACHE_CONTROL,
+  STABLE_SPEC_CACHE_CONTROL,
+  createApiJsonCompressionMiddleware,
+  sendNegotiatedJson,
+} = require("./responseCompression");
 
 const SECRET = process.env.JWT_SECRET || "smartarena_secret_key_25";
 const PORT = process.env.PORT || 5000;
@@ -235,6 +241,7 @@ app.use(cors({
 // Security middlewares
 app.disable("x-powered-by");
 app.use(helmet());
+app.use("/api", createApiJsonCompressionMiddleware());
 app.use("/proxy/external", express.json({ limit: PROXY_EXTERNAL_BODY_LIMIT }));
 app.use("/proxy/external", payloadTooLargeHandler(PROXY_EXTERNAL_BODY_LIMIT));
 // Keep request bodies bounded while allowing normal admin/product JSON payloads.
@@ -323,6 +330,10 @@ const API_ALIAS_REWRITE_RULES = [
   {
     alias: /^\/api\/gateway\/node\/([^/]+)$/i,
     target: (m) => `/api/public/product/${m[1]}`,
+  },
+  {
+    alias: /^\/api\/gateway\/node\/([^/]+)\/specs$/i,
+    target: (m) => `/api/public/product/${m[1]}/specs`,
   },
   {
     alias: /^\/api\/gateway\/node\/([^/]+)\/hit$/i,
@@ -13557,7 +13568,12 @@ app.get("/api/smartphones", async (req, res) => {
     const publicSmartphones = sortedSmartphones.map((item) =>
       toPublicSmartphoneResponse(item),
     );
-    res.json({ smartphones: publicSmartphones });
+    return sendNegotiatedJson(
+      req,
+      res,
+      { smartphones: publicSmartphones },
+      { cacheControl: SEMI_STATIC_CACHE_CONTROL },
+    );
   } catch (err) {
     console.error("GET /api/smartphones error:", err);
     res.status(500).json({ error: err.message });
@@ -19642,15 +19658,20 @@ const handleTrendingSmartphones = async (req, res) => {
       toPublicSmartphoneResponse(item),
     );
 
-    return res.json({
-      success: true,
-      period: "7d",
-      updated_at:
-        (rows || []).find((r) => r?.trending_calculated_at)
-          ?.trending_calculated_at ?? null,
-      trending: publicTrending,
-      smartphones: publicTrending,
-    });
+    return sendNegotiatedJson(
+      req,
+      res,
+      {
+        success: true,
+        period: "7d",
+        updated_at:
+          (rows || []).find((r) => r?.trending_calculated_at)
+            ?.trending_calculated_at ?? null,
+        trending: publicTrending,
+        smartphones: publicTrending,
+      },
+      { cacheControl: SEMI_STATIC_CACHE_CONTROL },
+    );
   } catch (err) {
     console.error("Trending smartphones error:", err);
     return res.status(500).json({
@@ -19829,7 +19850,12 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
       .slice(0, limit)
       .map((item) => toPublicSmartphoneResponse(item));
 
-    return res.json({ upcoming, smartphones: upcoming });
+    return sendNegotiatedJson(
+      req,
+      res,
+      { upcoming, smartphones: upcoming },
+      { cacheControl: SEMI_STATIC_CACHE_CONTROL },
+    );
   } catch (err) {
     console.error("GET /api/public/upcoming/smartphones error:", err);
     return res.status(500).json({ error: err.message });
@@ -20746,7 +20772,12 @@ app.get("/api/public/new/smartphones", async (req, res) => {
       .map((entry) => entry.item)
       .map((item) => toPublicSmartphoneResponse(item));
 
-    return res.json({ new: publicLaunches });
+    return sendNegotiatedJson(
+      req,
+      res,
+      { new: publicLaunches },
+      { cacheControl: SEMI_STATIC_CACHE_CONTROL },
+    );
   } catch (err) {
     console.error("GET /api/public/new/smartphones error:", err);
     return res.status(500).json({ error: err.message });
@@ -26533,6 +26564,130 @@ app.get("/api/public/product/:id/competitors", async (req, res) => {
   }
 });
 
+const firstStableSpecValue = (...values) =>
+  values.find(
+    (value) => value !== undefined && value !== null && value !== "",
+  ) ?? null;
+
+const buildStableSmartphoneSpecPayload = (row = {}) => {
+  const smartphone = toPlainObject(row.smartphone_data);
+  const performance = toPlainObject(smartphone.performance);
+  const connectivity = toPlainObject(smartphone.connectivity);
+  const buildDesign = toPlainObject(smartphone.build_design);
+  const productImages = Array.isArray(row.product_images)
+    ? row.product_images.filter(Boolean)
+    : [];
+  const embeddedImages = Array.isArray(smartphone.images)
+    ? smartphone.images.filter(Boolean)
+    : [];
+
+  return {
+    id: Number(row.product_id),
+    product_id: Number(row.product_id),
+    name: row.name || null,
+    brand_name: row.brand_name || smartphone.brand || null,
+    model: smartphone.model || null,
+    category: smartphone.category || null,
+    build_design: smartphone.build_design || null,
+    display: smartphone.display || null,
+    memory: firstStableSpecValue(
+      smartphone.memory,
+      performance.memory,
+      null,
+    ),
+    performance: smartphone.performance || null,
+    camera: smartphone.camera || null,
+    navigation: firstStableSpecValue(
+      smartphone.navigation,
+      connectivity.navigation,
+      null,
+    ),
+    audio: smartphone.audio || null,
+    multimedia: smartphone.multimedia || null,
+    cooling: firstStableSpecValue(
+      smartphone.cooling,
+      performance.cooling,
+      null,
+    ),
+    durability: firstStableSpecValue(
+      smartphone.durability,
+      buildDesign.durability,
+      null,
+    ),
+    operating_system: firstStableSpecValue(
+      smartphone.operating_system,
+      performance.operating_system,
+      performance.operatingSystem,
+      performance.os,
+      null,
+    ),
+    sensors: smartphone.sensors || null,
+    colors: Array.isArray(smartphone.colors) ? smartphone.colors : [],
+    images: productImages.length ? productImages : embeddedImages,
+    box_contents: firstStableSpecValue(
+      smartphone.box_contents,
+      smartphone.in_the_box,
+      null,
+    ),
+    country_of_origin: smartphone.country_of_origin || null,
+  };
+};
+
+// PUBLIC: Stable smartphone specification payload. Price, stores, ratings,
+// launch policy, and trend scores intentionally stay out of this response.
+app.get("/api/public/product/:id/specs", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const result = await db.query(
+      `SELECT
+         p.id AS product_id,
+         p.name,
+         b.name AS brand_name,
+         to_jsonb(s) AS smartphone_data,
+         COALESCE(
+           (
+             SELECT json_agg(pi.image_url ORDER BY pi.position ASC)
+             FROM product_images pi
+             WHERE pi.product_id = p.id
+           ),
+           '[]'::json
+         ) AS product_images
+       FROM products p
+       INNER JOIN product_publish pub
+         ON pub.product_id = p.id
+        AND pub.is_published = true
+       INNER JOIN smartphones s ON s.product_id = p.id
+       LEFT JOIN brands b ON b.id = p.brand_id
+       WHERE p.id = $1
+         AND p.product_type = 'smartphone'
+       LIMIT 1`,
+      [id],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    return sendNegotiatedJson(
+      req,
+      res,
+      buildStableSmartphoneSpecPayload(result.rows[0]),
+      {
+        brotliQuality: 9,
+        cacheControl: STABLE_SPEC_CACHE_CONTROL,
+        threshold: 256,
+      },
+    );
+  } catch (err) {
+    console.error("GET /api/public/product/:id/specs error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // PUBLIC: Get smartphone/product details by ID (no auth required)
 app.get("/api/public/product/:id", async (req, res) => {
   try {
@@ -26666,7 +26821,9 @@ app.get("/api/public/product/:id", async (req, res) => {
         ? toPublicSmartphoneResponse(scoredResponse)
         : scoredResponse;
 
-    res.json(publicResponse);
+    return sendNegotiatedJson(req, res, publicResponse, {
+      cacheControl: SEMI_STATIC_CACHE_CONTROL,
+    });
   } catch (err) {
     console.error("GET /api/public/product/:id error:", err);
     res.status(500).json({ error: err.message });
