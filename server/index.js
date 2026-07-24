@@ -224,7 +224,14 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
-
+app.use(cors({
+  origin: [
+    "https://tryhook.shop",
+    "https://www.tryhook.shop",
+    "http://localhost:3000"
+  ],
+  credentials: true
+}));
 // Security middlewares
 app.disable("x-powered-by");
 app.use(helmet());
