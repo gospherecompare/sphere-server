@@ -27,22 +27,23 @@ const {
   sendCareerInterviewEmail,
   sendCareerHrEmail,
   sendCareerOfferEmail,
-} = require("../utils/mailer");
+} = require("./utils/mailer");
 const { authenticateCustomer, authenticate } = require("./middleware/auth");
 const {
   recomputeProductDynamicScoreSmartphones,
   recomputeProductDynamicScoreLaptops,
   recomputeProductDynamicScoreTVs,
-} = require("../utils/hookScore");
-const { recomputeProductTrendingScores } = require("../utils/trendingScore");
+} = require("./utils/hookScore");
+const { recomputeProductTrendingScores } = require("./utils/trendingScore");
 const {
   normalizeCompareScoreConfig,
   buildCompareRanking,
   weightsToPercent,
-} = require("../utils/compareScoring");
+} = require("./utils/compareScoring");
+const { buildDecisionComparison } = require("./utils/compareDecisionEngine");
 const {
   recomputeSmartphoneCompetitorAnalysis,
-} = require("../utils/competitorAnalysis");
+} = require("./utils/competitorAnalysis");
 const {
   ROLE_PRESETS: RBAC_ROLE_PRESETS,
   expandPermissionSet: expandRbacPermissionSet,
@@ -51,7 +52,7 @@ const {
   hasPermissionSet: hasRbacPermissionSet,
   normalizePermissionToken: normalizeRbacPermissionToken,
   normalizeRole: normalizeRbacRole,
-} = require("../utils/rbacCatalog");
+} = require("./utils/rbacCatalog");
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
@@ -5076,6 +5077,20 @@ async function runMigrations() {
       ADD CONSTRAINT products_product_type_check
       CHECK (
         product_type IN ('smartphone','laptop','networking','tv','accessories')
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS merchant_product_sync (
+        id SERIAL PRIMARY KEY,
+        product_id INT UNIQUE REFERENCES products(id) ON DELETE CASCADE,
+        enabled BOOLEAN DEFAULT false,
+        merchant_product_id TEXT,
+        status TEXT,
+        last_synced_at TIMESTAMP,
+        issues JSONB,
+        created_at TIMESTAMP DEFAULT now(),
+        updated_at TIMESTAMP DEFAULT now()
       );
     `);
 
@@ -11290,10 +11305,7 @@ app.patch("/api/admin/blogs/bulk", authenticate, async (req, res) => {
     }
     if (hasAuthorNameInput) {
       authorName = String(
-        req.body?.author_name ??
-          req.body?.authorName ??
-          req.body?.byline ??
-          "",
+        req.body?.author_name ?? req.body?.authorName ?? req.body?.byline ?? "",
       ).trim();
     }
 
@@ -11390,13 +11402,19 @@ app.patch("/api/admin/blogs/bulk", authenticate, async (req, res) => {
       setClauses.push(`author_name = ${addValue(authorName || null)}`);
     }
     if (hasFeaturedInput) {
-      setClauses.push(`featured = ${addValue(parseBooleanInput(req.body.featured))}`);
+      setClauses.push(
+        `featured = ${addValue(parseBooleanInput(req.body.featured))}`,
+      );
     }
     if (hasTrendingInput) {
-      setClauses.push(`trending = ${addValue(parseBooleanInput(req.body.trending))}`);
+      setClauses.push(
+        `trending = ${addValue(parseBooleanInput(req.body.trending))}`,
+      );
     }
     if (hasPinnedInput) {
-      setClauses.push(`pinned = ${addValue(parseBooleanInput(req.body.pinned))}`);
+      setClauses.push(
+        `pinned = ${addValue(parseBooleanInput(req.body.pinned))}`,
+      );
     }
     setClauses.push(`updated_by = ${addValue(actorId)}`);
 
@@ -11571,7 +11589,9 @@ app.delete(
       });
     } catch (err) {
       console.error("DELETE /api/admin/blogs/bulk error:", err);
-      return res.status(500).json({ message: "Failed to delete news articles" });
+      return res
+        .status(500)
+        .json({ message: "Failed to delete news articles" });
     }
   },
 );
@@ -13329,6 +13349,221 @@ app.post("/api/products", authenticate, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+app.get("/api/merchant-product-sync", authenticate, async (req, res) => {
+  try {
+    const { product_id } = req.query;
+    const params = [];
+    const where = [];
+
+    if (product_id !== undefined) {
+      params.push(Number(product_id));
+      where.push(`m.product_id = $${params.length}`);
+    }
+
+    const query = `
+      SELECT m.*
+      FROM merchant_product_sync m
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY m.id DESC
+    `;
+
+    const result = await db.query(query, params);
+    res.json({ data: result.rows });
+  } catch (err) {
+    console.error("GET /api/merchant-product-sync error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get(
+  "/api/merchant-product-sync/:productId",
+  authenticate,
+  async (req, res) => {
+    try {
+      const productId = Number(req.params.productId);
+      if (!productId || Number.isNaN(productId)) {
+        return res.status(400).json({ message: "Invalid product id" });
+      }
+
+      const result = await db.query(
+        `SELECT * FROM merchant_product_sync WHERE product_id = $1`,
+        [productId],
+      );
+
+      if (!result.rows.length) {
+        return res
+          .status(404)
+          .json({ message: "Merchant sync record not found" });
+      }
+
+      res.json({ data: result.rows[0] });
+    } catch (err) {
+      console.error("GET /api/merchant-product-sync/:productId error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+app.post("/api/merchant-product-sync", authenticate, async (req, res) => {
+  try {
+    const {
+      product_id,
+      enabled,
+      merchant_product_id,
+      status,
+      last_synced_at,
+      issues,
+    } = req.body || {};
+
+    const productId = Number(product_id);
+    if (!productId || Number.isNaN(productId)) {
+      return res.status(400).json({ message: "product_id is required" });
+    }
+
+    const productCheck = await db.query(
+      `SELECT id FROM products WHERE id = $1 LIMIT 1`,
+      [productId],
+    );
+    if (!productCheck.rows.length) {
+      return res.status(400).json({ message: "Product not found" });
+    }
+
+    const normalizedIssues = Array.isArray(issues)
+      ? issues
+      : typeof issues === "string"
+        ? (() => {
+            try {
+              const parsed = JSON.parse(issues);
+              return Array.isArray(parsed) ? parsed : [];
+            } catch {
+              return [];
+            }
+          })()
+        : [];
+
+    const normalizedLastSyncedAt = last_synced_at
+      ? (() => {
+          const date = new Date(last_synced_at);
+          return Number.isNaN(date.getTime()) ? null : date;
+        })()
+      : null;
+
+    const result = await db.query(
+      `INSERT INTO merchant_product_sync (
+         product_id, enabled, merchant_product_id, status,
+         last_synced_at, issues, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,now())
+       ON CONFLICT (product_id) DO UPDATE SET
+         enabled = EXCLUDED.enabled,
+         merchant_product_id = EXCLUDED.merchant_product_id,
+         status = EXCLUDED.status,
+         last_synced_at = EXCLUDED.last_synced_at,
+         issues = EXCLUDED.issues,
+         updated_at = now()
+       RETURNING *`,
+      [
+        productId,
+        Boolean(enabled),
+        merchant_product_id || null,
+        status || null,
+        normalizedLastSyncedAt,
+        normalizedIssues.length ? JSON.stringify(normalizedIssues) : null,
+      ],
+    );
+
+    res
+      .status(201)
+      .json({ message: "Merchant sync record saved", data: result.rows[0] });
+  } catch (err) {
+    console.error("POST /api/merchant-product-sync error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch(
+  "/api/merchant-product-sync/:productId",
+  authenticate,
+  async (req, res) => {
+    try {
+      const productId = Number(req.params.productId);
+      if (!productId || Number.isNaN(productId)) {
+        return res.status(400).json({ message: "Invalid product id" });
+      }
+
+      const { enabled, merchant_product_id, status, last_synced_at, issues } =
+        req.body || {};
+
+      const updates = [];
+      const values = [];
+
+      if (enabled !== undefined) {
+        values.push(Boolean(enabled));
+        updates.push(`enabled = $${values.length}`);
+      }
+      if (merchant_product_id !== undefined) {
+        values.push(merchant_product_id || null);
+        updates.push(`merchant_product_id = $${values.length}`);
+      }
+      if (status !== undefined) {
+        values.push(status || null);
+        updates.push(`status = $${values.length}`);
+      }
+      if (last_synced_at !== undefined) {
+        const normalized = last_synced_at
+          ? (() => {
+              const date = new Date(last_synced_at);
+              return Number.isNaN(date.getTime()) ? null : date;
+            })()
+          : null;
+        values.push(normalized);
+        updates.push(`last_synced_at = $${values.length}`);
+      }
+      if (issues !== undefined) {
+        const normalizedIssues = Array.isArray(issues)
+          ? issues
+          : typeof issues === "string"
+            ? (() => {
+                try {
+                  const parsed = JSON.parse(issues);
+                  return Array.isArray(parsed) ? parsed : [];
+                } catch {
+                  return [];
+                }
+              })()
+            : [];
+        values.push(
+          normalizedIssues.length ? JSON.stringify(normalizedIssues) : null,
+        );
+        updates.push(`issues = $${values.length}`);
+      }
+
+      if (!updates.length) {
+        return res.status(400).json({ message: "No merchant fields provided" });
+      }
+
+      values.push(productId);
+      const result = await db.query(
+        `UPDATE merchant_product_sync SET ${updates.join(", ")}, updated_at = now() WHERE product_id = $${values.length} RETURNING *`,
+        values,
+      );
+
+      if (!result.rows.length) {
+        return res
+          .status(404)
+          .json({ message: "Merchant sync record not found" });
+      }
+
+      res.json({
+        message: "Merchant sync record updated",
+        data: result.rows[0],
+      });
+    } catch (err) {
+      console.error("PATCH /api/merchant-product-sync/:productId error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 // Get published smartphones (public) - returns flattened variants as separate rows
 // Get published smartphones (public) - nested structure
@@ -17488,7 +17723,8 @@ app.patch("/api/products/:id/publish", authenticate, async (req, res) => {
       );
       if (is_published) {
         try {
-          compareSyncResult = await syncComparePagesForPrimaryProduct(productId);
+          compareSyncResult =
+            await syncComparePagesForPrimaryProduct(productId);
         } catch (syncErr) {
           console.error(
             "Failed to sync compare pages for published smartphone:",
@@ -17519,7 +17755,9 @@ app.patch("/api/admin/smartphones/bulk", authenticate, async (req, res) => {
 
     const ids = normalizePositiveIntegerList(req.body?.ids);
     if (!ids.length) {
-      return res.status(400).json({ message: "Select at least one smartphone" });
+      return res
+        .status(400)
+        .json({ message: "Select at least one smartphone" });
     }
 
     const hasPublishValue =
@@ -17652,7 +17890,9 @@ app.delete(
     };
 
     if (!ids.length) {
-      return res.status(400).json({ message: "Select at least one smartphone" });
+      return res
+        .status(400)
+        .json({ message: "Select at least one smartphone" });
     }
 
     const client = await db.connect();
@@ -17709,9 +17949,10 @@ app.delete(
       }
 
       const productIds = products.map((product) => Number(product.id));
-      await client.query("DELETE FROM product_publish WHERE product_id = ANY($1::int[])", [
-        productIds,
-      ]);
+      await client.query(
+        "DELETE FROM product_publish WHERE product_id = ANY($1::int[])",
+        [productIds],
+      );
       await client.query(
         "DELETE FROM product_comparisons WHERE product_id = ANY($1::int[]) OR compared_with = ANY($1::int[])",
         [productIds],
@@ -19781,8 +20022,7 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
       variantsByProductId.set(productId, variants);
     }
     for (const item of items) {
-      const variants =
-        variantsByProductId.get(Number(item.product_id)) || [];
+      const variants = variantsByProductId.get(Number(item.product_id)) || [];
 
       const effectivePrice = resolveEffectiveSmartphonePrice(
         variants,
@@ -21122,7 +21362,6 @@ app.post("/api/public/compare/scores", async (req, res) => {
 
       const variantId = Number(item?.variant_id ?? item?.variantId);
       const variantIndex = Number(item?.variant_index ?? item?.variantIndex);
-
       const entry = { product_id: productId };
       if (Number.isInteger(variantId) && variantId > 0) {
         entry.variant_id = variantId;
@@ -21146,25 +21385,87 @@ app.post("/api/public/compare/scores", async (req, res) => {
       SELECT
         p.id AS product_id,
         p.name,
+        p.name AS product_name,
         p.product_type,
-        COALESCE(s.performance, n.performance, l.cpu, t.video_engine_json, '{}'::jsonb) AS performance,
+        b.name AS brand_name,
+        b.name AS brand,
+
+        s.launch_date,
+        s.build_design,
+        s.connectivity,
+        s.network,
+        s.ports,
+        s.audio,
+        s.multimedia,
+        s.sensors,
+
+        COALESCE(
+          s.performance,
+          n.performance,
+          l.cpu,
+          t.video_engine_json,
+          '{}'::jsonb
+        ) AS performance,
         COALESCE(s.display, l.display, t.display_json, '{}'::jsonb) AS display,
         COALESCE(s.camera, '{}'::jsonb) AS camera,
         COALESCE(s.battery, l.battery, t.power_json, '{}'::jsonb) AS battery,
-        (
-          SELECT MIN(v.base_price)
-          FROM product_variants v
-          WHERE v.product_id = p.id
-            AND v.base_price IS NOT NULL
+
+        COALESCE(
+          (
+            SELECT MIN(vsp.price)::numeric
+            FROM product_variants pv
+            INNER JOIN variant_store_prices vsp
+              ON vsp.variant_id = pv.id
+            WHERE pv.product_id = p.id
+              AND vsp.price IS NOT NULL
+          ),
+          (
+            SELECT MIN(pv.base_price)::numeric
+            FROM product_variants pv
+            WHERE pv.product_id = p.id
+              AND pv.base_price IS NOT NULL
+          )
         ) AS min_price,
+
         COALESCE(
           (
             SELECT json_agg(
               jsonb_build_object(
                 'id', v.id,
+                'variant_id', v.id,
+                'variant_key', v.variant_key,
                 'base_price', v.base_price,
                 'price', v.base_price,
-                'attributes', v.attributes
+                'attributes', COALESCE(v.attributes, '{}'::jsonb),
+                'ram', COALESCE(
+                  v.attributes->>'ram',
+                  v.attributes->>'RAM',
+                  v.attributes->>'memory'
+                ),
+                'storage', COALESCE(
+                  v.attributes->>'storage',
+                  v.attributes->>'rom',
+                  v.attributes->>'internal_storage'
+                ),
+                'store_prices', (
+                  SELECT COALESCE(
+                    json_agg(
+                      jsonb_build_object(
+                        'id', vsp.id,
+                        'store_name', vsp.store_name,
+                        'price', vsp.price,
+                        'url', vsp.url,
+                        'offer_text', vsp.offer_text,
+                        'delivery_info', vsp.delivery_info,
+                        'sale_start_date', vsp.sale_start_date
+                      )
+                      ORDER BY vsp.price ASC NULLS LAST, vsp.id ASC
+                    ),
+                    '[]'::json
+                  )
+                  FROM variant_store_prices vsp
+                  WHERE vsp.variant_id = v.id
+                )
               )
               ORDER BY v.id ASC
             )
@@ -21177,6 +21478,8 @@ app.post("/api/public/compare/scores", async (req, res) => {
       INNER JOIN product_publish pub
         ON pub.product_id = p.id
        AND pub.is_published = true
+      LEFT JOIN brands b
+        ON b.id = p.brand_id
       LEFT JOIN smartphones s
         ON s.product_id = p.id
       LEFT JOIN laptop l
@@ -21194,21 +21497,78 @@ app.post("/api/public/compare/scores", async (req, res) => {
       return res.status(404).json({ message: "Products not found" });
     }
 
+    const rowsById = new Map(
+      (productResult.rows || []).map((row) => [Number(row.product_id), row]),
+    );
+    const orderedRows = normalizedDevices
+      .map((entry) => rowsById.get(Number(entry.product_id)))
+      .filter(Boolean);
+
+    const productTypes = new Set(
+      orderedRows.map((row) => String(row.product_type || "").trim()),
+    );
+    if (productTypes.size > 1) {
+      return res.status(400).json({
+        message: "Selected products must have the same product type",
+      });
+    }
+
     const compareConfig = await readCompareScoringConfig();
     const variantSelection = Object.fromEntries(
       normalizedDevices.map((entry) => [String(entry.product_id), entry]),
     );
-    const ranking = buildCompareRanking(
-      productResult.rows,
-      variantSelection,
-      compareConfig,
-    );
+
+    let ranking = [];
+    try {
+      ranking = buildCompareRanking(
+        orderedRows,
+        variantSelection,
+        compareConfig,
+      );
+    } catch (rankingError) {
+      console.error(
+        "Existing compare ranking failed; using Hooks decision engine fallback:",
+        rankingError,
+      );
+    }
+
+    const decision = buildDecisionComparison({
+      devices: orderedRows,
+      selections: variantSelection,
+      ranking,
+    });
+
+    const compatibleCategoryWinners = {
+      ...decision.categoryWinners,
+      ...(decision.categoryWinners?.value
+        ? { priceValue: decision.categoryWinners.value }
+        : {}),
+      ...(decision.categoryWinners?.performance
+        ? { memory: decision.categoryWinners.performance }
+        : {}),
+      ...(decision.categoryWinners?.portability
+        ? { body: decision.categoryWinners.portability }
+        : {}),
+    };
 
     return res.json({
-      scores: ranking.map((row) => ({
-        product_id: Number(row.productId),
-        overall_score: row.overallScore,
-      })),
+      score_version: decision.scoreVersion,
+      generated_at: decision.generatedAt,
+      product_type: decision.productType,
+      scores: decision.scores,
+      devices: decision.devices,
+      overall_winner: decision.overallWinner,
+      overall_verdict: decision.overallVerdict,
+      category_winners: compatibleCategoryWinners,
+      category_verdicts: decision.categoryVerdicts,
+      key_differences: decision.keyDifferences,
+      common_features: decision.commonFeatures,
+      upgrade_story: decision.upgradeStory,
+      use_case_picks: decision.useCasePicks,
+      price_verdict: decision.priceVerdict,
+      tradeoffs: decision.tradeoffs,
+      confidence: decision.confidence,
+      warnings: decision.warnings,
     });
   } catch (err) {
     console.error("POST /api/public/compare/scores error:", err);
@@ -22126,7 +22486,8 @@ const orderCompareItemsByPrimary = (
         ? right.launchTime
         : -Infinity;
       if (leftTime !== rightTime) return rightTime - leftTime;
-      if (left.productId !== right.productId) return right.productId - left.productId;
+      if (left.productId !== right.productId)
+        return right.productId - left.productId;
       return left.index - right.index;
     })
     .map((entry) => entry.item);
@@ -22717,7 +23078,9 @@ const normalizeComparePageRecord = (row) => {
     items[0]?.product_id ||
     null;
   const primaryItem =
-    items.find((item) => item.product_id === primaryProductId) || items[0] || null;
+    items.find((item) => item.product_id === primaryProductId) ||
+    items[0] ||
+    null;
   const launchDates = items
     .map((item) => item.launch_date)
     .filter(Boolean)
@@ -22745,13 +23108,11 @@ const normalizeComparePageRecord = (row) => {
     smartphone_type_label: String(
       row.smartphone_type_label || row.smartphoneTypeLabel || "",
     ).trim(),
-    launch_date:
-      row.launch_date ||
-      row.launchDate ||
-      latestLaunchDate ||
-      null,
+    launch_date: row.launch_date || row.launchDate || latestLaunchDate || null,
     oldest_launch_date: launchDates[0] || null,
-    latest_launch_date: latestLaunchDate ? String(latestLaunchDate).slice(0, 10) : null,
+    latest_launch_date: latestLaunchDate
+      ? String(latestLaunchDate).slice(0, 10)
+      : null,
     slug: String(row.slug || "").trim(),
     title: String(row.title || "").trim(),
     meta_description: String(
@@ -22929,7 +23290,9 @@ const compareMarketSegmentDistance = (left, right) => {
 };
 
 const extractCompareMarketProcessorKey = (device = {}) => {
-  const performance = toPlainObject(device.performance || device.performance_json);
+  const performance = toPlainObject(
+    device.performance || device.performance_json,
+  );
   const text = normalizeSmartphoneMatchToken(
     performance.processor ||
       performance.cpu ||
@@ -22961,7 +23324,9 @@ const extractCompareMarketProcessorKey = (device = {}) => {
 };
 
 const resolveCompareMarketIntentTags = (device = {}) => {
-  const performance = toPlainObject(device.performance || device.performance_json);
+  const performance = toPlainObject(
+    device.performance || device.performance_json,
+  );
   const display = toPlainObject(device.display || device.display_json);
   const camera = toPlainObject(device.camera || device.camera_json);
   const battery = toPlainObject(device.battery || device.battery_json);
@@ -22994,7 +23359,11 @@ const resolveCompareMarketIntentTags = (device = {}) => {
   if (/\b(camera|mp|sony|zeiss|sensor|portrait|selfie)\b/.test(text)) {
     tags.add("camera");
   }
-  if (/\b(gaming|performance|snapdragon|dimensity|processor|chipset|gpu)\b/.test(text)) {
+  if (
+    /\b(gaming|performance|snapdragon|dimensity|processor|chipset|gpu)\b/.test(
+      text,
+    )
+  ) {
     tags.add("performance");
   }
   if (/\b(display|screen|amoled|oled|refresh|hz|brightness)\b/.test(text)) {
@@ -23062,7 +23431,11 @@ const countCompareMarketSpecOverlap = (primary = {}, candidate = {}) => {
   return Math.min(4, overlap);
 };
 
-const scoreCompareMarketCandidate = (primary = {}, candidate = {}, pairStats) => {
+const scoreCompareMarketCandidate = (
+  primary = {},
+  candidate = {},
+  pairStats,
+) => {
   const primaryId = Number(primary.product_id);
   const candidateId = Number(candidate.product_id);
   if (!primaryId || !candidateId || primaryId === candidateId) return null;
@@ -23120,7 +23493,9 @@ const scoreCompareMarketCandidate = (primary = {}, candidate = {}, pairStats) =>
   const primarySeries = primary.series_key || "";
   const candidateSeries = candidate.series_key || "";
   const seriesBonus =
-    primarySeries && candidateSeries && primarySeries === candidateSeries ? 6 : 0;
+    primarySeries && candidateSeries && primarySeries === candidateSeries
+      ? 6
+      : 0;
   const userDemandBonus = pairStats
     ? Math.min(12, Math.log1p(Number(pairStats.compare_count) || 0) * 5)
     : 0;
@@ -23220,7 +23595,9 @@ const selectCompareMarketMatches = (primary = {}, scored = []) => {
   const needsManualReview = pool.length < AUTO_COMPARE_CANDIDATES_PER_PRIMARY;
   const fallbackPool = pool.length
     ? pool
-    : scored.filter((entry) => entry.priceDiffRatio == null || entry.priceDiffRatio <= 0.45);
+    : scored.filter(
+        (entry) => entry.priceDiffRatio == null || entry.priceDiffRatio <= 0.45,
+      );
   const crossBrandQualified = fallbackPool.filter(
     (entry) => entry.crossBrand && entry.score >= AUTO_COMPARE_MIN_PAIR_SCORE,
   ).length;
@@ -23249,12 +23626,17 @@ const selectCompareMarketMatches = (primary = {}, scored = []) => {
   };
 };
 
-const normalizeCompareMarketPhoneRow = (row = {}, expectedPriceCandidates = []) => {
+const normalizeCompareMarketPhoneRow = (
+  row = {},
+  expectedPriceCandidates = [],
+) => {
   const officialPrice = normalizeSmartphoneExpectedPrice(
     row.store_price,
     row.base_price,
   );
-  const manualExpectedPrice = normalizeSmartphoneExpectedPrice(row.expected_price);
+  const manualExpectedPrice = normalizeSmartphoneExpectedPrice(
+    row.expected_price,
+  );
   let algorithmExpectedPrice = null;
   let algorithmPriceMeta = null;
 
@@ -23276,7 +23658,8 @@ const normalizeCompareMarketPhoneRow = (row = {}, expectedPriceCandidates = []) 
     );
   }
 
-  const matchPrice = officialPrice ?? manualExpectedPrice ?? algorithmExpectedPrice;
+  const matchPrice =
+    officialPrice ?? manualExpectedPrice ?? algorithmExpectedPrice;
   const priceSource =
     officialPrice !== null
       ? "official"
@@ -23300,7 +23683,10 @@ const normalizeCompareMarketPhoneRow = (row = {}, expectedPriceCandidates = []) 
     match_price: matchPrice,
     price_source: priceSource,
     expected_price:
-      manualExpectedPrice ?? algorithmExpectedPrice ?? row.expected_price ?? null,
+      manualExpectedPrice ??
+      algorithmExpectedPrice ??
+      row.expected_price ??
+      null,
     image_url: row.image_url || null,
     display: toPlainObject(row.display),
     performance: toPlainObject(row.performance),
@@ -23331,7 +23717,8 @@ const fetchCompareMarketSmartphones = async ({
     ? Math.min(730, Math.max(1, Math.floor(Number(days))))
     : 180;
   const normalizedPrimaryProductId = Number(primaryProductId);
-  const expectedPriceCandidates = await fetchSmartphoneExpectedPriceCandidates();
+  const expectedPriceCandidates =
+    await fetchSmartphoneExpectedPriceCandidates();
   const result = await db.query(
     `
     SELECT
@@ -23477,10 +23864,13 @@ const fetchCompareMarketPairStats = async (productIds = [], days = 180) => {
 
   const stats = new Map();
   for (const row of result.rows || []) {
-    stats.set(getCompareMarketPairKey(row.left_product_id, row.right_product_id), {
-      compare_count: Number(row.compare_count) || 0,
-      last_compared_at: row.last_compared_at || null,
-    });
+    stats.set(
+      getCompareMarketPairKey(row.left_product_id, row.right_product_id),
+      {
+        compare_count: Number(row.compare_count) || 0,
+        last_compared_at: row.last_compared_at || null,
+      },
+    );
   }
   return stats;
 };
@@ -23516,7 +23906,10 @@ const fetchMarketComparePageCandidates = async ({
   const safeLimit = Number.isFinite(Number(limit))
     ? Math.min(300, Math.max(1, Math.floor(Number(limit))))
     : 100;
-  const phones = await fetchCompareMarketSmartphones({ days, primaryProductId });
+  const phones = await fetchCompareMarketSmartphones({
+    days,
+    primaryProductId,
+  });
   if (phones.length < 2) return [];
 
   const pairStats = await fetchCompareMarketPairStats(
@@ -23525,8 +23918,11 @@ const fetchMarketComparePageCandidates = async ({
   );
   const normalizedPrimaryProductId = Number(primaryProductId);
   const primaryPool =
-    Number.isInteger(normalizedPrimaryProductId) && normalizedPrimaryProductId > 0
-      ? phones.filter((phone) => phone.product_id === normalizedPrimaryProductId)
+    Number.isInteger(normalizedPrimaryProductId) &&
+    normalizedPrimaryProductId > 0
+      ? phones.filter(
+          (phone) => phone.product_id === normalizedPrimaryProductId,
+        )
       : phones
           .filter((phone) => {
             const recency = phone.launch_recency_days;
@@ -23584,7 +23980,10 @@ const fetchMarketComparePageCandidates = async ({
     if (!selected.length) continue;
 
     for (const entry of selected) {
-      const items = [primary, entry.candidate].slice(0, AUTO_COMPARE_MAX_DEVICES);
+      const items = [primary, entry.candidate].slice(
+        0,
+        AUTO_COMPARE_MAX_DEVICES,
+      );
       const compareKey = getCompareMarketPageKey("smartphone", items);
       if (!compareKey || seenPageKeys.has(compareKey)) continue;
       seenPageKeys.add(compareKey);
@@ -23619,10 +24018,10 @@ const fetchMarketComparePageCandidates = async ({
     }
 
     if (selected.length >= AUTO_COMPARE_CANDIDATES_PER_PRIMARY) {
-      const trioItems = [primary, ...selected.map((entry) => entry.candidate)].slice(
-        0,
-        AUTO_COMPARE_MAX_DEVICES,
-      );
+      const trioItems = [
+        primary,
+        ...selected.map((entry) => entry.candidate),
+      ].slice(0, AUTO_COMPARE_MAX_DEVICES);
       const trioScore =
         selected.reduce((sum, entry) => sum + entry.score, 0) / selected.length;
       const compareKey = getCompareMarketPageKey("smartphone", trioItems);
@@ -23870,7 +24269,9 @@ const fetchUserTrendComparePageCandidates = async ({
 
 const resolveComparePagePrimaryLaunchTime = (page = {}) => {
   const items = parseComparePageItems(page.items);
-  const primaryProductId = Number(page.primary_product_id ?? page.primaryProductId);
+  const primaryProductId = Number(
+    page.primary_product_id ?? page.primaryProductId,
+  );
   const primaryItem =
     items.find(
       (item) =>
@@ -23910,7 +24311,11 @@ const mergeAutomaticComparePageMetrics = (preferred = {}, other = {}) => ({
   ),
 });
 
-const mergeAutomaticComparePages = (pageGroups = [], limit = 100, options = {}) => {
+const mergeAutomaticComparePages = (
+  pageGroups = [],
+  limit = 100,
+  options = {},
+) => {
   const safeLimit = Number.isFinite(Number(limit))
     ? Math.min(300, Math.max(1, Math.floor(Number(limit))))
     : 100;
@@ -23936,7 +24341,8 @@ const mergeAutomaticComparePages = (pageGroups = [], limit = 100, options = {}) 
     if (hasFocusedPrimary) {
       const existingHasFocus =
         Number(existing.primary_product_id) === focusedPrimaryProductId;
-      const nextHasFocus = Number(page.primary_product_id) === focusedPrimaryProductId;
+      const nextHasFocus =
+        Number(page.primary_product_id) === focusedPrimaryProductId;
       if (nextHasFocus !== existingHasFocus) {
         byKey.set(
           key,
@@ -23974,7 +24380,8 @@ const mergeAutomaticComparePages = (pageGroups = [], limit = 100, options = {}) 
       Number(existing.manual_compare_count || 0) * 3;
     const nextScore =
       Number(page.auto_priority || 0) * 1000 +
-      Number(page.system_score || 0) + Number(page.manual_compare_count || 0) * 3;
+      Number(page.system_score || 0) +
+      Number(page.manual_compare_count || 0) * 3;
     if (nextScore > existingScore) {
       byKey.set(key, mergeAutomaticComparePageMetrics(page, existing));
     }
@@ -24000,8 +24407,16 @@ const fetchAutomaticComparePageCandidates = async ({
     ? Math.min(300, Math.max(1, Math.floor(Number(limit))))
     : 100;
   const [trendPages, marketPages] = await Promise.all([
-    fetchUserTrendComparePageCandidates({ days, limit: safeLimit, primaryProductId }),
-    fetchMarketComparePageCandidates({ days, limit: safeLimit, primaryProductId }),
+    fetchUserTrendComparePageCandidates({
+      days,
+      limit: safeLimit,
+      primaryProductId,
+    }),
+    fetchMarketComparePageCandidates({
+      days,
+      limit: safeLimit,
+      primaryProductId,
+    }),
   ]);
 
   return mergeAutomaticComparePages([trendPages, marketPages], safeLimit, {
@@ -25077,8 +25492,12 @@ app.get("/api/admin/compare-pages", authenticate, async (req, res) => {
       ? Math.min(500, Math.max(1, Math.floor(limitRaw)))
       : 100;
     const queryText = String(req.query?.q || req.query?.query || "").trim();
-    const sourceFilter = String(req.query?.source || "").trim().toLowerCase();
-    const statusFilter = String(req.query?.status || "").trim().toLowerCase();
+    const sourceFilter = String(req.query?.source || "")
+      .trim()
+      .toLowerCase();
+    const statusFilter = String(req.query?.status || "")
+      .trim()
+      .toLowerCase();
     const segmentFilter = String(req.query?.segment || "").trim();
     const dateBasis = String(
       req.query?.date_basis || req.query?.dateBasis || "updated",
@@ -25086,7 +25505,9 @@ app.get("/api/admin/compare-pages", authenticate, async (req, res) => {
       .trim()
       .toLowerCase();
     const daysRaw = Number(req.query?.days);
-    const fromDateRaw = String(req.query?.from_date || req.query?.fromDate || "")
+    const fromDateRaw = String(
+      req.query?.from_date || req.query?.fromDate || "",
+    )
       .trim()
       .slice(0, 10);
     const filterParams = [];
@@ -25356,11 +25777,17 @@ app.patch("/api/admin/compare-pages/bulk", authenticate, async (req, res) => {
 
     const ids = normalizePositiveIntegerList(req.body?.ids);
     if (!ids.length) {
-      return res.status(400).json({ message: "Select at least one compare page" });
+      return res
+        .status(400)
+        .json({ message: "Select at least one compare page" });
     }
 
-    const status = String(req.body?.status || "").trim().toLowerCase();
-    const source = String(req.body?.source || "").trim().toLowerCase();
+    const status = String(req.body?.status || "")
+      .trim()
+      .toLowerCase();
+    const source = String(req.body?.source || "")
+      .trim()
+      .toLowerCase();
     const generationReason = String(
       req.body?.generation_reason || req.body?.generationReason || "",
     ).trim();
@@ -25431,7 +25858,9 @@ app.delete("/api/admin/compare-pages/bulk", authenticate, async (req, res) => {
 
     const ids = normalizePositiveIntegerList(req.body?.ids);
     if (!ids.length) {
-      return res.status(400).json({ message: "Select at least one compare page" });
+      return res
+        .status(400)
+        .json({ message: "Select at least one compare page" });
     }
 
     const result = await db.query(
@@ -25446,7 +25875,9 @@ app.delete("/api/admin/compare-pages/bulk", authenticate, async (req, res) => {
     return res.json({
       ok: true,
       deleted_count: Number(result.rowCount) || 0,
-      deleted_ids: (result.rows || []).map((row) => Number(row.id)).filter(Boolean),
+      deleted_ids: (result.rows || [])
+        .map((row) => Number(row.id))
+        .filter(Boolean),
       generated_at: new Date().toISOString(),
     });
   } catch (err) {
