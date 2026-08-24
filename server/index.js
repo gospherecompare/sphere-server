@@ -12729,6 +12729,8 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
         bl.content_rendered,
         bl.meta_title,
         bl.meta_description,
+        aig.content AS ai_summary,
+        aig.generated_at AS ai_summary_generated_at,
         COALESCE(
           bl.hero_image,
           (
@@ -12780,6 +12782,11 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
         ON p.id = bl.product_id
       LEFT JOIN brands b
         ON b.id = p.brand_id
+      LEFT JOIN ai_generated_content aig
+        ON aig.entity_type = 'blog'
+        AND aig.entity_id = bl.id
+        AND aig.content_type = 'summary'
+        AND aig.status = 'generated'
       LEFT JOIN LATERAL (
         SELECT
           array_agg(linked_product.id ORDER BY bpl.position ASC, linked_product.id ASC) AS product_ids,
@@ -12817,6 +12824,357 @@ app.get("/api/public/blogs/:slug", async (req, res) => {
     return res.status(500).json({ message: "Failed to fetch blog" });
   }
 });
+
+/*--- AI: Generate blog summary ---*/
+app.post(
+  "/api/admin/ai/blogs/:blogId/summary",
+  authenticate,
+  ensureBlogManagerAccess,
+  async (req, res) => {
+    try {
+      const blogId = Number(req.params.blogId);
+      const { force = false } = req.body;
+
+      if (!blogId || blogId <= 0) {
+        return res.status(400).json({ message: "Invalid blog ID" });
+      }
+
+      // Fetch the blog with product details
+      const blogResult = await db.query(
+        `
+      SELECT
+        bl.id,
+        bl.title,
+        bl.excerpt,
+        bl.category,
+        bl.content_rendered,
+        bl.tags,
+        bl.published_at,
+        p.id as product_id,
+        p.name as product_name,
+        p.product_type,
+        b.name as brand_name
+      FROM blogs bl
+      LEFT JOIN products p ON p.id = bl.product_id
+      LEFT JOIN brands b ON b.id = p.brand_id
+      WHERE bl.id = $1
+      LIMIT 1
+      `,
+        [blogId],
+      );
+
+      if (!blogResult.rows.length) {
+        return res.status(404).json({ message: "Blog not found" });
+      }
+
+      const blog = blogResult.rows[0];
+
+      // Import AI service
+      const {
+        generateBlogSummary,
+        createInputHash,
+      } = require("./services/ai/generateBlogSummary");
+      const { buildBlogAiInput } = require("./services/ai/buildBlogAiInput");
+      const { saveAiContent } = require("./services/ai/aiContentRepository");
+
+      const inputHash = createInputHash(buildBlogAiInput(blog));
+
+      if (!force) {
+        const cachedResult = await db.query(
+          `
+        SELECT content, generated_at, input_hash
+        FROM ai_generated_content
+        WHERE entity_type = 'blog'
+          AND entity_id = $1
+          AND content_type = 'summary'
+          AND status = 'generated'
+        LIMIT 1
+        `,
+          [blogId],
+        );
+        const cached = cachedResult.rows[0];
+        if (cached && cached.input_hash === inputHash) {
+          return res.json({
+            ok: true,
+            cached: true,
+            summary: cached.content,
+            generatedAt: cached.generated_at,
+          });
+        }
+      }
+
+      // Generate new summary
+      let summary, model, temperature, inputTokens, outputTokens;
+      try {
+        const result = await generateBlogSummary(blog);
+        summary = result.summary;
+        model = result.model;
+        temperature = result.temperature;
+        inputTokens = result.inputTokens;
+        outputTokens = result.outputTokens;
+      } catch (aiErr) {
+        console.error("AI summary generation failed:", aiErr);
+        return res.status(500).json({
+          message: "Failed to generate summary",
+          error: aiErr.message,
+        });
+      }
+
+      if (!force) {
+        const cachedResult = await db.query(
+          `
+        SELECT content, generated_at, input_hash
+        FROM ai_generated_content
+        WHERE entity_type = 'blog'
+          AND entity_id = $1
+          AND content_type = 'summary'
+          AND status = 'generated'
+        LIMIT 1
+        `,
+          [blogId],
+        );
+        const cached = cachedResult.rows[0];
+        if (cached && cached.input_hash === inputHash) {
+          return res.json({
+            ok: true,
+            cached: true,
+            summary: cached.content,
+            generatedAt: cached.generated_at,
+          });
+        }
+      }
+
+      // Persist the AI result with inputHash for stale detection
+      const generatedAt = new Date().toISOString();
+
+      await saveAiContent({
+        entityType: "blog",
+        entityId: blogId,
+        contentType: "summary",
+        content: summary,
+        status: "generated",
+        model,
+        temperature,
+        inputTokens,
+        outputTokens,
+        inputHash,
+      });
+
+      return res.json({
+        ok: true,
+        cached: false,
+        summary,
+        model,
+        temperature,
+        inputTokens,
+        outputTokens,
+        generatedAt,
+      });
+    } catch (err) {
+      console.error("POST /api/admin/ai/blogs/:blogId/summary error:", err);
+      return res.status(500).json({
+        message: "Failed to generate blog summary",
+        error: err.message,
+      });
+    }
+  },
+);
+
+/*--- AI: Generate product summary ---*/
+app.post(
+  "/api/admin/ai/products/:productId/summary",
+  authenticate,
+  ensureBlogManagerAccess,
+  async (req, res) => {
+    try {
+      const productId = Number(req.params.productId);
+      const { force = false } = req.body;
+
+      if (!productId || productId <= 0) {
+        return res.status(400).json({ message: "Invalid product ID" });
+      }
+
+      // Fetch product with smartphone specs and variants
+      const productResult = await db.query(
+        `
+      SELECT
+        p.id,
+        p.name,
+        p.product_type,
+        p.brand_id,
+        b.name as brand_name,
+        s.id as smartphone_id,
+        s.model,
+        s.brand,
+        s.display,
+        s.performance,
+        s.camera,
+        s.battery,
+        s.build_design,
+        s.connectivity,
+        s.network,
+        s.ports,
+        s.audio,
+        s.sensors,
+        s.launch_date,
+        s.launch_status_override,
+        s.expected_price
+      FROM products p
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN smartphones s ON s.product_id = p.id
+      WHERE p.id = $1
+      LIMIT 1
+      `,
+        [productId],
+      );
+
+      if (!productResult.rows.length) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+
+      const product = productResult.rows[0];
+
+      if (product.product_type !== "smartphone") {
+        return res.status(400).json({
+          message:
+            "Product AI summary is currently available for smartphones only",
+        });
+      }
+
+      if (!product.smartphone_id) {
+        return res.status(400).json({
+          message:
+            "Smartphone specifications are required before generating a summary",
+        });
+      }
+
+      // Fetch variants
+      const variantsResult = await db.query(
+        `
+      SELECT id, variant_key, storage, ram, color, base_price
+      FROM product_variants
+      WHERE product_id = $1
+      `,
+        [productId],
+      );
+
+      const variants = variantsResult.rows || [];
+
+      let prices = [];
+      if (variants.length > 0) {
+        const pricesResult = await db.query(
+          `
+        SELECT price
+        FROM variant_store_prices
+        WHERE variant_id = ANY($1::int[])
+        LIMIT 20
+        `,
+          [variants.map((variant) => variant.id)],
+        );
+        prices = pricesResult.rows || [];
+      }
+
+      // Import AI service
+      const {
+        generateProductSummary,
+        createInputHash,
+      } = require("./services/ai/generateProductSummary");
+      const {
+        buildProductAiInput,
+      } = require("./services/ai/buildProductAiInput");
+      const { saveAiContent } = require("./services/ai/aiContentRepository");
+
+      const inputHash = createInputHash(
+        buildProductAiInput({
+          product,
+          smartphone: product.smartphone_id ? product : null,
+          variants,
+          prices,
+        }),
+      );
+
+      if (!force) {
+        const cachedResult = await db.query(
+          `
+        SELECT content, generated_at, input_hash
+        FROM ai_generated_content
+        WHERE entity_type = 'smartphone'
+          AND entity_id = $1
+          AND content_type = 'summary'
+          AND status = 'generated'
+        LIMIT 1
+        `,
+          [productId],
+        );
+        const cached = cachedResult.rows[0];
+        if (cached && cached.input_hash === inputHash) {
+          return res.json({
+            ok: true,
+            cached: true,
+            summary: cached.content,
+            generatedAt: cached.generated_at,
+          });
+        }
+      }
+
+      // Generate the current snapshot and hash before deciding whether cache is stale.
+      let summary, model, temperature, inputTokens, outputTokens;
+      try {
+        const result = await generateProductSummary({
+          product,
+          smartphone: product.smartphone_id ? product : null,
+          variants,
+          prices,
+        });
+        summary = result.summary;
+        model = result.model;
+        temperature = result.temperature;
+        inputTokens = result.inputTokens;
+        outputTokens = result.outputTokens;
+      } catch (aiErr) {
+        console.error("AI summary generation failed:", aiErr);
+        return res.status(500).json({
+          message: "Failed to generate summary",
+          error: aiErr.message,
+        });
+      }
+
+      const generatedAt = new Date().toISOString();
+      await saveAiContent({
+        entityType: "smartphone",
+        entityId: productId,
+        contentType: "summary",
+        content: summary,
+        status: "generated",
+        model,
+        temperature,
+        inputTokens,
+        outputTokens,
+        inputHash,
+      });
+
+      return res.json({
+        ok: true,
+        cached: false,
+        summary,
+        model,
+        temperature,
+        inputTokens,
+        outputTokens,
+        generatedAt,
+      });
+    } catch (err) {
+      console.error(
+        "POST /api/admin/ai/products/:productId/summary error:",
+        err,
+      );
+      return res.status(500).json({
+        message: "Failed to generate product summary",
+        error: err.message,
+      });
+    }
+  },
+);
 
 /*--- ratings smartphones  ---*/
 app.post(
@@ -13569,8 +13927,17 @@ app.patch(
 // Get published smartphones (public) - nested structure
 app.get("/api/smartphones", async (req, res) => {
   try {
+    const hasPagination =
+      req.query.page !== undefined || req.query.limit !== undefined;
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(
+      100,
+      Math.max(1, Number.parseInt(req.query.limit, 10) || 20),
+    );
+    const offset = (page - 1) * limit;
     const profileConfig = await readDeviceFieldProfilesConfig();
-    const result = await db.query(`
+    const result = await db.query(
+      `
       SELECT
         p.id AS product_id,
         p.name,
@@ -13675,8 +14042,23 @@ app.get("/api/smartphones", async (req, res) => {
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at,
         s.expected_price
 
-      ORDER BY COALESCE(MAX(ds.hook_score), 0) DESC, p.id DESC;
-    `);
+      ORDER BY COALESCE(MAX(ds.hook_score), 0) DESC, p.id DESC
+      ${hasPagination ? "LIMIT $1 OFFSET $2" : ""};
+    `,
+      hasPagination ? [limit, offset] : [],
+    );
+
+    const countResult = hasPagination
+      ? await db.query(`
+          SELECT COUNT(DISTINCT p.id)::int AS total
+          FROM products p
+          INNER JOIN smartphones s ON s.product_id = p.id
+          INNER JOIN product_publish pub
+            ON pub.product_id = p.id
+           AND pub.is_published = true
+          WHERE p.product_type = 'smartphone';
+        `)
+      : null;
 
     const normalizeHookNumber = (value, fallback = null) => {
       const numeric = Number(value);
@@ -13792,7 +14174,19 @@ app.get("/api/smartphones", async (req, res) => {
     const publicSmartphones = sortedSmartphones.map((item) =>
       toPublicSmartphoneResponse(item),
     );
-    res.json({ smartphones: publicSmartphones });
+    if (!hasPagination) {
+      res.json({ smartphones: publicSmartphones });
+      return;
+    }
+
+    const total = Number(countResult?.rows?.[0]?.total || 0);
+    res.json({
+      smartphones: publicSmartphones,
+      page,
+      limit,
+      total,
+      hasNext: offset + publicSmartphones.length < total,
+    });
   } catch (err) {
     console.error("GET /api/smartphones error:", err);
     res.status(500).json({ error: err.message });
@@ -27092,9 +27486,29 @@ app.get("/api/public/product/:id", async (req, res) => {
       profileConfig.profiles,
     );
 
+    // Fetch AI summary if available
+    let aiSummary = null;
+    if (product.product_type === "smartphone") {
+      const aiSummaryResult = await db.query(
+        `
+        SELECT content
+        FROM ai_generated_content
+        WHERE entity_type = 'smartphone'
+          AND entity_id = $1
+          AND content_type = 'summary'
+          AND status = 'generated'
+        LIMIT 1
+        `,
+        [id],
+      );
+      if (aiSummaryResult.rows.length) {
+        aiSummary = aiSummaryResult.rows[0].content;
+      }
+    }
+
     const publicResponse =
       product.product_type === "smartphone"
-        ? toPublicSmartphoneResponse(scoredResponse)
+        ? { ...toPublicSmartphoneResponse(scoredResponse), aiSummary }
         : scoredResponse;
 
     res.json(publicResponse);
