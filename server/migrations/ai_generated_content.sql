@@ -13,7 +13,9 @@ CREATE TABLE IF NOT EXISTS ai_generated_content (
       'pending',
       'generating',
       'generated',
-      'failed'
+      'failed',
+      'disabled',
+      'waiting_for_data'
     )),
 
   model TEXT,
@@ -37,6 +39,13 @@ CREATE TABLE IF NOT EXISTS ai_generated_content (
     content_type
   )
 );
+
+ALTER TABLE ai_generated_content
+  DROP CONSTRAINT IF EXISTS ai_generated_content_status_check;
+
+ALTER TABLE ai_generated_content
+  ADD CONSTRAINT ai_generated_content_status_check
+  CHECK (status IN ('pending', 'generating', 'generated', 'failed', 'disabled', 'waiting_for_data'));
 
 CREATE INDEX IF NOT EXISTS idx_ai_generated_content_entity
 ON ai_generated_content (

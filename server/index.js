@@ -13459,12 +13459,259 @@ app.delete("/api/reviews/:id", authenticateCustomer, async (req, res) => {
   Smartphones CRUD (Option B input format) - tables with   suffix
 ------------------------*/
 
+const smartphoneAiQueue = [];
+let smartphoneAiWorkerRunning = false;
+const { getProductAiEligibility } = require("./services/ai/isProductAiEligible");
+
+const processSmartphoneAiQueue = async () => {
+  if (smartphoneAiWorkerRunning) return;
+  smartphoneAiWorkerRunning = true;
+
+  try {
+    while (smartphoneAiQueue.length) {
+      const productId = smartphoneAiQueue.shift();
+      try {
+        const productResult = await db.query(
+          `
+          SELECT p.id, p.name, p.product_type, b.name AS brand_name,
+                 s.id AS smartphone_id, s.model, s.brand, s.display,
+                 s.performance, s.camera, s.battery, s.build_design,
+                 s.connectivity, s.network, s.ports, s.audio, s.sensors,
+                   s.launch_date, s.launch_status_override, s.expected_price,
+                   COALESCE(pub.is_published, false) AS is_published
+          FROM products p
+          LEFT JOIN brands b ON b.id = p.brand_id
+          LEFT JOIN smartphones s ON s.product_id = p.id
+                 LEFT JOIN product_publish pub ON pub.product_id = p.id
+          WHERE p.id = $1 AND p.product_type = 'smartphone'
+          LIMIT 1
+          `,
+          [productId],
+        );
+        const product = productResult.rows[0];
+        if (!product?.smartphone_id) continue;
+
+        const variantsResult = await db.query(
+          `SELECT id, variant_key, attributes->>'storage' AS storage,
+                  attributes->>'ram' AS ram, base_price
+           FROM product_variants WHERE product_id = $1`,
+          [productId],
+        );
+        const variants = variantsResult.rows || [];
+        let prices = [];
+        if (variants.length) {
+          const pricesResult = await db.query(
+            `SELECT price FROM variant_store_prices
+             WHERE variant_id = ANY($1::int[]) LIMIT 20`,
+            [variants.map((variant) => variant.id)],
+          );
+          prices = pricesResult.rows || [];
+        }
+
+        const eligibility = getProductAiEligibility(product);
+        if (!eligibility.eligible) {
+          const { saveAiContent } = require("./services/ai/aiContentRepository");
+          await saveAiContent({
+            entityType: "smartphone",
+            entityId: productId,
+            content: null,
+            contentType: "summary",
+            status: eligibility.status,
+            errorMessage: eligibility.reason,
+          });
+          continue;
+        }
+
+        const { generateProductSummary } = require("./services/ai/generateProductSummary");
+        const { saveAiContent } = require("./services/ai/aiContentRepository");
+        await saveAiContent({
+          entityType: "smartphone",
+          entityId: productId,
+          contentType: "summary",
+          content: null,
+          status: "generating",
+        });
+        const result = await generateProductSummary({
+          product,
+          smartphone: product,
+          variants,
+          prices,
+        });
+        await saveAiContent({
+          entityType: "smartphone",
+          entityId: productId,
+          contentType: "summary",
+          content: result.summary,
+          status: "generated",
+          model: result.model,
+          temperature: result.temperature,
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          inputHash: result.inputHash,
+        });
+      } catch (error) {
+        console.error(`Automatic AI summary failed for product ${productId}:`, error.message);
+        try {
+          const { saveAiContent } = require("./services/ai/aiContentRepository");
+          await saveAiContent({
+            entityType: "smartphone",
+            entityId: productId,
+            content: null,
+            contentType: "summary",
+            status: "failed",
+            errorMessage: error.message,
+          });
+        } catch (saveError) {
+          console.error("Could not save AI failure status:", saveError.message);
+        }
+      }
+    }
+  } finally {
+    smartphoneAiWorkerRunning = false;
+  }
+};
+
+const enqueueSmartphoneAiSummary = async (productId) => {
+  const { saveAiContent } = require("./services/ai/aiContentRepository");
+  const { buildProductAiInput } = require("./services/ai/buildProductAiInput");
+
+  const snapshotResult = await db.query(
+    `
+    SELECT p.id, p.name, p.product_type, b.name AS brand_name,
+           s.id AS smartphone_id, s.model, s.brand, s.display,
+           s.performance, s.camera, s.battery, s.build_design,
+           s.connectivity, s.network, s.ports, s.audio, s.sensors,
+           s.launch_date, s.launch_status_override, s.expected_price,
+           COALESCE(pub.is_published, false) AS is_published
+    FROM products p
+    LEFT JOIN brands b ON b.id = p.brand_id
+    LEFT JOIN smartphones s ON s.product_id = p.id
+    LEFT JOIN product_publish pub ON pub.product_id = p.id
+    WHERE p.id = $1 AND p.product_type = 'smartphone'
+    LIMIT 1
+    `,
+    [productId],
+  );
+  const product = snapshotResult.rows[0];
+  if (!product?.smartphone_id) return { queued: false, status: "disabled" };
+
+  const eligibility = getProductAiEligibility(product);
+  if (!eligibility.eligible) {
+    await saveAiContent({
+      entityType: "smartphone",
+      entityId: productId,
+      contentType: "summary",
+      content: null,
+      status: eligibility.status,
+      errorMessage: eligibility.reason,
+    });
+    return { queued: false, status: eligibility.status };
+  }
+
+  const variantsResult = await db.query(
+    `SELECT id, variant_key, attributes->>'storage' AS storage,
+            attributes->>'ram' AS ram, base_price
+     FROM product_variants WHERE product_id = $1`,
+    [productId],
+  );
+  const variants = variantsResult.rows || [];
+  let prices = [];
+  if (variants.length) {
+    const pricesResult = await db.query(
+      `SELECT price FROM variant_store_prices
+       WHERE variant_id = ANY($1::int[]) LIMIT 20`,
+      [variants.map((variant) => variant.id)],
+    );
+    prices = pricesResult.rows || [];
+  }
+  const inputHash = crypto
+    .createHash("sha256")
+    .update(JSON.stringify(buildProductAiInput({ product, smartphone: product, variants, prices })))
+    .digest("hex");
+  const existing = await db.query(
+    `SELECT status, input_hash FROM ai_generated_content
+     WHERE entity_type = 'smartphone' AND entity_id = $1 AND content_type = 'summary'
+     LIMIT 1`,
+    [productId],
+  );
+  if (existing.rows[0]?.status === "generated" && existing.rows[0].input_hash === inputHash) {
+    return { queued: false, status: "generated" };
+  }
+
+  await saveAiContent({
+    entityType: "smartphone",
+    entityId: productId,
+    contentType: "summary",
+    content: null,
+    status: "pending",
+  });
+  if (!smartphoneAiQueue.includes(productId)) smartphoneAiQueue.push(productId);
+  setImmediate(() => processSmartphoneAiQueue().catch((error) => {
+    console.error("Smartphone AI queue failed:", error.message);
+  }));
+  return { queued: true, status: "pending", inputHash };
+};
+
+app.post(
+  "/api/admin/ai/products/queue",
+  authenticate,
+  ensureBlogManagerAccess,
+  async (req, res) => {
+    try {
+      const limitRaw = Number(req.body?.limit);
+      const limit = Number.isInteger(limitRaw) && limitRaw > 0
+        ? Math.min(limitRaw, 1000)
+        : 1000;
+      const result = await db.query(
+        `
+        SELECT p.id
+        FROM products p
+        INNER JOIN smartphones s ON s.product_id = p.id
+        LEFT JOIN ai_generated_content ai
+          ON ai.entity_type = 'smartphone'
+         AND ai.entity_id = p.id
+         AND ai.content_type = 'summary'
+        LEFT JOIN product_publish pub ON pub.product_id = p.id
+        WHERE p.product_type = 'smartphone'
+          AND COALESCE(pub.is_published, false) = true
+          AND (ai.id IS NULL OR ai.status IN ('failed', 'pending', 'generating', 'waiting_for_data'))
+        ORDER BY p.id ASC
+        LIMIT $1
+        `,
+        [limit],
+      );
+
+      let queued = 0;
+      for (const row of result.rows) {
+        const queueResult = await enqueueSmartphoneAiSummary(row.id);
+        if (queueResult?.queued) queued += 1;
+      }
+
+      return res.status(202).json({
+        ok: true,
+        queued,
+        scanned: result.rows.length,
+        message: "AI summaries queued for background generation",
+      });
+    } catch (error) {
+      console.error("Queue product AI summaries error:", error.message);
+      return res.status(500).json({ message: "Failed to queue AI summaries" });
+    }
+  },
+);
+
 // Create smartphone (with variants + variant_store_prices )
 app.post("/api/smartphones", authenticate, async (req, res) => {
   const client = await db.connect();
 
   try {
-    const { product, smartphone, images = [], variants = [] } = req.body;
+    const {
+      product,
+      smartphone,
+      images = [],
+      variants = [],
+      create_ai_summary: createAiSummary = true,
+    } = req.body;
 
     await client.query("BEGIN");
 
@@ -13647,10 +13894,24 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
 
     await client.query("COMMIT");
     scheduleSmartphoneCompetitorRefresh(`smartphone_created:${productId}`);
+    if (createAiSummary !== false) {
+      await enqueueSmartphoneAiSummary(productId);
+    } else {
+      const { saveAiContent } = require("./services/ai/aiContentRepository");
+      await saveAiContent({
+        entityType: "smartphone",
+        entityId: productId,
+        contentType: "summary",
+        content: null,
+        status: "disabled",
+        errorMessage: "Automatic AI summary generation disabled",
+      });
+    }
 
     res.status(201).json({
       message: "Smartphone created successfully",
       product_id: productId,
+      ai_summary_status: createAiSummary === false ? "disabled" : "pending",
     });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -14231,6 +14492,8 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
 
         COALESCE(pub.is_published, false) AS is_published,
 
+        COALESCE(ai.status, 'not_created') AS ai_summary_status,
+
         /* ---------- Images ---------- */
         COALESCE(
           (
@@ -14289,6 +14552,11 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
       LEFT JOIN product_dynamic_score ds
         ON ds.product_id = p.id
 
+      LEFT JOIN ai_generated_content ai
+        ON ai.entity_type = 'smartphone'
+       AND ai.entity_id = p.id
+       AND ai.content_type = 'summary'
+
       WHERE p.product_type = 'smartphone'
 
       GROUP BY
@@ -14297,7 +14565,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at, pub.is_published,
-        s.expected_price
+        s.expected_price, ai.id, ai.status
 
       ORDER BY p.id DESC;
     `);
@@ -14343,7 +14611,28 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
       profileConfig.profiles,
     );
 
-    res.json({ smartphones });
+    const usageResult = await db.query(
+      `
+      SELECT
+        COUNT(*) FILTER (WHERE entity_type = 'smartphone' AND content_type = 'summary')::int AS total,
+        COUNT(*) FILTER (WHERE entity_type = 'smartphone' AND content_type = 'summary' AND status = 'generated')::int AS generated,
+        COUNT(*) FILTER (WHERE entity_type = 'smartphone' AND content_type = 'summary' AND status IN ('pending', 'generating'))::int AS processing,
+        COUNT(*) FILTER (WHERE entity_type = 'smartphone' AND content_type = 'summary' AND status = 'waiting_for_data')::int AS waiting,
+        COUNT(*) FILTER (WHERE entity_type = 'smartphone' AND content_type = 'summary' AND status = 'failed')::int AS failed
+      FROM ai_generated_content
+      `,
+    );
+
+    res.json({
+      smartphones,
+      ai_summary_usage: usageResult.rows[0] || {
+        total: 0,
+        generated: 0,
+        processing: 0,
+        waiting: 0,
+        failed: 0,
+      },
+    });
   } catch (err) {
     console.error("GET /api/smartphones error:", err);
     res.status(500).json({ error: err.message });
@@ -16535,9 +16824,24 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 
     await client.query("COMMIT");
     scheduleSmartphoneCompetitorRefresh(`smartphone_updated:${productId}`);
+    if (req.body.create_ai_summary !== false) {
+      await enqueueSmartphoneAiSummary(productId);
+    } else {
+      const { saveAiContent } = require("./services/ai/aiContentRepository");
+      await saveAiContent({
+        entityType: "smartphone",
+        entityId: productId,
+        contentType: "summary",
+        content: null,
+        status: "disabled",
+        errorMessage: "Automatic AI summary generation disabled",
+      });
+    }
     return res.json({
       message: "Smartphone updated successfully",
       data: phoneRes.rows[0],
+      ai_summary_status:
+        req.body.create_ai_summary === false ? "disabled" : "pending",
     });
   } catch (err) {
     await client.query("ROLLBACK");
