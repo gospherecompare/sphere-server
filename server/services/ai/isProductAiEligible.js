@@ -38,7 +38,9 @@ const getLaunchStatus = (product) => {
     }
   }
 
-  const launchDate = product?.launch_date ? new Date(product.launch_date) : null;
+  const launchDate = product?.launch_date
+    ? new Date(product.launch_date)
+    : null;
   if (launchDate && !Number.isNaN(launchDate.getTime())) {
     return launchDate <= new Date() ? "released" : "upcoming";
   }
@@ -72,7 +74,11 @@ const getProductAiEligibility = (product) => {
     return { eligible: false, status: "disabled", reason: "Not a smartphone" };
   }
   if (product?.is_published !== true) {
-    return { eligible: false, status: "waiting_for_data", reason: "Product is not published" };
+    return {
+      eligible: false,
+      status: "waiting_for_data",
+      reason: "Product is not published",
+    };
   }
 
   const launchStatus = getLaunchStatus(product);

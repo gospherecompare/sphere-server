@@ -1,9 +1,7 @@
 const crypto = require("crypto");
-const openai = require("./openaiClient");
+const gemini = require("./geminiClient");
 const { buildBlogAiInput } = require("./buildBlogAiInput");
 const { buildBlogSummaryPrompt } = require("./prompts/blogSummaryPrompt");
-
-const MODEL = process.env.OPENAI_AI_MODEL || "gpt-4o-mini";
 
 const TEMPERATURE = 0.2;
 
@@ -17,26 +15,13 @@ const generateBlogSummary = async (blog) => {
   const prompt = buildBlogSummaryPrompt(input);
 
   try {
-    const response = await openai.chat.completions.create({
-      model: MODEL,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a technology-news summarization assistant. Summarize articles accurately and concisely without adding outside knowledge.",
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      temperature: TEMPERATURE,
-      max_tokens: 220,
+    const response = await gemini.generateContent({
+      systemInstruction:
+        "You are a technology-news summarization assistant. Summarize articles accurately and concisely without adding outside knowledge.",
+      prompt,
     });
 
-    const summary = String(
-      response.choices?.[0]?.message?.content || "",
-    ).trim();
+    const summary = response.summary;
 
     if (!summary) {
       throw new Error("AI provider returned an empty summary");
@@ -45,16 +30,23 @@ const generateBlogSummary = async (blog) => {
     return {
       summary,
       inputHash,
-      model: MODEL,
+      model: response.model,
       temperature: TEMPERATURE,
-      inputTokens: response.usage?.prompt_tokens ?? null,
-      outputTokens: response.usage?.completion_tokens ?? null,
+      inputTokens: response.inputTokens,
+      outputTokens: response.outputTokens,
     };
   } catch (error) {
-    console.error("OpenAI API error:", error.message);
-    throw new Error(
+    console.error("Gemini API error:", {
+      message: error.message,
+      status: error.status || null,
+      code: error.code || null,
+    });
+    const wrappedError = new Error(
       `Failed to generate summary: ${error.message || "Unknown error"}`,
     );
+    wrappedError.status = error.status;
+    wrappedError.code = error.code;
+    throw wrappedError;
   }
 };
 

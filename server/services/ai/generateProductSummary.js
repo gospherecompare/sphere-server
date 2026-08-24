@@ -1,9 +1,8 @@
 const crypto = require("crypto");
-const openai = require("./openaiClient");
+const gemini = require("./geminiClient");
 const { buildProductAiInput } = require("./buildProductAiInput");
 const { buildProductSummaryPrompt } = require("./prompts/productSummaryPrompt");
 
-const MODEL = process.env.OPENAI_AI_MODEL || "gpt-4o-mini";
 const TEMPERATURE = 0.2;
 
 const createInputHash = (input) =>
@@ -14,6 +13,7 @@ const generateProductSummary = async ({
   smartphone,
   variants,
   prices,
+  requestId,
 }) => {
   const input = buildProductAiInput({
     product,
@@ -26,26 +26,26 @@ const generateProductSummary = async ({
   const prompt = buildProductSummaryPrompt(input);
 
   try {
-    const response = await openai.chat.completions.create({
-      model: MODEL,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a technology product summarization assistant. Summarize products accurately and concisely based only on the provided data.",
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      temperature: TEMPERATURE,
-      max_tokens: 250,
+    console.info("Gemini product summary request started", {
+      requestId,
+      model: gemini.model,
+      promptCharacters: prompt.length,
+      inputHash,
+    });
+    const response = await gemini.generateContent({
+      systemInstruction:
+        "You are a technology product summarization assistant. Summarize products accurately and concisely based only on the provided data.",
+      prompt,
+      requestId,
     });
 
-    const summary = String(
-      response.choices?.[0]?.message?.content || "",
-    ).trim();
+    const summary = response.summary;
+
+    console.info("Gemini product summary request completed", {
+      requestId,
+      model: response.model,
+      hasSummary: Boolean(summary),
+    });
 
     if (!summary) {
       throw new Error("AI provider returned an empty summary");
@@ -54,16 +54,25 @@ const generateProductSummary = async ({
     return {
       summary,
       inputHash,
-      model: MODEL,
+      model: response.model,
       temperature: TEMPERATURE,
-      inputTokens: response.usage?.prompt_tokens ?? null,
-      outputTokens: response.usage?.completion_tokens ?? null,
+      inputTokens: response.inputTokens,
+      outputTokens: response.outputTokens,
     };
   } catch (error) {
-    console.error("OpenAI API error:", error.message);
-    throw new Error(
+    console.error("Gemini API error:", {
+      requestId,
+      message: error.message,
+      status: error.status || null,
+      code: error.code || null,
+    });
+    const wrappedError = new Error(
       `Failed to generate product summary: ${error.message || "Unknown error"}`,
     );
+    wrappedError.status = error.status;
+    wrappedError.code = error.code;
+    wrappedError.requestId = requestId;
+    throw wrappedError;
   }
 };
 

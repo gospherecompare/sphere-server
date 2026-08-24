@@ -4969,6 +4969,16 @@ async function runMigrations() {
         throw err;
       }
     }
+
+    const fs = require("fs");
+    const path = require("path");
+    await safeQuery(
+      fs.readFileSync(
+        path.join(__dirname, "migrations", "ai_generated_content.sql"),
+        "utf8",
+      ),
+    );
+
     // Migrations - create tables in dependency order
 
     // 1) brands
@@ -12917,6 +12927,9 @@ app.post(
         return res.status(500).json({
           message: "Failed to generate summary",
           error: aiErr.message,
+          provider: "Gemini",
+          status: aiErr.status || null,
+          code: aiErr.code || null,
         });
       }
 
@@ -12987,8 +13000,14 @@ app.post(
   ensureBlogManagerAccess,
   async (req, res) => {
     try {
+      const requestId = crypto.randomUUID();
       const productId = Number(req.params.productId);
       const { force = false } = req.body;
+      console.info("AI product summary request received", {
+        requestId,
+        productId,
+        force: Boolean(force),
+      });
 
       if (!productId || productId <= 0) {
         return res.status(400).json({ message: "Invalid product ID" });
@@ -13027,6 +13046,11 @@ app.post(
       `,
         [productId],
       );
+      console.info("AI product summary product lookup completed", {
+        requestId,
+        productId,
+        found: productResult.rows.length > 0,
+      });
 
       if (!productResult.rows.length) {
         return res.status(404).json({ message: "Product not found" });
@@ -13059,6 +13083,11 @@ app.post(
       );
 
       const variants = variantsResult.rows || [];
+      console.info("AI product summary variants lookup completed", {
+        requestId,
+        productId,
+        variantCount: variants.length,
+      });
 
       let prices = [];
       if (variants.length > 0) {
@@ -13072,6 +13101,11 @@ app.post(
           [variants.map((variant) => variant.id)],
         );
         prices = pricesResult.rows || [];
+        console.info("AI product summary prices lookup completed", {
+          requestId,
+          productId,
+          priceCount: prices.length,
+        });
       }
 
       // Import AI service
@@ -13092,6 +13126,11 @@ app.post(
           prices,
         }),
       );
+      console.info("AI product summary input prepared", {
+        requestId,
+        productId,
+        inputHash,
+      });
 
       if (!force) {
         const cachedResult = await db.query(
@@ -13119,23 +13158,58 @@ app.post(
 
       // Generate the current snapshot and hash before deciding whether cache is stale.
       let summary, model, temperature, inputTokens, outputTokens;
+      await saveAiContent({
+        entityType: "smartphone",
+        entityId: productId,
+        contentType: "summary",
+        content: null,
+        status: "generating",
+        inputHash,
+      });
+      console.info("AI product summary generating status saved", {
+        requestId,
+        productId,
+      });
       try {
+        console.info("AI product summary provider call starting", {
+          requestId,
+          productId,
+        });
         const result = await generateProductSummary({
           product,
           smartphone: product.smartphone_id ? product : null,
           variants,
           prices,
+          requestId,
         });
         summary = result.summary;
         model = result.model;
         temperature = result.temperature;
         inputTokens = result.inputTokens;
         outputTokens = result.outputTokens;
+        console.info("AI product summary provider call returned", {
+          requestId,
+          productId,
+          hasSummary: Boolean(summary),
+        });
       } catch (aiErr) {
         console.error("AI summary generation failed:", aiErr);
+        await saveAiContent({
+          entityType: "smartphone",
+          entityId: productId,
+          contentType: "summary",
+          content: null,
+          status: "failed",
+          inputHash,
+          errorMessage: aiErr.message,
+        });
         return res.status(500).json({
           message: "Failed to generate summary",
           error: aiErr.message,
+          provider: "Gemini",
+          requestId,
+          status: aiErr.status || null,
+          code: aiErr.code || null,
         });
       }
 
@@ -13155,6 +13229,7 @@ app.post(
 
       return res.json({
         ok: true,
+        requestId,
         cached: false,
         summary,
         model,
@@ -13461,7 +13536,32 @@ app.delete("/api/reviews/:id", authenticateCustomer, async (req, res) => {
 
 const smartphoneAiQueue = [];
 let smartphoneAiWorkerRunning = false;
-const { getProductAiEligibility } = require("./services/ai/isProductAiEligible");
+let automaticAiSummarySweepRunning = false;
+let aiProviderNextRequestAt = 0;
+const AI_PROVIDER_MIN_DELAY_MS = 3_000;
+const AI_RATE_LIMIT_DEFAULT_RETRY_MS = 60_000;
+const {
+  getProductAiEligibility,
+} = require("./services/ai/isProductAiEligible");
+
+const waitForAiProviderSlot = async () => {
+  const delay = Math.max(0, aiProviderNextRequestAt - Date.now());
+  if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+  aiProviderNextRequestAt = Date.now() + AI_PROVIDER_MIN_DELAY_MS;
+};
+
+const isAiRateLimitError = (error) =>
+  Number(error?.status) === 429 ||
+  /rate.?limit|resource.?exhausted|too many requests/i.test(
+    `${error?.code || ""} ${error?.message || ""}`,
+  );
+
+const getAiRetryDelayMs = (error) => {
+  const message = String(error?.message || "");
+  const seconds = message.match(/retry(?: in| after)\s*([\d.]+)\s*s?/i);
+  if (seconds) return Math.max(1_000, Math.ceil(Number(seconds[1]) * 1000));
+  return AI_RATE_LIMIT_DEFAULT_RETRY_MS;
+};
 
 const processSmartphoneAiQueue = async () => {
   if (smartphoneAiWorkerRunning) return;
@@ -13470,6 +13570,7 @@ const processSmartphoneAiQueue = async () => {
   try {
     while (smartphoneAiQueue.length) {
       const productId = smartphoneAiQueue.shift();
+      const requestId = crypto.randomUUID();
       try {
         const productResult = await db.query(
           `
@@ -13510,7 +13611,9 @@ const processSmartphoneAiQueue = async () => {
 
         const eligibility = getProductAiEligibility(product);
         if (!eligibility.eligible) {
-          const { saveAiContent } = require("./services/ai/aiContentRepository");
+          const {
+            saveAiContent,
+          } = require("./services/ai/aiContentRepository");
           await saveAiContent({
             entityType: "smartphone",
             entityId: productId,
@@ -13522,7 +13625,9 @@ const processSmartphoneAiQueue = async () => {
           continue;
         }
 
-        const { generateProductSummary } = require("./services/ai/generateProductSummary");
+        const {
+          generateProductSummary,
+        } = require("./services/ai/generateProductSummary");
         const { saveAiContent } = require("./services/ai/aiContentRepository");
         await saveAiContent({
           entityType: "smartphone",
@@ -13531,11 +13636,13 @@ const processSmartphoneAiQueue = async () => {
           content: null,
           status: "generating",
         });
+        await waitForAiProviderSlot();
         const result = await generateProductSummary({
           product,
           smartphone: product,
           variants,
           prices,
+          requestId,
         });
         await saveAiContent({
           entityType: "smartphone",
@@ -13550,9 +13657,35 @@ const processSmartphoneAiQueue = async () => {
           inputHash: result.inputHash,
         });
       } catch (error) {
-        console.error(`Automatic AI summary failed for product ${productId}:`, error.message);
+        console.error(
+          `Automatic AI summary failed for product ${productId}:`,
+          error.message,
+        );
         try {
-          const { saveAiContent } = require("./services/ai/aiContentRepository");
+          const {
+            saveAiContent,
+          } = require("./services/ai/aiContentRepository");
+          if (isAiRateLimitError(error)) {
+            const retryDelayMs = getAiRetryDelayMs(error);
+            console.warn(
+              `AI provider rate limit for product ${productId}; retrying in ${retryDelayMs}ms`,
+            );
+            await saveAiContent({
+              entityType: "smartphone",
+              entityId: productId,
+              content: null,
+              contentType: "summary",
+              status: "pending",
+              errorMessage: `Rate limited by Gemini; retrying in ${Math.ceil(retryDelayMs / 1000)} seconds`,
+            });
+            setTimeout(() => {
+              if (!smartphoneAiQueue.includes(productId)) {
+                smartphoneAiQueue.push(productId);
+              }
+              void processSmartphoneAiQueue();
+            }, retryDelayMs);
+            continue;
+          }
           await saveAiContent({
             entityType: "smartphone",
             entityId: productId,
@@ -13626,7 +13759,11 @@ const enqueueSmartphoneAiSummary = async (productId) => {
   }
   const inputHash = crypto
     .createHash("sha256")
-    .update(JSON.stringify(buildProductAiInput({ product, smartphone: product, variants, prices })))
+    .update(
+      JSON.stringify(
+        buildProductAiInput({ product, smartphone: product, variants, prices }),
+      ),
+    )
     .digest("hex");
   const existing = await db.query(
     `SELECT status, input_hash FROM ai_generated_content
@@ -13634,7 +13771,10 @@ const enqueueSmartphoneAiSummary = async (productId) => {
      LIMIT 1`,
     [productId],
   );
-  if (existing.rows[0]?.status === "generated" && existing.rows[0].input_hash === inputHash) {
+  if (
+    existing.rows[0]?.status === "generated" &&
+    existing.rows[0].input_hash === inputHash
+  ) {
     return { queued: false, status: "generated" };
   }
 
@@ -13646,10 +13786,152 @@ const enqueueSmartphoneAiSummary = async (productId) => {
     status: "pending",
   });
   if (!smartphoneAiQueue.includes(productId)) smartphoneAiQueue.push(productId);
-  setImmediate(() => processSmartphoneAiQueue().catch((error) => {
-    console.error("Smartphone AI queue failed:", error.message);
-  }));
+  setImmediate(() =>
+    processSmartphoneAiQueue().catch((error) => {
+      console.error("Smartphone AI queue failed:", error.message);
+    }),
+  );
   return { queued: true, status: "pending", inputHash };
+};
+
+const runAutomaticAiSummarySweep = async () => {
+  if (automaticAiSummarySweepRunning) {
+    return { skipped: true, reason: "previous sweep still running" };
+  }
+
+  automaticAiSummarySweepRunning = true;
+  const limitRaw = Number(process.env.AI_SUMMARY_BATCH_SIZE);
+  const limit = Number.isFinite(limitRaw)
+    ? Math.min(1000, Math.max(1, Math.floor(limitRaw)))
+    : 100;
+  let productsQueued = 0;
+  let newsGenerated = 0;
+  let newsFailed = 0;
+
+  try {
+    const productResult = await db.query(
+      `
+      SELECT p.id
+      FROM products p
+      INNER JOIN smartphones s ON s.product_id = p.id
+      LEFT JOIN ai_generated_content ai
+        ON ai.entity_type = 'smartphone'
+       AND ai.entity_id = p.id
+       AND ai.content_type = 'summary'
+      LEFT JOIN product_publish pub ON pub.product_id = p.id
+      WHERE p.product_type = 'smartphone'
+        AND COALESCE(pub.is_published, false) = true
+        AND (ai.id IS NULL OR ai.status IN ('failed', 'pending', 'generating', 'waiting_for_data'))
+      ORDER BY p.id ASC
+      LIMIT $1
+      `,
+      [limit],
+    );
+
+    for (const row of productResult.rows) {
+      const result = await enqueueSmartphoneAiSummary(row.id);
+      if (result?.queued) productsQueued += 1;
+    }
+
+    const newsResult = await db.query(
+      `
+      SELECT
+        bl.id,
+        bl.title,
+        bl.excerpt,
+        bl.category,
+        bl.content_rendered,
+        bl.tags,
+        bl.published_at,
+        p.id AS product_id,
+        p.name AS product_name,
+        p.product_type,
+        b.name AS brand_name
+      FROM blogs bl
+      LEFT JOIN products p ON p.id = bl.product_id
+      LEFT JOIN brands b ON b.id = p.brand_id
+      LEFT JOIN ai_generated_content ai
+        ON ai.entity_type = 'blog'
+       AND ai.entity_id = bl.id
+       AND ai.content_type = 'summary'
+      WHERE bl.is_published = true
+        AND COALESCE(ai.status, 'not_created') IN ('not_created', 'failed')
+      ORDER BY bl.id ASC
+      LIMIT $1
+      `,
+      [limit],
+    );
+
+    const { generateBlogSummary } = require("./services/ai/generateBlogSummary");
+    const { saveAiContent } = require("./services/ai/aiContentRepository");
+
+    for (const blog of newsResult.rows) {
+      try {
+        await saveAiContent({
+          entityType: "blog",
+          entityId: blog.id,
+          contentType: "summary",
+          content: null,
+          status: "generating",
+        });
+        await waitForAiProviderSlot();
+        const result = await generateBlogSummary(blog);
+        await saveAiContent({
+          entityType: "blog",
+          entityId: blog.id,
+          contentType: "summary",
+          content: result.summary,
+          status: "generated",
+          model: result.model,
+          temperature: result.temperature,
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          inputHash: result.inputHash,
+        });
+        newsGenerated += 1;
+      } catch (error) {
+        if (isAiRateLimitError(error)) {
+          const retryDelayMs = getAiRetryDelayMs(error);
+          newsFailed = Math.max(0, newsFailed - 1);
+          await saveAiContent({
+            entityType: "blog",
+            entityId: blog.id,
+            content: null,
+            contentType: "summary",
+            status: "pending",
+            errorMessage: `Rate limited by Gemini; retrying in ${Math.ceil(retryDelayMs / 1000)} seconds`,
+          });
+          console.warn(
+            `AI provider rate limit for blog ${blog.id}; stopping sweep for ${retryDelayMs}ms`,
+          );
+          break;
+        }
+        newsFailed += 1;
+        console.error(`Automatic AI summary failed for blog ${blog.id}:`, error.message);
+        await saveAiContent({
+          entityType: "blog",
+          entityId: blog.id,
+          content: null,
+          contentType: "summary",
+          status: "failed",
+          errorMessage: error.message,
+        });
+      }
+    }
+
+    const result = {
+      ok: true,
+      productsScanned: productResult.rows.length,
+      productsQueued,
+      newsScanned: newsResult.rows.length,
+      newsGenerated,
+      newsFailed,
+    };
+    console.log("Automatic AI summary sweep:", result);
+    return result;
+  } finally {
+    automaticAiSummarySweepRunning = false;
+  }
 };
 
 app.post(
@@ -13659,9 +13941,10 @@ app.post(
   async (req, res) => {
     try {
       const limitRaw = Number(req.body?.limit);
-      const limit = Number.isInteger(limitRaw) && limitRaw > 0
-        ? Math.min(limitRaw, 1000)
-        : 1000;
+      const limit =
+        Number.isInteger(limitRaw) && limitRaw > 0
+          ? Math.min(limitRaw, 1000)
+          : 1000;
       const result = await db.query(
         `
         SELECT p.id
@@ -14493,6 +14776,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         COALESCE(pub.is_published, false) AS is_published,
 
         COALESCE(ai.status, 'not_created') AS ai_summary_status,
+        ai.error_message AS ai_summary_error,
 
         /* ---------- Images ---------- */
         COALESCE(
@@ -14565,7 +14849,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at, pub.is_published,
-        s.expected_price, ai.id, ai.status
+        s.expected_price, ai.id, ai.status, ai.error_message
 
       ORDER BY p.id DESC;
     `);
@@ -28194,6 +28478,29 @@ async function start() {
     }
 
     await runMigrations();
+
+    console.log("AI provider configuration:", {
+      provider: "Gemini",
+      model: process.env.GEMINI_MODEL || "gemini-3.6-flash",
+      apiKeyConfigured: Boolean(
+        String(process.env.GEMINI_API_KEY || "").trim(),
+      ),
+    });
+
+    const aiSummaryIntervalMs = 15 * 60 * 1000;
+    void runAutomaticAiSummarySweep().catch((error) => {
+      console.error("Automatic AI summary sweep failed:", error);
+    });
+    const aiSummaryTimer = setInterval(() => {
+      void runAutomaticAiSummarySweep().catch((error) => {
+        console.error("Automatic AI summary sweep failed:", error);
+      });
+    }, aiSummaryIntervalMs);
+    if (typeof aiSummaryTimer.unref === "function") aiSummaryTimer.unref();
+    console.log("Automatic AI summary cron enabled:", {
+      intervalMs: aiSummaryIntervalMs,
+      batchSize: Number(process.env.AI_SUMMARY_BATCH_SIZE) || 100,
+    });
 
     // Optional: periodically recompute Hook Dynamic Score in-process.
     // In production, prefer an external scheduler calling the admin endpoint

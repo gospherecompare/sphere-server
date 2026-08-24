@@ -18,9 +18,15 @@ const PROCESSOR_SCORE_RULES = Object.freeze([
   { pattern: /dimensity\s*9400/i, score: 97 },
   { pattern: /dimensity\s*9300/i, score: 92 },
   { pattern: /apple\s*a18|a18\s*pro|a17\s*pro/i, score: 98 },
-  { pattern: /snapdragon\s*8\s*gen\s*2|dimensity\s*9200|apple\s*a16/i, score: 89 },
+  {
+    pattern: /snapdragon\s*8\s*gen\s*2|dimensity\s*9200|apple\s*a16/i,
+    score: 89,
+  },
   { pattern: /snapdragon\s*7\s*gen\s*3|dimensity\s*8300/i, score: 75 },
-  { pattern: /snapdragon\s*7|dimensity\s*8|tensor\s*g2|tensor\s*g3/i, score: 72 },
+  {
+    pattern: /snapdragon\s*7|dimensity\s*8|tensor\s*g2|tensor\s*g3/i,
+    score: 72,
+  },
   { pattern: /snapdragon\s*6|dimensity\s*7|exynos\s*13/i, score: 62 },
   { pattern: /snapdragon\s*4|helio|unisoc|exynos\s*8/i, score: 50 },
 ]);
@@ -108,7 +114,9 @@ const roundOne = (value) =>
 const toFiniteNumber = (value) => {
   if (value == null || value === "") return null;
   if (typeof value === "number" && Number.isFinite(value)) return value;
-  const match = String(value).replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+  const match = String(value)
+    .replace(/,/g, "")
+    .match(/-?\d+(?:\.\d+)?/);
   if (!match) return null;
   const parsed = Number(match[0]);
   return Number.isFinite(parsed) ? parsed : null;
@@ -235,7 +243,9 @@ const scoreProcessorTier = (processorText) => {
     if (rule.pattern.test(text)) return rule.score;
   }
 
-  const snapdragonGenMatch = text.match(/snapdragon\s*([0-9])\s*gen\s*([0-9]+)/i);
+  const snapdragonGenMatch = text.match(
+    /snapdragon\s*([0-9])\s*gen\s*([0-9]+)/i,
+  );
   if (snapdragonGenMatch) {
     const series = Number(snapdragonGenMatch[1]);
     const gen = Number(snapdragonGenMatch[2]);
@@ -253,7 +263,9 @@ const scoreProcessorTier = (processorText) => {
     return 58;
   }
 
-  const appleMatch = text.match(/apple\s*a([0-9]{2})|a([0-9]{2})\s*(pro|bionic)?/i);
+  const appleMatch = text.match(
+    /apple\s*a([0-9]{2})|a([0-9]{2})\s*(pro|bionic)?/i,
+  );
   if (appleMatch) {
     const chipNum = Number(appleMatch[1] || appleMatch[2]);
     return clamp(74 + (chipNum - 14) * 4, 70, 99);
@@ -288,11 +300,7 @@ const scoreDisplayComposite = (profile) => {
   }
   if (profile.display_size_in != null) {
     parts.push({
-      score: clamp(
-        ((profile.display_size_in - 5) / (8 - 5)) * 100,
-        0,
-        100,
-      ),
+      score: clamp(((profile.display_size_in - 5) / (8 - 5)) * 100, 0, 100),
       weight: 0.15,
     });
   }
@@ -366,7 +374,11 @@ const extractDisplayRefreshHz = (display) => {
 
 const extractDisplaySizeIn = (display) => {
   const source = toObject(display);
-  const direct = pickFirstNumber(source, ["size", "screen_size", "display_size"]);
+  const direct = pickFirstNumber(source, [
+    "size",
+    "screen_size",
+    "display_size",
+  ]);
   if (direct != null) return direct;
   return pickLargestNumber(source, 3, 12);
 };
@@ -610,7 +622,11 @@ const buildReason = (base, candidate, scores) => {
     parts.push("Frequently compared by users");
   }
 
-  if (base.category && candidate.category && base.category === candidate.category) {
+  if (
+    base.category &&
+    candidate.category &&
+    base.category === candidate.category
+  ) {
     parts.push("Same segment");
   }
 
@@ -632,7 +648,8 @@ const shouldIncludeCandidate = (
 
   const hasBothPrices = base.price != null && candidate.price != null;
   if (matchedFeatureCount < 2 && compareCount <= 0) return false;
-  if (specSimilarity == null && !hasBothPrices && compareCount <= 0) return false;
+  if (specSimilarity == null && !hasBothPrices && compareCount <= 0)
+    return false;
   if (!hasBothPrices) return true;
 
   const priceGap = Math.abs(base.price - candidate.price);
@@ -667,7 +684,10 @@ const buildTopCompetitors = (base, profiles, compareMap, limit = 3) => {
       continue;
     }
 
-    const priceProximityScore = calculatePriceProximityScore(base.price, peer.price);
+    const priceProximityScore = calculatePriceProximityScore(
+      base.price,
+      peer.price,
+    );
     const compareFrequencyScore =
       maxCompareCount > 0 ? roundOne((pairCount / maxCompareCount) * 100) : 0;
     const scoreParts = [
@@ -708,7 +728,7 @@ const buildTopCompetitors = (base, profiles, compareMap, limit = 3) => {
       competitor_id: peer.id,
       competition_score: roundedCompetition,
       spec_similarity_score: specSimilarityScore,
-      price_proximity_score: priceProximityScore,
+      price_proximity_score: priceProximityScore ?? 0,
       compare_frequency_score: compareFrequencyScore,
       reason,
       analysis_json: {
@@ -753,9 +773,7 @@ const parseIds = (value) => {
   if (!Array.isArray(value)) return [];
   return Array.from(
     new Set(
-      value
-        .map((v) => Number(v))
-        .filter((v) => Number.isInteger(v) && v > 0),
+      value.map((v) => Number(v)).filter((v) => Number.isInteger(v) && v > 0),
     ),
   );
 };
@@ -820,7 +838,9 @@ const loadPublishedSmartphones = async (db) => {
     `,
   );
 
-  return (result.rows || []).map(buildProfile).filter((row) => Number.isInteger(row.id));
+  return (result.rows || [])
+    .map(buildProfile)
+    .filter((row) => Number.isInteger(row.id));
 };
 
 const loadCompareCounts = async (db) => {
@@ -853,7 +873,9 @@ const loadCompareCounts = async (db) => {
 
 async function recomputeSmartphoneCompetitorAnalysis(db, options = {}) {
   const limitRaw = Number(options.limit);
-  const limit = Number.isFinite(limitRaw) ? clamp(Math.floor(limitRaw), 1, 10) : 3;
+  const limit = Number.isFinite(limitRaw)
+    ? clamp(Math.floor(limitRaw), 1, 10)
+    : 3;
   const requestedIds = parseIds(options.productIds);
 
   const profiles = await loadPublishedSmartphones(db);
@@ -886,11 +908,17 @@ async function recomputeSmartphoneCompetitorAnalysis(db, options = {}) {
       const base = byId.get(productId);
       if (!base) continue;
 
-      const competitors = buildTopCompetitors(base, profiles, compareMap, limit);
+      const competitors = buildTopCompetitors(
+        base,
+        profiles,
+        compareMap,
+        limit,
+      );
 
-      await client.query("DELETE FROM competitor_analysis WHERE product_id = $1", [
-        productId,
-      ]);
+      await client.query(
+        "DELETE FROM competitor_analysis WHERE product_id = $1",
+        [productId],
+      );
 
       for (const competitor of competitors) {
         await client.query(
