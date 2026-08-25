@@ -1,18 +1,44 @@
 const { GoogleGenAI } = require("@google/genai");
+const { db } = require("../../db");
 
-const apiKey = String(process.env.GEMINI_API_KEY || "").trim();
-const model = String(process.env.GEMINI_MODEL || "gemini-3.6-flash").trim();
 const REQUEST_TIMEOUT_MS = 55_000;
+const MIN_REQUEST_INTERVAL_MS = 15_000;
+let nextRequestAt = 0;
 
-if (!apiKey) {
-  throw new Error("GEMINI_API_KEY environment variable is not configured");
-}
+const readGeminiConfig = async () => {
+  const result = await db.query(
+    `SELECT api_key, model
+     FROM gemini_ai_config
+     WHERE id = 1
+     LIMIT 1`,
+  );
+  const row = result.rows[0];
+  const apiKey = String(row?.api_key || "").trim();
+  if (!apiKey) {
+    throw new Error("Gemini API key is not configured in admin settings");
+  }
+  return {
+    apiKey,
+    model: String(row?.model || "gemini-3.6-flash").trim(),
+  };
+};
 
-const ai = new GoogleGenAI({ apiKey });
+const waitForGeminiSlot = async () => {
+  const delay = Math.max(0, nextRequestAt - Date.now());
+  if (delay > 0) {
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+  nextRequestAt = Date.now() + MIN_REQUEST_INTERVAL_MS;
+};
 
 const generateContent = async ({ systemInstruction, prompt, requestId }) => {
   let response;
+  let activeModel;
   try {
+    const { apiKey, model } = await readGeminiConfig();
+    activeModel = model;
+    const ai = new GoogleGenAI({ apiKey });
+    await waitForGeminiSlot();
     const providerRequest = ai.interactions.create({
       model,
       input: `${systemInstruction}\n\n${prompt}`,
@@ -60,7 +86,7 @@ const generateContent = async ({ systemInstruction, prompt, requestId }) => {
 
   return {
     summary,
-    model,
+    model: activeModel,
     inputTokens: response.usage?.input_tokens ?? null,
     outputTokens: response.usage?.output_tokens ?? null,
   };
@@ -68,5 +94,4 @@ const generateContent = async ({ systemInstruction, prompt, requestId }) => {
 
 module.exports = {
   generateContent,
-  model,
 };

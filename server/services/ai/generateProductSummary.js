@@ -28,7 +28,6 @@ const generateProductSummary = async ({
   try {
     console.info("Gemini product summary request started", {
       requestId,
-      model: gemini.model,
       promptCharacters: prompt.length,
       inputHash,
     });

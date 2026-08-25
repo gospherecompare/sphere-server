@@ -5838,6 +5838,22 @@ async function runMigrations() {
     `);
 
     await safeQuery(`
+      CREATE TABLE IF NOT EXISTS gemini_ai_config (
+        id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        api_key TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL DEFAULT 'gemini-3.6-flash',
+        updated_by INT REFERENCES "user"(id),
+        updated_at TIMESTAMP DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      INSERT INTO gemini_ai_config (id)
+      VALUES (1)
+      ON CONFLICT (id) DO NOTHING;
+    `);
+
+    await safeQuery(`
         CREATE TABLE IF NOT EXISTS career_applications (
           id SERIAL PRIMARY KEY,
           role TEXT NOT NULL,
@@ -13537,18 +13553,10 @@ app.delete("/api/reviews/:id", authenticateCustomer, async (req, res) => {
 const smartphoneAiQueue = [];
 let smartphoneAiWorkerRunning = false;
 let automaticAiSummarySweepRunning = false;
-let aiProviderNextRequestAt = 0;
-const AI_PROVIDER_MIN_DELAY_MS = 3_000;
 const AI_RATE_LIMIT_DEFAULT_RETRY_MS = 60_000;
 const {
   getProductAiEligibility,
 } = require("./services/ai/isProductAiEligible");
-
-const waitForAiProviderSlot = async () => {
-  const delay = Math.max(0, aiProviderNextRequestAt - Date.now());
-  if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-  aiProviderNextRequestAt = Date.now() + AI_PROVIDER_MIN_DELAY_MS;
-};
 
 const isAiRateLimitError = (error) =>
   Number(error?.status) === 429 ||
@@ -13559,7 +13567,7 @@ const isAiRateLimitError = (error) =>
 const getAiRetryDelayMs = (error) => {
   const message = String(error?.message || "");
   const seconds = message.match(/retry(?: in| after)\s*([\d.]+)\s*s?/i);
-  if (seconds) return Math.max(1_000, Math.ceil(Number(seconds[1]) * 1000));
+  if (seconds) return Math.max(15_000, Math.ceil(Number(seconds[1]) * 1000));
   return AI_RATE_LIMIT_DEFAULT_RETRY_MS;
 };
 
@@ -13636,7 +13644,6 @@ const processSmartphoneAiQueue = async () => {
           content: null,
           status: "generating",
         });
-        await waitForAiProviderSlot();
         const result = await generateProductSummary({
           product,
           smartphone: product,
@@ -13678,13 +13685,13 @@ const processSmartphoneAiQueue = async () => {
               status: "pending",
               errorMessage: `Rate limited by Gemini; retrying in ${Math.ceil(retryDelayMs / 1000)} seconds`,
             });
+            if (!smartphoneAiQueue.includes(productId)) {
+              smartphoneAiQueue.unshift(productId);
+            }
             setTimeout(() => {
-              if (!smartphoneAiQueue.includes(productId)) {
-                smartphoneAiQueue.push(productId);
-              }
               void processSmartphoneAiQueue();
             }, retryDelayMs);
-            continue;
+            break;
           }
           await saveAiContent({
             entityType: "smartphone",
@@ -13821,7 +13828,7 @@ const runAutomaticAiSummarySweep = async () => {
       LEFT JOIN product_publish pub ON pub.product_id = p.id
       WHERE p.product_type = 'smartphone'
         AND COALESCE(pub.is_published, false) = true
-        AND (ai.id IS NULL OR ai.status IN ('failed', 'pending', 'generating', 'waiting_for_data'))
+        AND (ai.id IS NULL OR ai.status IN ('failed', 'pending', 'waiting_for_data'))
       ORDER BY p.id ASC
       LIMIT $1
       `,
@@ -13855,14 +13862,16 @@ const runAutomaticAiSummarySweep = async () => {
        AND ai.entity_id = bl.id
        AND ai.content_type = 'summary'
       WHERE bl.is_published = true
-        AND COALESCE(ai.status, 'not_created') IN ('not_created', 'failed')
+        AND COALESCE(ai.status, 'not_created') IN ('not_created', 'failed', 'pending')
       ORDER BY bl.id ASC
       LIMIT $1
       `,
       [limit],
     );
 
-    const { generateBlogSummary } = require("./services/ai/generateBlogSummary");
+    const {
+      generateBlogSummary,
+    } = require("./services/ai/generateBlogSummary");
     const { saveAiContent } = require("./services/ai/aiContentRepository");
 
     for (const blog of newsResult.rows) {
@@ -13874,7 +13883,6 @@ const runAutomaticAiSummarySweep = async () => {
           content: null,
           status: "generating",
         });
-        await waitForAiProviderSlot();
         const result = await generateBlogSummary(blog);
         await saveAiContent({
           entityType: "blog",
@@ -13904,10 +13912,18 @@ const runAutomaticAiSummarySweep = async () => {
           console.warn(
             `AI provider rate limit for blog ${blog.id}; stopping sweep for ${retryDelayMs}ms`,
           );
+          setTimeout(() => {
+            void runAutomaticAiSummarySweep().catch((retryError) => {
+              console.error("Automatic AI summary retry failed:", retryError);
+            });
+          }, retryDelayMs);
           break;
         }
         newsFailed += 1;
-        console.error(`Automatic AI summary failed for blog ${blog.id}:`, error.message);
+        console.error(
+          `Automatic AI summary failed for blog ${blog.id}:`,
+          error.message,
+        );
         await saveAiContent({
           entityType: "blog",
           entityId: blog.id,
@@ -13957,7 +13973,7 @@ app.post(
         LEFT JOIN product_publish pub ON pub.product_id = p.id
         WHERE p.product_type = 'smartphone'
           AND COALESCE(pub.is_published, false) = true
-          AND (ai.id IS NULL OR ai.status IN ('failed', 'pending', 'generating', 'waiting_for_data'))
+          AND (ai.id IS NULL OR ai.status IN ('failed', 'pending', 'waiting_for_data'))
         ORDER BY p.id ASC
         LIMIT $1
         `,
@@ -20266,6 +20282,93 @@ app.put("/api/admin/device-field-profiles", authenticate, async (req, res) => {
     return res
       .status(500)
       .json({ message: "Failed to update device field profiles" });
+  }
+});
+
+app.get("/api/admin/ai/gemini-config", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const result = await db.query(
+      `SELECT api_key, model, updated_at
+       FROM gemini_ai_config
+       WHERE id = 1
+       LIMIT 1`,
+    );
+    const row = result.rows[0];
+    const apiKey = String(row?.api_key || "").trim();
+
+    return res.json({
+      success: true,
+      configured: Boolean(apiKey),
+      apiKeyPreview: apiKey ? `${apiKey.slice(0, 4)}...${apiKey.slice(-4)}` : "",
+      model: String(row?.model || "gemini-3.6-flash").trim(),
+      updated_at: row?.updated_at || null,
+    });
+  } catch (err) {
+    console.error("GET /api/admin/ai/gemini-config error:", err);
+    return res.status(500).json({ message: "Failed to load Gemini settings" });
+  }
+});
+
+app.put("/api/admin/ai/gemini-config", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    const apiKey = String(req.body?.apiKey || "").trim();
+    const model = String(req.body?.model || "").trim();
+    if (!model || model.length > 120) {
+      return res.status(400).json({ message: "A valid Gemini model is required" });
+    }
+
+    const existing = await db.query(
+      `SELECT api_key FROM gemini_ai_config WHERE id = 1 LIMIT 1`,
+    );
+    const storedApiKey = String(existing.rows[0]?.api_key || "").trim();
+    if (!apiKey && !storedApiKey) {
+      return res.status(400).json({ message: "A Gemini API key is required" });
+    }
+
+    await db.query(
+      `INSERT INTO gemini_ai_config (id, api_key, model, updated_by, updated_at)
+       VALUES (1, $1, $2, $3, now())
+       ON CONFLICT (id)
+       DO UPDATE SET
+         api_key = EXCLUDED.api_key,
+         model = EXCLUDED.model,
+         updated_by = EXCLUDED.updated_by,
+         updated_at = now()`,
+      [apiKey || storedApiKey, model, req.user?.id ?? null],
+    );
+
+    return res.json({ success: true, message: "Gemini settings saved" });
+  } catch (err) {
+    console.error("PUT /api/admin/ai/gemini-config error:", err);
+    return res.status(500).json({ message: "Failed to save Gemini settings" });
+  }
+});
+
+app.delete("/api/admin/ai/gemini-config", authenticate, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+
+    await db.query(
+      `UPDATE gemini_ai_config
+       SET api_key = '', updated_by = $1, updated_at = now()
+       WHERE id = 1`,
+      [req.user?.id ?? null],
+    );
+
+    return res.json({ success: true, message: "Gemini API key deleted" });
+  } catch (err) {
+    console.error("DELETE /api/admin/ai/gemini-config error:", err);
+    return res.status(500).json({ message: "Failed to delete Gemini API key" });
   }
 });
 
@@ -28479,12 +28582,17 @@ async function start() {
 
     await runMigrations();
 
+    const geminiConfigResult = await db.query(
+      `SELECT model, api_key IS NOT NULL AND api_key <> '' AS configured
+       FROM gemini_ai_config
+       WHERE id = 1
+       LIMIT 1`,
+    );
+    const geminiConfig = geminiConfigResult.rows[0];
     console.log("AI provider configuration:", {
       provider: "Gemini",
-      model: process.env.GEMINI_MODEL || "gemini-3.6-flash",
-      apiKeyConfigured: Boolean(
-        String(process.env.GEMINI_API_KEY || "").trim(),
-      ),
+      model: geminiConfig?.model || "gemini-3.6-flash",
+      apiKeyConfigured: Boolean(geminiConfig?.configured),
     });
 
     const aiSummaryIntervalMs = 15 * 60 * 1000;
