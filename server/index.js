@@ -14164,7 +14164,38 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
 
       const variantId = variantRes.rows[0].id;
 
-      for (const sp of v.stores || []) {
+      // Normalize to accept both 'stores' and 'store_prices' field names
+      const storePrices = Array.isArray(v?.stores)
+        ? v.stores
+        : Array.isArray(v?.store_prices)
+          ? v.store_prices
+          : [];
+
+      for (const sp of storePrices) {
+        // Normalize field aliases
+        const storeName =
+          sp?.store_name ||
+          sp?.store ||
+          sp?.storeName ||
+          sp?.display_store_name ||
+          null;
+
+        const price =
+          sp?.price ??
+          sp?.current_price ??
+          sp?.sale_price ??
+          null;
+
+        const url =
+          sp?.url ||
+          sp?.link ||
+          sp?.affiliate_link ||
+          sp?.affiliateUrl ||
+          null;
+
+        // Skip rows without required fields
+        if (!storeName || !url) continue;
+
         await client.query(
           `
           INSERT INTO variant_store_prices
@@ -14179,12 +14210,15 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
           `,
           [
             variantId,
-            sp.store_name,
-            sp.price || null,
-            sp.url || null,
-            sp.offer_text || null,
+            storeName,
+            price,
+            url,
+            sp?.offer_text || sp?.offerText || null,
             normalizeDateOnlyInput(
-              sp.sale_start_date ?? sp.sale_date ?? sp.saleStartDate ?? null,
+              sp?.sale_start_date ??
+                sp?.sale_date ??
+                sp?.saleStartDate ??
+                null,
             ),
           ],
         );
@@ -15275,6 +15309,11 @@ app.post("/api/laptops", authenticate, async (req, res) => {
 
       for (const s of stores) {
         const storeObj = toPlainObject(s);
+        const storeName = storeObj.store_name || storeObj.store || null;
+        
+        // Skip rows without a store name
+        if (!storeName) continue;
+
         await client.query(
           `
           INSERT INTO variant_store_prices
@@ -15283,7 +15322,7 @@ app.post("/api/laptops", authenticate, async (req, res) => {
           `,
           [
             variantId,
-            storeObj.store_name || storeObj.store || "Store",
+            storeName,
             storeObj.price || null,
             storeObj.url || null,
             storeObj.offer_text || storeObj.offerText || null,
@@ -16066,9 +16105,15 @@ app.post("/api/tvs", authenticate, async (req, res) => {
     const imagesJson = Array.isArray(payload.images_json)
       ? payload.images_json
       : [];
-    const variantsJson = normalizeTvVariantsInput(
-      Array.isArray(payload.variants_json) ? payload.variants_json : [],
-    );
+    
+    // Accept both 'variants' and 'variants_json' field names
+    const variantsInput = Array.isArray(payload?.variants)
+      ? payload.variants
+      : Array.isArray(payload?.variants_json)
+        ? payload.variants_json
+        : [];
+    
+    const variantsJson = normalizeTvVariantsInput(variantsInput);
     const variantsJsonForRow = variantsJson.map((variant) => ({
       variant_key: variant.variant_key,
       screen_size: variant.screen_size,
@@ -16176,8 +16221,38 @@ app.post("/api/tvs", authenticate, async (req, res) => {
       );
 
       const variantId = variantRes.rows[0].id;
-      for (const store of variant.store_prices) {
-        if (!store.store_name) continue;
+      
+      // Accept both 'stores' and 'store_prices' field names
+      const storePrices = Array.isArray(variant?.stores)
+        ? variant.stores
+        : Array.isArray(variant?.store_prices)
+          ? variant.store_prices
+          : [];
+      
+      for (const store of storePrices) {
+        // Normalize field names and aliases
+        const storeName =
+          store?.store_name ||
+          store?.store ||
+          store?.storeName ||
+          store?.display_store_name ||
+          null;
+
+        const price =
+          store?.price ??
+          store?.current_price ??
+          store?.sale_price ??
+          null;
+
+        const url =
+          store?.url ||
+          store?.link ||
+          store?.affiliate_url ||
+          store?.affiliateUrl ||
+          null;
+
+        // Skip rows without required fields
+        if (!storeName || !url) continue;
 
         await client.query(
           `
@@ -16193,11 +16268,11 @@ app.post("/api/tvs", authenticate, async (req, res) => {
           `,
           [
             variantId,
-            store.store_name,
-            store.price,
-            store.url,
-            store.offer_text,
-            store.delivery_info,
+            storeName,
+            price,
+            url,
+            store?.offer_text || store?.offerText || null,
+            store?.delivery_info || store?.deliveryInfo || null,
           ],
         );
       }
