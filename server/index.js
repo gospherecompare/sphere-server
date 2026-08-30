@@ -4136,10 +4136,22 @@ const applySpecScoreToRow = (type, row, profiles) => {
     overallScoreV2 = specScoreV2;
     overallScoreV2Source =
       specScoreV2 != null ? "model_v2_raw" : "model_v2_unavailable";
-    specScore = specScoreV2;
-    specScoreSource = specScoreV2Source;
-    overallScore = specScoreV2;
-    overallScoreSource = overallScoreV2Source;
+
+    const canonicalSpecScore = providedSpecScore ?? specScoreV2;
+    specScore = canonicalSpecScore;
+    specScoreSource =
+      providedSpecScore != null ? "provided" : specScoreV2Source;
+
+    const canonicalOverallScore =
+      providedOverallScore ?? canonicalSpecScore ?? null;
+    overallScore = canonicalOverallScore;
+    overallScoreSource =
+      providedOverallScore != null
+        ? "provided"
+        : canonicalSpecScore != null
+          ? "derived_from_spec_score"
+          : "model_v2_unavailable";
+
     specScorePrice = toFiniteNumberOrNull(v2.price);
     specScorePriceBand = v2.priceBand || "unknown";
     specFeatureCoverage = toFiniteNumberOrNull(v2.featureCoverage);
@@ -4272,19 +4284,10 @@ const applySpecScoreToRows = (type, rows, profiles) => {
     );
 
     updated.set(entry.index, {
-      spec_score: context.score,
-      spec_score_source: context.source,
-      overall_score: context.score,
-      overall_score_source: context.source,
-      spec_score_v2: context.score,
-      overall_score_v2: context.score,
-      spec_score_v2_source: context.source,
-      overall_score_v2_source: context.source,
-      spec_score_v2_display_80_98: display8098,
-      overall_score_v2_display_80_98: display8098,
-      spec_score_display: publicDisplay,
-      overall_score_display: publicDisplay,
-      spec_tier_v2: toSpecTier(context.score),
+      ranking_score: context.score,
+      ranking_score_source: context.source,
+      ranking_score_display: publicDisplay,
+      ranking_score_display_80_98: display8098,
     });
   });
 
@@ -10935,6 +10938,8 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
         blog_author.role AS author_role,
         bl.category,
         bl.blog_eligible,
+        COALESCE(ai.status, 'not_created') AS ai_summary_status,
+        ai.error_message AS ai_summary_error,
         COALESCE(
           bl.hero_image,
           (
@@ -10964,6 +10969,10 @@ app.get("/api/admin/blogs", authenticate, async (req, res) => {
         ON p.id = bl.product_id
       LEFT JOIN brands b
         ON b.id = p.brand_id
+      LEFT JOIN ai_generated_content ai
+        ON ai.entity_type = 'blog'
+       AND ai.entity_id = bl.id
+       AND ai.content_type = 'summary'
       ${whereSql}
       ORDER BY bl.updated_at DESC, bl.id DESC
       LIMIT $${status ? 2 : 1} OFFSET $${status ? 3 : 2}
@@ -11028,6 +11037,8 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
         bl.token_snapshot,
         bl.meta_title,
         bl.meta_description,
+        COALESCE(ai.status, 'not_created') AS ai_summary_status,
+        ai.error_message AS ai_summary_error,
         COALESCE(
           bl.hero_image,
           (
@@ -11058,6 +11069,10 @@ app.get("/api/admin/blogs/:id", authenticate, async (req, res) => {
         ON p.id = bl.product_id
       LEFT JOIN brands b
         ON b.id = p.brand_id
+      LEFT JOIN ai_generated_content ai
+        ON ai.entity_type = 'blog'
+       AND ai.entity_id = bl.id
+       AND ai.content_type = 'summary'
       WHERE bl.id = $1
       LIMIT 1
     `,
@@ -12982,11 +12997,14 @@ app.post(
         contentType: "summary",
         content: summary,
         status: "generated",
+        provider: "gemini",
         model,
         temperature,
         inputTokens,
         outputTokens,
         inputHash,
+        inputText: JSON.stringify(buildBlogAiInput(blog), null, 2),
+        promptText: buildBlogSummaryPrompt(buildBlogAiInput(blog)),
       });
 
       return res.json({
@@ -13230,17 +13248,26 @@ app.post(
       }
 
       const generatedAt = new Date().toISOString();
+      const summaryInput = buildProductAiInput({
+        product,
+        smartphone: product.smartphone_id ? product : null,
+        variants,
+        prices,
+      });
       await saveAiContent({
         entityType: "smartphone",
         entityId: productId,
         contentType: "summary",
         content: summary,
         status: "generated",
+        provider: "gemini",
         model,
         temperature,
         inputTokens,
         outputTokens,
         inputHash,
+        inputText: JSON.stringify(summaryInput, null, 2),
+        promptText: buildProductSummaryPrompt(summaryInput),
       });
 
       return res.json({
@@ -14180,18 +14207,10 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
           sp?.display_store_name ||
           null;
 
-        const price =
-          sp?.price ??
-          sp?.current_price ??
-          sp?.sale_price ??
-          null;
+        const price = sp?.price ?? sp?.current_price ?? sp?.sale_price ?? null;
 
         const url =
-          sp?.url ||
-          sp?.link ||
-          sp?.affiliate_link ||
-          sp?.affiliateUrl ||
-          null;
+          sp?.url || sp?.link || sp?.affiliate_link || sp?.affiliateUrl || null;
 
         // Skip rows without required fields
         if (!storeName || !url) continue;
@@ -14215,10 +14234,7 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
             url,
             sp?.offer_text || sp?.offerText || null,
             normalizeDateOnlyInput(
-              sp?.sale_start_date ??
-                sp?.sale_date ??
-                sp?.saleStartDate ??
-                null,
+              sp?.sale_start_date ?? sp?.sale_date ?? sp?.saleStartDate ?? null,
             ),
           ],
         );
@@ -15310,7 +15326,7 @@ app.post("/api/laptops", authenticate, async (req, res) => {
       for (const s of stores) {
         const storeObj = toPlainObject(s);
         const storeName = storeObj.store_name || storeObj.store || null;
-        
+
         // Skip rows without a store name
         if (!storeName) continue;
 
@@ -16105,14 +16121,14 @@ app.post("/api/tvs", authenticate, async (req, res) => {
     const imagesJson = Array.isArray(payload.images_json)
       ? payload.images_json
       : [];
-    
+
     // Accept both 'variants' and 'variants_json' field names
     const variantsInput = Array.isArray(payload?.variants)
       ? payload.variants
       : Array.isArray(payload?.variants_json)
         ? payload.variants_json
         : [];
-    
+
     const variantsJson = normalizeTvVariantsInput(variantsInput);
     const variantsJsonForRow = variantsJson.map((variant) => ({
       variant_key: variant.variant_key,
@@ -16221,14 +16237,14 @@ app.post("/api/tvs", authenticate, async (req, res) => {
       );
 
       const variantId = variantRes.rows[0].id;
-      
+
       // Accept both 'stores' and 'store_prices' field names
       const storePrices = Array.isArray(variant?.stores)
         ? variant.stores
         : Array.isArray(variant?.store_prices)
           ? variant.store_prices
           : [];
-      
+
       for (const store of storePrices) {
         // Normalize field names and aliases
         const storeName =
@@ -16239,10 +16255,7 @@ app.post("/api/tvs", authenticate, async (req, res) => {
           null;
 
         const price =
-          store?.price ??
-          store?.current_price ??
-          store?.sale_price ??
-          null;
+          store?.price ?? store?.current_price ?? store?.sale_price ?? null;
 
         const url =
           store?.url ||
@@ -20378,13 +20391,175 @@ app.get("/api/admin/ai/gemini-config", authenticate, async (req, res) => {
     return res.json({
       success: true,
       configured: Boolean(apiKey),
-      apiKeyPreview: apiKey ? `${apiKey.slice(0, 4)}...${apiKey.slice(-4)}` : "",
+      apiKeyPreview: apiKey
+        ? `${apiKey.slice(0, 4)}...${apiKey.slice(-4)}`
+        : "",
       model: String(row?.model || "gemini-3.6-flash").trim(),
       updated_at: row?.updated_at || null,
     });
   } catch (err) {
     console.error("GET /api/admin/ai/gemini-config error:", err);
     return res.status(500).json({ message: "Failed to load Gemini settings" });
+  }
+});
+
+app.get("/api/admin/ai/history", authenticate, async (req, res) => {
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 100)));
+    const entityType = String(req.query.entity_type || "all").trim();
+    const contentType = String(req.query.content_type || "summary").trim();
+
+    const whereClauses = [];
+    const params = [];
+
+    if (entityType && entityType !== "all") {
+      params.push(entityType);
+      whereClauses.push(`entity_type = $${params.length}`);
+    }
+
+    if (contentType) {
+      params.push(contentType);
+      whereClauses.push(`content_type = $${params.length}`);
+    }
+
+    params.push(limit);
+    const query = `
+      SELECT
+        a.id,
+        a.entity_type,
+        a.entity_id,
+        CASE
+          WHEN a.entity_type = 'blog' THEN COALESCE(b.title, CONCAT('news #', a.entity_id)::text)
+          WHEN a.entity_type IN ('smartphone', 'laptop', 'appliance') THEN COALESCE(p.name, CONCAT(a.entity_type, ' #', a.entity_id)::text)
+          ELSE CONCAT(a.entity_type, ' #', a.entity_id)::text
+        END AS entity_name,
+        a.content_type,
+        a.status,
+        a.provider,
+        a.model,
+        a.temperature,
+        a.input_tokens,
+        a.output_tokens,
+        a.input_hash,
+        a.input_text,
+        a.prompt_text,
+        a.content,
+        a.error_message,
+        a.generated_at,
+        a.created_at,
+        a.updated_at
+      FROM ai_generated_content a
+      LEFT JOIN products p ON a.entity_type IN ('smartphone', 'laptop', 'appliance') AND p.id = a.entity_id
+      LEFT JOIN blogs b ON a.entity_type = 'blog' AND b.id = a.entity_id
+      ${whereClauses.length ? `WHERE ${whereClauses.join(" AND ")}` : ""}
+      ORDER BY a.generated_at DESC NULLS LAST, a.updated_at DESC
+      LIMIT $${params.length}
+    `;
+
+    const result = await db.query(query, params);
+    return res.json({ success: true, items: result.rows || [] });
+  } catch (err) {
+    console.error("GET /api/admin/ai/history error:", err);
+    return res.status(500).json({ message: "Failed to load AI history" });
+  }
+});
+
+app.get("/api/admin/ai/history/:id", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id || id <= 0) {
+      return res.status(400).json({ message: "Invalid history entry ID" });
+    }
+
+    const result = await db.query(
+      `
+        SELECT
+          a.id,
+          a.entity_type,
+          a.entity_id,
+          CASE
+            WHEN a.entity_type = 'blog' THEN COALESCE(b.title, CONCAT('news #', a.entity_id)::text)
+            WHEN a.entity_type IN ('smartphone', 'laptop', 'appliance') THEN COALESCE(p.name, CONCAT(a.entity_type, ' #', a.entity_id)::text)
+            ELSE CONCAT(a.entity_type, ' #', a.entity_id)::text
+          END AS entity_name,
+          a.content_type,
+          a.status,
+          a.provider,
+          a.model,
+          a.temperature,
+          a.input_tokens,
+          a.output_tokens,
+          a.input_hash,
+          a.input_text,
+          a.prompt_text,
+          a.content,
+          a.error_message,
+          a.generated_at,
+          a.created_at,
+          a.updated_at
+        FROM ai_generated_content a
+        LEFT JOIN products p ON a.entity_type IN ('smartphone', 'laptop', 'appliance') AND p.id = a.entity_id
+        LEFT JOIN blogs b ON a.entity_type = 'blog' AND b.id = a.entity_id
+        WHERE a.id = $1
+        LIMIT 1
+      `,
+      [id],
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ message: "AI history entry not found" });
+    }
+
+    return res.json({ success: true, item: result.rows[0] });
+  } catch (err) {
+    console.error("GET /api/admin/ai/history/:id error:", err);
+    return res.status(500).json({ message: "Failed to load AI history entry" });
+  }
+});
+
+app.put("/api/admin/ai/history/:id", authenticate, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id || id <= 0) {
+      return res.status(400).json({ message: "Invalid history entry ID" });
+    }
+
+    const body = req.body || {};
+    const content = typeof body.content === "string" ? body.content.trim() : null;
+    const model = typeof body.model === "string" ? body.model.trim() : null;
+    const temperature = body.temperature === undefined || body.temperature === null ? null : Number(body.temperature);
+    const promptText = typeof body.prompt_text === "string" ? body.prompt_text : null;
+    const inputText = typeof body.input_text === "string" ? body.input_text : null;
+    const revisedNotes = typeof body.revision_notes === "string" ? body.revision_notes.trim() : null;
+
+    if (!content) {
+      return res.status(400).json({ message: "AI output content is required" });
+    }
+
+    const result = await db.query(
+      `UPDATE ai_generated_content
+       SET content = $1,
+           model = COALESCE($2, model),
+           temperature = COALESCE($3, temperature),
+           prompt_text = COALESCE($4, prompt_text),
+           input_text = COALESCE($5, input_text),
+           revision_notes = COALESCE($6, revision_notes),
+           status = 'generated',
+           error_message = NULL,
+           updated_at = now()
+       WHERE id = $7
+       RETURNING *`,
+      [content, model, Number.isFinite(temperature) ? temperature : null, promptText, inputText, revisedNotes, id],
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ message: "AI history entry not found" });
+    }
+
+    return res.json({ success: true, item: result.rows[0] });
+  } catch (err) {
+    console.error("PUT /api/admin/ai/history/:id error:", err);
+    return res.status(500).json({ message: "Failed to update AI history entry" });
   }
 });
 
@@ -20397,7 +20572,9 @@ app.put("/api/admin/ai/gemini-config", authenticate, async (req, res) => {
     const apiKey = String(req.body?.apiKey || "").trim();
     const model = String(req.body?.model || "").trim();
     if (!model || model.length > 120) {
-      return res.status(400).json({ message: "A valid Gemini model is required" });
+      return res
+        .status(400)
+        .json({ message: "A valid Gemini model is required" });
     }
 
     const existing = await db.query(

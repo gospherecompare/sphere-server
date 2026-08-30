@@ -53,6 +53,8 @@ const generateProductSummary = async ({
     return {
       summary,
       inputHash,
+      inputText: JSON.stringify(input, null, 2),
+      promptText: prompt,
       model: response.model,
       temperature: TEMPERATURE,
       inputTokens: response.inputTokens,

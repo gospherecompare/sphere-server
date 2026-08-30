@@ -11,11 +11,15 @@ const getAiContent = async (entityType, entityId, contentType) => {
           content_type,
           content,
           status,
+          provider,
           model,
           temperature,
           input_tokens,
           output_tokens,
           input_hash,
+          input_text,
+          prompt_text,
+          revision_notes,
           generated_at,
           updated_at
         FROM ai_generated_content
@@ -40,11 +44,14 @@ const saveAiContent = async ({
   contentType,
   content,
   status,
+  provider = "gemini",
   model,
   temperature,
   inputTokens,
   outputTokens,
   inputHash,
+  inputText = null,
+  promptText = null,
   errorMessage = null,
 }) => {
   try {
@@ -56,11 +63,14 @@ const saveAiContent = async ({
           content_type,
           content,
           status,
+          provider,
           model,
           temperature,
           input_tokens,
           output_tokens,
           input_hash,
+          input_text,
+          prompt_text,
           error_message,
           generated_at,
           updated_at
@@ -68,7 +78,7 @@ const saveAiContent = async ({
         VALUES (
           $1, $2, $3, $4, $5,
           $6, $7, $8, $9, $10,
-          $11,
+          $11, $12, $13, $14,
           CASE WHEN $5 = 'generated' THEN now() ELSE NULL END,
           now()
         )
@@ -80,11 +90,14 @@ const saveAiContent = async ({
         DO UPDATE SET
           content = EXCLUDED.content,
           status = EXCLUDED.status,
+          provider = EXCLUDED.provider,
           model = EXCLUDED.model,
           temperature = EXCLUDED.temperature,
           input_tokens = EXCLUDED.input_tokens,
           output_tokens = EXCLUDED.output_tokens,
           input_hash = EXCLUDED.input_hash,
+          input_text = EXCLUDED.input_text,
+          prompt_text = EXCLUDED.prompt_text,
           error_message = EXCLUDED.error_message,
           generated_at = EXCLUDED.generated_at,
           updated_at = now()
@@ -96,11 +109,14 @@ const saveAiContent = async ({
         contentType,
         content,
         status,
+        provider,
         model,
         temperature,
         inputTokens,
         outputTokens,
         inputHash,
+        inputText,
+        promptText,
         errorMessage,
       ],
     );
