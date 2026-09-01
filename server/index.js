@@ -158,7 +158,9 @@ const normalizeOrigin = (value) => {
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:3000",
   "http://localhost:5173",
-  "https://workspace.tryhook.shop",
+  "https://workspace.mobilesx.in",
+  "https://www.mobilesx.in",
+  "https://mobilesx.in",
   "https://www.tryhook.shop",
   "https://tryhook.shop",
   "https://www.hooks.in",
@@ -184,7 +186,7 @@ const ALLOWED_ORIGINS = new Set(
     .filter(Boolean),
 );
 
-const ALLOWED_ORIGIN_HOST_SUFFIXES = [".tryhook.shop", ".hooks.in"];
+const ALLOWED_ORIGIN_HOST_SUFFIXES = [".mobilesx.in", ".tryhook.shop", ".hooks.in"];
 
 const isAllowedOriginHost = (hostname) => {
   const normalizedHost = String(hostname || "")
