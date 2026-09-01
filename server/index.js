@@ -44,6 +44,7 @@ const { buildDecisionComparison } = require("./utils/compareDecisionEngine");
 const {
   recomputeSmartphoneCompetitorAnalysis,
 } = require("./utils/competitorAnalysis");
+const { normalizeSmartphonePayload } = require("./schemas/smartphonePayload");
 const {
   ROLE_PRESETS: RBAC_ROLE_PRESETS,
   expandPermissionSet: expandRbacPermissionSet,
@@ -161,10 +162,6 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "https://workspace.mobilesx.in",
   "https://www.mobilesx.in",
   "https://mobilesx.in",
-  "https://www.tryhook.shop",
-  "https://tryhook.shop",
-  "https://www.hooks.in",
-  "https://hooks.in",
 ];
 
 const ENV_ALLOWED_ORIGINS = [
@@ -186,7 +183,7 @@ const ALLOWED_ORIGINS = new Set(
     .filter(Boolean),
 );
 
-const ALLOWED_ORIGIN_HOST_SUFFIXES = [".mobilesx.in", ".tryhook.shop", ".hooks.in"];
+const ALLOWED_ORIGIN_HOST_SUFFIXES = [".mobilesx.in"];
 
 const isAllowedOriginHost = (hostname) => {
   const normalizedHost = String(hostname || "")
@@ -495,16 +492,44 @@ const resolveSmartphoneLaunchStage = (
   todayIndia = getIndiaDateOnly(),
 ) => {
   if (!device) return null;
+
+  // Check explicit override FIRST - this is authoritative
   const override = normalizeLaunchStatusOverride(
-    device.launch_status_override ||
-      device.launchStatusOverride ||
-      device.launch_status ||
-      device.launchStatus,
+    device.launch_status_override || device.launchStatusOverride,
   );
+
+  if (override) {
+    // Explicit override is authoritative - return it immediately
+    return override;
+  }
+
+  // Then check other status hints (status, availability, badge, etc.)
   const statusHint = normalizeLaunchStatusOverride(
-    device.status || device.availability || device.badge || device.status_text,
+    device.launch_status ||
+      device.launchStatus ||
+      device.status ||
+      device.availability ||
+      device.badge ||
+      device.status_text,
   );
-  const explicitStatus = override || statusHint;
+
+  if (statusHint === "rumored" || statusHint === "announced") {
+    return statusHint;
+  }
+
+  if (statusHint === "upcoming") {
+    return "upcoming";
+  }
+
+  if (statusHint === "available") {
+    return "available";
+  }
+
+  if (statusHint === "released") {
+    return "released";
+  }
+
+  // Finally, use data availability stage to infer status
   const dataAvailabilityStage = resolveSmartphoneDataAvailabilityStage(
     device,
     todayIndia,
@@ -512,22 +537,6 @@ const resolveSmartphoneLaunchStage = (
 
   if (dataAvailabilityStage) {
     return dataAvailabilityStage;
-  }
-
-  if (explicitStatus === "rumored" || explicitStatus === "announced") {
-    return explicitStatus;
-  }
-
-  if (explicitStatus === "upcoming") {
-    return "upcoming";
-  }
-
-  if (explicitStatus === "available") {
-    return "available";
-  }
-
-  if (explicitStatus === "released") {
-    return "released";
   }
 
   return "released";
@@ -12160,8 +12169,8 @@ const STATIC_SITEMAP_ROUTES = [
 ];
 
 const getPublicSiteOrigin = () =>
-  normalizeOrigin(process.env.PUBLIC_SITE_ORIGIN || "https://tryhook.shop") ||
-  "https://tryhook.shop";
+  normalizeOrigin(process.env.PUBLIC_SITE_ORIGIN || "https://mobilesx.in") ||
+  "https://mobilesx.in";
 
 const escapeXmlText = (value = "") =>
   String(value || "")
@@ -14033,13 +14042,37 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
   const client = await db.connect();
 
   try {
-    const {
-      product,
-      smartphone,
-      images = [],
-      variants = [],
-      create_ai_summary: createAiSummary = true,
-    } = req.body;
+    const canonical = normalizeSmartphonePayload(req.body || {});
+    const product = {
+      ...canonical.product,
+      name: canonical.product_name,
+      brand_id: req.body?.product?.brand_id || req.body?.brand_id || null,
+    };
+    const smartphone = {
+      ...canonical.smartphone,
+      brand: canonical.brand_name,
+      model: canonical.model,
+      category: canonical.category || req.body?.smartphone?.category || null,
+      segment: canonical.category || req.body?.smartphone?.segment || null,
+      launch_status_override:
+        canonical.launch_status_override ||
+        req.body?.smartphone?.launch_status_override ||
+        null,
+      launchStatusOverride:
+        canonical.launch_status_override ||
+        req.body?.smartphone?.launchStatusOverride ||
+        null,
+      expected_price:
+        canonical.expected_price ??
+        req.body?.smartphone?.expected_price ??
+        null,
+      expectedPrice:
+        canonical.expected_price ?? req.body?.smartphone?.expectedPrice ?? null,
+    };
+    const images = canonical.images || [];
+    const variants = canonical.variants || [];
+    const createAiSummary =
+      req.body?.create_ai_summary ?? req.body?.createAiSummary ?? true;
 
     await client.query("BEGIN");
 
@@ -16707,7 +16740,19 @@ app.get("/api/networking", async (req, res) => {
 // Update smartphone (replace variants & variant_store_prices  if provided) - authenticated
 app.put("/api/smartphone/:id", authenticate, async (req, res) => {
   const client = await db.connect();
-  console.log(req.body);
+  const canonicalBody = normalizeSmartphonePayload(req.body || {});
+  req.body = {
+    ...canonicalBody,
+    ...canonicalBody.product,
+    ...canonicalBody.smartphone,
+    brand: canonicalBody.brand_name || req.body?.brand || null,
+    model: canonicalBody.model || req.body?.model || null,
+    product_name: canonicalBody.product_name || req.body?.product_name || null,
+    name: canonicalBody.product_name || req.body?.name || null,
+    images: canonicalBody.images || [],
+    variants: canonicalBody.variants || [],
+    variant_store_prices: canonicalBody.variant_store_prices || [],
+  };
   // Accept payloads that wrap a single smartphone inside { smartphones: [ { ... } ] }
   if (
     req.body &&
@@ -17246,6 +17291,20 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 // Payload format similar to /api/smartphones/req but for updating existing device
 app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
   const client = await db.connect();
+  const canonicalBody = normalizeSmartphonePayload(req.body || {});
+  req.body = {
+    ...canonicalBody,
+    ...canonicalBody.product,
+    ...canonicalBody.smartphone,
+    brand: canonicalBody.brand_name || req.body?.brand || null,
+    brand_name: canonicalBody.brand_name || req.body?.brand_name || null,
+    model: canonicalBody.model || req.body?.model || null,
+    product_name: canonicalBody.product_name || req.body?.product_name || null,
+    name: canonicalBody.product_name || req.body?.name || null,
+    images: canonicalBody.images || [],
+    variants: canonicalBody.variants || [],
+    variant_store_prices: canonicalBody.variant_store_prices || [],
+  };
   try {
     await client.query("BEGIN");
 
@@ -20527,12 +20586,21 @@ app.put("/api/admin/ai/history/:id", authenticate, async (req, res) => {
     }
 
     const body = req.body || {};
-    const content = typeof body.content === "string" ? body.content.trim() : null;
+    const content =
+      typeof body.content === "string" ? body.content.trim() : null;
     const model = typeof body.model === "string" ? body.model.trim() : null;
-    const temperature = body.temperature === undefined || body.temperature === null ? null : Number(body.temperature);
-    const promptText = typeof body.prompt_text === "string" ? body.prompt_text : null;
-    const inputText = typeof body.input_text === "string" ? body.input_text : null;
-    const revisedNotes = typeof body.revision_notes === "string" ? body.revision_notes.trim() : null;
+    const temperature =
+      body.temperature === undefined || body.temperature === null
+        ? null
+        : Number(body.temperature);
+    const promptText =
+      typeof body.prompt_text === "string" ? body.prompt_text : null;
+    const inputText =
+      typeof body.input_text === "string" ? body.input_text : null;
+    const revisedNotes =
+      typeof body.revision_notes === "string"
+        ? body.revision_notes.trim()
+        : null;
 
     if (!content) {
       return res.status(400).json({ message: "AI output content is required" });
@@ -20551,7 +20619,15 @@ app.put("/api/admin/ai/history/:id", authenticate, async (req, res) => {
            updated_at = now()
        WHERE id = $7
        RETURNING *`,
-      [content, model, Number.isFinite(temperature) ? temperature : null, promptText, inputText, revisedNotes, id],
+      [
+        content,
+        model,
+        Number.isFinite(temperature) ? temperature : null,
+        promptText,
+        inputText,
+        revisedNotes,
+        id,
+      ],
     );
 
     if (!result.rows[0]) {
@@ -20561,7 +20637,9 @@ app.put("/api/admin/ai/history/:id", authenticate, async (req, res) => {
     return res.json({ success: true, item: result.rows[0] });
   } catch (err) {
     console.error("PUT /api/admin/ai/history/:id error:", err);
-    return res.status(500).json({ message: "Failed to update AI history entry" });
+    return res
+      .status(500)
+      .json({ message: "Failed to update AI history entry" });
   }
 });
 

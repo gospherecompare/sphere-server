@@ -323,7 +323,7 @@ const renderCareerApplicationTemplate = ({ role, firstName, lastName }) => {
                     <span style="display:inline-block;width:5px;height:12px;margin-top:-3px;background:#fff;vertical-align:middle;"></span>
                   </span>
                 </span>
-                <span class="logo-text" style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:#ffffff;letter-spacing:-0.4px;vertical-align:middle;">Hooks</span>
+                <span class="logo-text" style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:#ffffff;letter-spacing:-0.4px;vertical-align:middle;">MobileX</span>
                 <span style="font-size:10px;font-weight:500;color:#5a4d80;letter-spacing:2.5px;text-transform:uppercase;margin-left:9px;vertical-align:middle;">Careers</span>
               </td>
             </tr>
@@ -347,12 +347,12 @@ const renderCareerApplicationTemplate = ({ role, firstName, lastName }) => {
                 <p class="body-copy" style="margin:0 0 16px;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">
                   We've successfully received your application for the
                   <strong style="font-weight:600;color:#5b3ef8;">${roleLabel}</strong>
-                  at Hooks. Our recruitment team has been notified and your profile is now under active review.
+                  at MobileX. Our recruitment team has been notified and your profile is now under active review.
                 </p>
                 <p class="body-copy" style="margin:0 0 16px;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">
                   Our hiring team will carefully evaluate your qualifications and experience against the requirements of the role. If your profile is a strong match, we'll reach out to discuss next steps.
                 </p>
-                <p class="body-copy" style="margin:0;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">We truly appreciate your interest in joining Hooks.</p>
+                <p class="body-copy" style="margin:0;font-size:15px;line-height:1.85;color:#3d3550;font-weight:300;">We truly appreciate your interest in joining MobileX.</p>
   
                 <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:34px;padding-top:22px;">
                   <tbody><tr>
@@ -373,7 +373,7 @@ const renderCareerApplicationTemplate = ({ role, firstName, lastName }) => {
                     <td style="vertical-align:middle;">
                       <p class="footer-copy" style="margin:0;font-size:11px;color:#f0f0f0;line-height:1.5;">
                         &copy; 2026
-                        <a href="https://tryhook.shop/" style="color:#8b72ff;text-decoration:none;font-weight:600;">tryhook.shop</a>
+                        <a href="https://mobilesx.in/" style="color:#8b72ff;text-decoration:none;font-weight:600;">mobilesx.in</a>
                         &nbsp;&middot;&nbsp; All rights reserved.
                       </p>
                     </td>

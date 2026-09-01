@@ -1,6 +1,7 @@
 const express = require("express");
 const { db } = require("../db");
 const { authenticate } = require("../middleware/auth");
+const { normalizeSmartphonePayload } = require("../schemas/smartphonePayload");
 
 const router = express.Router();
 
@@ -140,18 +141,38 @@ function normalizeLaunchStatusOverride(value) {
   const raw = String(value || "")
     .trim()
     .toLowerCase();
-  if (/(upcoming|coming soon|expected|scheduled)/i.test(raw))
-    return "upcoming";
+  if (/(upcoming|coming soon|expected|scheduled)/i.test(raw)) return "upcoming";
   return LAUNCH_STATUS_VALUES.has(raw) ? raw : null;
 }
 
 router.post("/req", authenticate, async (req, res) => {
-  const normalizedRequest = normalizeSingleSmartphoneBody(req.body || {});
+  const normalizedPayload = normalizeSmartphonePayload(req.body || {});
+  const normalizedRequest = normalizeSingleSmartphoneBody(normalizedPayload);
   if (normalizedRequest.error) {
     return res.status(400).json({ message: normalizedRequest.error });
   }
 
   const b = normalizedRequest.body || {};
+  const legacyCompatibleBody = {
+    ...b,
+    product: {
+      ...(isPlainObject(b.product) ? b.product : {}),
+      name: b.product_name || b.name || null,
+    },
+    smartphone: {
+      ...(isPlainObject(b.smartphone) ? b.smartphone : {}),
+      ...b,
+      brand: b.brand_name || null,
+      model: b.model || null,
+      launch_status_override: b.launch_status_override || null,
+    },
+  };
+  const mergedBody = {
+    ...b,
+    ...legacyCompatibleBody,
+    ...legacyCompatibleBody.smartphone,
+  };
+  Object.assign(b, mergedBody);
   const product = isPlainObject(b.product) ? b.product : {};
   const smartphonePayload = isPlainObject(b.smartphone) ? b.smartphone : {};
   const basicInfo = pickSectionObject(b, "basic_info_json");
