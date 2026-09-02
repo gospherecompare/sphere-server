@@ -491,135 +491,11 @@ const resolveSmartphoneLaunchStage = (
   device,
   todayIndia = getIndiaDateOnly(),
 ) => {
-  if (!device) return null;
-
-  // Check explicit override FIRST - this is authoritative
-  const override = normalizeLaunchStatusOverride(
-    device.launch_status_override || device.launchStatusOverride,
-  );
-
-  if (override) {
-    // Explicit override is authoritative - return it immediately
-    return override;
-  }
-
-  // Then check other status hints (status, availability, badge, etc.)
-  const statusHint = normalizeLaunchStatusOverride(
-    device.launch_status ||
-      device.launchStatus ||
-      device.status ||
-      device.availability ||
-      device.badge ||
-      device.status_text,
-  );
-
-  if (statusHint === "rumored" || statusHint === "announced") {
-    return statusHint;
-  }
-
-  if (statusHint === "upcoming") {
-    return "upcoming";
-  }
-
-  if (statusHint === "available") {
-    return "available";
-  }
-
-  if (statusHint === "released") {
-    return "released";
-  }
-
-  // Finally, use data availability stage to infer status
-  const dataAvailabilityStage = resolveSmartphoneDataAvailabilityStage(
-    device,
-    todayIndia,
-  );
-
-  if (dataAvailabilityStage) {
-    return dataAvailabilityStage;
-  }
-
-  return "released";
+  return createCanonicalSmartphoneResponse(device, todayIndia).launch.stage;
 };
 
 const SMARTPHONE_COMPARE_LIMIT_DEFAULT = 4;
 const SMARTPHONE_COMPETITOR_LIMIT_DEFAULT = 5;
-const SMARTPHONE_SPEC_SCORE_MIN_IMPORTANT_INPUTS = 10;
-const SMARTPHONE_IMPORTANT_SPEC_PATHS = {
-  processor: ["performance.processor", "processor", "specs.processor"],
-  gpu: ["performance.gpu", "performance.graphics", "specs.gpu"],
-  ram: ["performance.ram", "variants[].ram", "specs.ram"],
-  storage: ["performance.storage", "variants[].storage", "specs.storage"],
-  display_size: ["display.size", "display.display_size", "specs.display_size"],
-  display_resolution: ["display.resolution", "specs.resolution"],
-  refresh_rate: [
-    "display.refresh_rate",
-    "display.refreshRate",
-    "specs.refresh_rate",
-  ],
-  display_type: ["display.type", "display.panel_type", "display.display_type"],
-  rear_camera: [
-    "camera.rear_camera.main_camera.resolution",
-    "camera.rear_camera.main.resolution",
-    "camera.main_camera_megapixels",
-    "camera.main_camera",
-  ],
-  front_camera: [
-    "camera.front_camera.resolution",
-    "camera.front_camera.megapixels",
-    "camera.front_camera_megapixels",
-    "camera.selfie_camera",
-  ],
-  battery_capacity: [
-    "battery.capacity",
-    "battery.battery_capacity",
-    "battery.battery_capacity_mah",
-  ],
-  charging: [
-    "battery.fast_charging",
-    "battery.charging_speed",
-    "battery.charging",
-  ],
-  operating_system: [
-    "performance.operating_system",
-    "performance.operatingSystem",
-    "performance.os",
-  ],
-  network: [
-    "connectivity.network_type",
-    "network.network_type",
-    "network.5g_support",
-  ],
-  weight: ["build_design.weight", "build_design.weight_g", "weight"],
-  protection: [
-    "build_design.ip_rating",
-    "build_design.water_resistance",
-    "display.protection",
-  ],
-};
-
-const countSmartphoneImportantSpecInputs = (device) => {
-  if (!device || typeof device !== "object") return 0;
-  return Object.values(SMARTPHONE_IMPORTANT_SPEC_PATHS).filter(
-    (paths) => resolveProfileValueByPaths(device, paths) != null,
-  ).length;
-};
-
-const canShowUpcomingSmartphoneSpecScore = (
-  device,
-  todayIndia = getIndiaDateOnly(),
-) => {
-  const launchDate = normalizeDateOnlyInput(
-    device?.launch_date ?? device?.launchDate ?? null,
-  );
-  if (!launchDate || !todayIndia || launchDate > todayIndia) return false;
-
-  return (
-    countSmartphoneImportantSpecInputs(device) >=
-    SMARTPHONE_SPEC_SCORE_MIN_IMPORTANT_INPUTS
-  );
-};
-
 const resolveSmartphoneLaunchPolicy = (
   launchStage,
   device = null,
@@ -652,7 +528,7 @@ const resolveSmartphoneLaunchPolicy = (
       allow_competitors: false,
       compare_limit: 0,
       competitor_limit: 0,
-      allow_spec_score: canShowUpcomingSmartphoneSpecScore(device, todayIndia),
+      allow_spec_score: false,
     };
   }
 
@@ -661,7 +537,7 @@ const resolveSmartphoneLaunchPolicy = (
       ...base,
       compare_limit: 2,
       competitor_limit: 2,
-      allow_spec_score: canShowUpcomingSmartphoneSpecScore(device, todayIndia),
+      allow_spec_score: false,
     };
   }
 
@@ -1375,53 +1251,8 @@ function collectSmartphoneStoreRows(device = {}) {
   return rows.filter(Boolean);
 }
 
-const resolveSmartphoneDataAvailabilityStage = (
-  device,
-  todayIndia = getIndiaDateOnly(),
-) => {
-  if (!device) return null;
-  const saleStartDate = getSmartphoneSaleStartDate(device);
-  if (hasFutureSmartphoneSaleDate(saleStartDate, todayIndia)) {
-    return "upcoming";
-  }
-
-  const storeRows = collectSmartphoneStoreRows(device);
-  const hasStoreEntries = storeRows.some(hasSmartphoneStoreEntrySignal);
-  if (!hasStoreEntries) return "upcoming";
-
-  return "available";
-};
-
 function resolveSmartphoneSaleStage(device, todayIndia = getIndiaDateOnly()) {
-  if (!device) return "sale_tbd";
-
-  const saleStartDate = getSmartphoneSaleStartDate(device);
-  const storeRows = collectSmartphoneStoreRows(device);
-  const liveStores = storeRows.some((store) =>
-    hasSmartphoneLiveStoreSignal(store, todayIndia),
-  );
-  const hasStoreSignals = storeRows.some(hasSmartphoneStoreEntrySignal);
-  const launchStage = resolveSmartphoneLaunchStage(device, todayIndia);
-
-  if (saleStartDate) {
-    if (hasFutureSmartphoneSaleDate(saleStartDate, todayIndia))
-      return "sale_scheduled";
-    return liveStores ? "on_sale" : "sale_started";
-  }
-
-  const normalizedStatus = normalizeLaunchStatusOverride(
-    device.launch_status_override ||
-      device.launchStatusOverride ||
-      device.launch_status ||
-      device.launchStatus ||
-      device.status ||
-      "",
-  );
-  if (normalizedStatus === "available") return "on_sale";
-  if (liveStores) return "on_sale";
-  if (launchStage === "upcoming") return "sale_tbd";
-  if (launchStage === "released" && hasStoreSignals) return "store_pending";
-  return "sale_tbd";
+  return createCanonicalSmartphoneResponse(device, todayIndia).sale.stage;
 }
 
 const getSmartphoneFeedStartDate = (device) =>
@@ -1624,20 +1455,7 @@ const resolveSmartphoneStoreStage = (
   device = {},
   todayIndia = getIndiaDateOnly(),
 ) => {
-  const storeRows = collectSmartphoneStoreRows(device);
-  const saleStartDate = getSmartphoneSaleStartDate(device);
-  if (hasFutureSmartphoneSaleDate(saleStartDate, todayIndia)) {
-    return storeRows.some(hasSmartphoneStoreEntrySignal) ? "scheduled" : "none";
-  }
-  if (
-    storeRows.some((store) => hasSmartphoneLiveStoreSignal(store, todayIndia))
-  ) {
-    return "live";
-  }
-  if (storeRows.length > 0) {
-    return "listed";
-  }
-  return "none";
+  return createCanonicalSmartphoneResponse(device, todayIndia).store.stage;
 };
 
 const applySmartphoneAvailabilityDetails = (
@@ -1670,7 +1488,8 @@ const isSmartphoneLatestFeedItem = (
   if (!device) return false;
   const saleStartDate = getSmartphoneFeedStartDate(device);
   const storeRows = collectSmartphoneStoreRows(device);
-  if (resolveSmartphoneLaunchStage(device, todayIndia) === "upcoming") {
+  const canonical = createCanonicalSmartphoneResponse(device, todayIndia);
+  if (canonical.launch.stage === "upcoming") {
     return false;
   }
   const hasLiveStores = storeRows.some((store) =>
@@ -1680,10 +1499,8 @@ const isSmartphoneLatestFeedItem = (
     return saleStartDate <= todayIndia;
   }
 
-  const launchStage = resolveSmartphoneLaunchStage(device, todayIndia);
-  if (launchStage === "available") return true;
-  if (launchStage === "released") return hasLiveStores;
-  return ["available"].includes(launchStage);
+  if (canonical.launch.stage === "released") return hasLiveStores;
+  return false;
 };
 
 const isSmartphoneUpcomingFeedItem = (
@@ -1691,7 +1508,8 @@ const isSmartphoneUpcomingFeedItem = (
   todayIndia = getIndiaDateOnly(),
 ) => {
   if (!device) return false;
-  const launchStage = resolveSmartphoneLaunchStage(device, todayIndia);
+  const launchStage = createCanonicalSmartphoneResponse(device, todayIndia)
+    .launch.stage;
   return (
     launchStage === "upcoming" ||
     launchStage === "rumored" ||
@@ -2403,8 +2221,57 @@ const resolvePublicSmartphoneSpecScore = (
   return null;
 };
 
+/**
+ * PHASE 1: CANONICAL LIFECYCLE RESOLVER
+ *
+ * Imported from lifecycle module (extracted for testability)
+ * See: server/lifecycle/smartphoneLifecycle.js
+ *
+ * This is the AUTHORITATIVE source for all lifecycle state calculations.
+ * All endpoints must return this contract.
+ */
+const {
+  resolveCanonicalLaunchStage,
+  resolveCanonicalSaleStage,
+  resolveCanonicalStoreStage,
+  resolveCanonicalRenderType,
+  resolveCanonicalPermissions,
+  createCanonicalSmartphoneResponse,
+} = require("./lifecycle/smartphoneLifecycle");
+
+const withCanonicalSmartphoneLifecycle = (
+  value,
+  todayIndia = getIndiaDateOnly(),
+) => {
+  const specScoreEligible =
+    value?.spec_score != null || value?.specScore != null;
+  const lifecycle = createCanonicalSmartphoneResponse(
+    value,
+    todayIndia,
+    specScoreEligible,
+  );
+
+  return {
+    ...(value || {}),
+    ...lifecycle,
+    lifecycle,
+    launch_status: lifecycle.launch.stage,
+    launchStatus: lifecycle.launch.stage,
+    sale_status: lifecycle.sale.stage,
+    saleStatus: lifecycle.sale.stage,
+    store_stage: lifecycle.store.stage,
+    storeStage: lifecycle.store.stage,
+    render_type: lifecycle.render.type,
+    renderType: lifecycle.render.type,
+    allowCompare: lifecycle.allow_compare,
+    allowCompetitors: lifecycle.allow_competitors,
+    allowSpecScore: lifecycle.allow_spec_score,
+  };
+};
+
 const toPublicSmartphoneResponse = (value) => {
-  const withoutBusinessFields = stripPublicSmartphoneBusinessFields(value);
+  const canonical = withCanonicalSmartphoneLifecycle(value);
+  const withoutBusinessFields = stripPublicSmartphoneBusinessFields(canonical);
   const resolvedSpecScore = resolvePublicSmartphoneSpecScore(
     withoutBusinessFields,
     {
@@ -4140,6 +4007,35 @@ const applySpecScoreToRow = (type, row, profiles) => {
   let cameraScoreV2Display8099 = null;
 
   if (normalizedType === "smartphone") {
+    const launchStage = resolveCanonicalLaunchStage(source);
+    if (launchStage !== "released") {
+      return {
+        ...row,
+        camera: row.camera,
+        camera_json: row.camera_json,
+        field_profile: fieldProfile,
+        spec_score: null,
+        spec_score_source: "unavailable_before_release",
+        overall_score: null,
+        overall_score_source: "unavailable_before_release",
+        spec_score_v2_raw: null,
+        spec_score_v2: null,
+        spec_score_v2_source: "unavailable_before_release",
+        overall_score_v2: null,
+        overall_score_v2_source: "unavailable_before_release",
+        spec_score_v2_display_80_98: null,
+        overall_score_v2_display_80_98: null,
+        spec_score_display: null,
+        overall_score_display: null,
+        spec_score_price: null,
+        spec_score_price_band: "unknown",
+        spec_score_feature_coverage: null,
+        camera_score_v2_raw: null,
+        camera_score_v2_display_80_99: null,
+        spec_tier_v2: "Unrated",
+      };
+    }
+
     const v2 = computeSmartphoneRawSpecScoreV2(source);
     specScoreV2 = toFiniteScore100(v2.rawScore);
     specScoreV2Raw = specScoreV2;
@@ -5162,6 +5058,7 @@ async function runMigrations() {
         brand TEXT,
         model TEXT,
         launch_date DATE,
+        launch_status_mode TEXT NOT NULL DEFAULT 'auto',
         official_preorder_url TEXT,
         launch_status_override TEXT,
         expected_price NUMERIC,
@@ -5194,6 +5091,9 @@ async function runMigrations() {
     );
     await safeQuery(
       `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS launch_status_override TEXT;`,
+    );
+    await safeQuery(
+      `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS launch_status_mode TEXT NOT NULL DEFAULT 'auto';`,
     );
     await safeQuery(
       `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS expected_price NUMERIC;`,
@@ -14595,6 +14495,7 @@ app.get("/api/smartphones", async (req, res) => {
         s.category,
         s.model,
         s.launch_date,
+        s.launch_status_mode,
         s.launch_status_override,
         s.colors,
         s.build_design,
@@ -14681,7 +14582,8 @@ app.get("/api/smartphones", async (req, res) => {
  
       GROUP BY
         p.id, p.name, p.product_type, p.brand_id, b.name, b.logo, b.id,
-        s.category, s.model, s.launch_date, s.launch_status_override,
+        s.category, s.model, s.launch_date, s.launch_status_mode,
+        s.launch_status_override,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at,
@@ -14858,6 +14760,7 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
         s.category,
         s.model,
         s.launch_date,
+        s.launch_status_mode,
         s.launch_status_override,
         s.colors,
         s.build_design,
@@ -14946,7 +14849,8 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
 
       GROUP BY
         p.id, p.name, p.product_type, p.brand_id, b.name, b.id,
-        s.category, s.model, s.launch_date, s.launch_status_override,
+        s.category, s.model, s.launch_date, s.launch_status_mode,
+        s.launch_status_override,
         s.colors, s.build_design, s.display, s.performance,
         s.camera, s.battery, s.connectivity, s.network,
         s.ports, s.audio, s.multimedia, s.sensors, s.created_at, pub.is_published,
@@ -14995,6 +14899,19 @@ app.get("/api/smartphone", authenticate, async (req, res) => {
       }),
       profileConfig.profiles,
     );
+
+    for (const item of smartphones) {
+      const lifecycle = createCanonicalSmartphoneResponse(item, todayIndia);
+      item.lifecycle = lifecycle;
+      item.launch_status = lifecycle.launch.stage;
+      item.sale_status = lifecycle.sale.stage;
+      item.store_stage = lifecycle.store.stage;
+      item.render_type = lifecycle.render.type;
+      item.allow_compare = lifecycle.allow_compare;
+      item.allow_competitors = lifecycle.allow_competitors;
+      item.allow_spec_score = lifecycle.allow_spec_score;
+      item.spec_score = lifecycle.allow_spec_score ? item.spec_score : null;
+    }
 
     const usageResult = await db.query(
       `
@@ -15180,7 +15097,7 @@ app.get("/api/smartphone/:id", async (req, res) => {
       profileConfig.profiles,
     );
 
-    return res.json({ data: scored });
+    return res.json({ data: toPublicSmartphoneResponse(scored) });
   } catch (err) {
     console.error("GET /api/smartphone/:id error:", err);
     return res.status(500).json({ error: err.message });
@@ -18912,8 +18829,25 @@ app.patch("/api/admin/smartphones/bulk", authenticate, async (req, res) => {
       Object.prototype.hasOwnProperty.call(req.body || {}, "isPublished") ||
       Object.prototype.hasOwnProperty.call(req.body || {}, "published") ||
       Object.prototype.hasOwnProperty.call(req.body || {}, "publish");
-    if (!hasPublishValue) {
+    const hasLaunchStatusValue = Object.prototype.hasOwnProperty.call(
+      req.body || {},
+      "launch_status_override",
+    );
+    if (!hasPublishValue && !hasLaunchStatusValue) {
       return res.status(400).json({ message: "is_published is required" });
+    }
+
+    let launchStatusOverride = null;
+    if (hasLaunchStatusValue) {
+      launchStatusOverride = normalizeLaunchStatusOverride(
+        req.body.launch_status_override,
+      );
+      if (!launchStatusOverride) {
+        return res.status(400).json({
+          message:
+            "launch_status_override must be rumored, announced, upcoming, or released",
+        });
+      }
     }
 
     const rawPublishValue =
@@ -18934,7 +18868,7 @@ app.patch("/api/admin/smartphones/bulk", authenticate, async (req, res) => {
             ? false
             : null;
 
-    if (typeof isPublished !== "boolean") {
+    if (hasPublishValue && typeof isPublished !== "boolean") {
       return res.status(400).json({ message: "is_published must be boolean" });
     }
 
@@ -18959,23 +18893,40 @@ app.patch("/api/admin/smartphones/bulk", authenticate, async (req, res) => {
     }
 
     const productIds = products.map((product) => Number(product.id));
-    const result = await db.query(
-      `
-      INSERT INTO product_publish (product_id, is_published, published_by)
-      SELECT selected.product_id, $2, $3
-      FROM unnest($1::int[]) AS selected(product_id)
-      ON CONFLICT (product_id)
-      DO UPDATE SET
-        is_published = EXCLUDED.is_published,
-        published_by = EXCLUDED.published_by,
-        updated_at = now()
-      RETURNING product_id, is_published, published_by, updated_at;
-      `,
-      [productIds, isPublished, req.user.id],
-    );
+    const result = hasPublishValue
+      ? await db.query(
+          `
+          INSERT INTO product_publish (product_id, is_published, published_by)
+          SELECT selected.product_id, $2, $3
+          FROM unnest($1::int[]) AS selected(product_id)
+          ON CONFLICT (product_id)
+          DO UPDATE SET
+            is_published = EXCLUDED.is_published,
+            published_by = EXCLUDED.published_by,
+            updated_at = now()
+          RETURNING product_id, is_published, published_by, updated_at;
+          `,
+          [productIds, isPublished, req.user.id],
+        )
+      : { rows: [], rowCount: 0 };
+
+    if (hasLaunchStatusValue) {
+      await db.query(
+        `UPDATE smartphones
+         SET launch_status_override = $1
+         WHERE product_id = ANY($2::int[])`,
+        [launchStatusOverride, productIds],
+      );
+    }
 
     scheduleSmartphoneCompetitorRefresh(
-      `smartphones_bulk_${isPublished ? "published" : "unpublished"}:${productIds.length}`,
+      `smartphones_bulk_${
+        hasLaunchStatusValue
+          ? launchStatusOverride
+          : isPublished
+            ? "published"
+            : "unpublished"
+      }:${productIds.length}`,
     );
 
     const compareSyncResults = [];
@@ -19004,8 +18955,10 @@ app.patch("/api/admin/smartphones/bulk", authenticate, async (req, res) => {
 
     return res.json({
       ok: true,
-      message: `Smartphones ${isPublished ? "published" : "unpublished"} successfully`,
-      updated_count: Number(result.rowCount) || 0,
+      message: hasLaunchStatusValue
+        ? `Smartphones marked ${launchStatusOverride} successfully`
+        : `Smartphones ${isPublished ? "published" : "unpublished"} successfully`,
+      updated_count: productIds.length,
       updated_ids: productIds,
       data: result.rows || [],
       compare_sync: isPublished ? compareSyncResults : null,
@@ -21046,6 +20999,7 @@ const handleTrendingSmartphones = async (req, res) => {
         MAX(to_jsonb(b)->>'website') AS brand_website,
         s.model,
         s.launch_date,
+        s.launch_status_mode,
         s.launch_status_override,
         s.display,
         s.performance,
@@ -21152,6 +21106,7 @@ const handleTrendingSmartphones = async (req, res) => {
         b.logo,
         s.model,
         s.launch_date,
+        s.launch_status_mode,
         s.launch_status_override,
         s.display,
         s.performance,
@@ -21341,6 +21296,7 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
         (to_jsonb(b)->>'website') AS brand_website,
         s.model AS model,
         s.launch_date,
+        s.launch_status_mode,
         s.launch_status_override,
         s.display,
         s.performance,
@@ -21367,7 +21323,7 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
       INNER JOIN product_publish pub ON pub.product_id = p.id AND pub.is_published = true
       WHERE p.product_type = 'smartphone'
       ORDER BY COALESCE(s.launch_date, p.created_at) DESC, p.id DESC
-      LIMIT 120;
+      ;
     `);
 
     const items = applySpecScoreToRows(
@@ -22274,6 +22230,7 @@ app.get("/api/public/new/smartphones", async (req, res) => {
         (to_jsonb(b)->>'website') AS brand_website,
         s.model AS model,
         s.launch_date,
+        s.launch_status_mode,
         s.launch_status_override,
         s.display,
         s.performance,
@@ -22703,12 +22660,59 @@ app.get("/api/public/compare/resolve", async (req, res) => {
 
     const result = await db.query(
       `
-      SELECT q.product_id, q.product_name, q.product_type, q.slug
+      SELECT
+        q.product_id,
+        q.product_name,
+        q.product_type,
+        q.slug,
+        q.launch_date,
+        q.launch_status_mode,
+        q.launch_status_override,
+        q.sale_start_date,
+        q.variants
       FROM (
         SELECT
           p.id AS product_id,
           p.name AS product_name,
           p.product_type,
+          s.launch_date,
+          s.launch_status_mode,
+          s.launch_status_override,
+          (
+            SELECT MIN(vsp.sale_start_date)
+            FROM product_variants pv
+            INNER JOIN variant_store_prices vsp
+              ON vsp.variant_id = pv.id
+            WHERE pv.product_id = p.id
+          ) AS sale_start_date,
+          COALESCE(
+            (
+              SELECT json_agg(
+                jsonb_build_object(
+                  'variant_id', pv.id,
+                  'base_price', pv.base_price,
+                  'store_prices', (
+                    SELECT COALESCE(
+                      json_agg(
+                        jsonb_build_object(
+                          'store_name', vsp.store_name,
+                          'price', vsp.price,
+                          'url', vsp.url,
+                          'sale_start_date', vsp.sale_start_date
+                        )
+                      ),
+                      '[]'::json
+                    )
+                    FROM variant_store_prices vsp
+                    WHERE vsp.variant_id = pv.id
+                  )
+                )
+              )
+              FROM product_variants pv
+              WHERE pv.product_id = p.id
+            ),
+            '[]'::json
+          ) AS variants,
           regexp_replace(
             regexp_replace(lower(coalesce(p.name, '')), '[^a-z0-9]+', '-', 'g'),
             '(^-|-$)',
@@ -22719,6 +22723,8 @@ app.get("/api/public/compare/resolve", async (req, res) => {
         INNER JOIN product_publish pub
           ON pub.product_id = p.id
          AND pub.is_published = true
+        LEFT JOIN smartphones s
+          ON s.product_id = p.id
         WHERE p.product_type IN ('smartphone', 'laptop', 'tv', 'networking')
           ${typeWhere}
       ) q
@@ -22744,10 +22750,21 @@ app.get("/api/public/compare/resolve", async (req, res) => {
       String(left.product_type || "") === String(right.product_type || ""),
     );
 
+    const enrichCompareProduct = (row) => {
+      if (String(row?.product_type || "").toLowerCase() !== "smartphone") {
+        return row;
+      }
+
+      return {
+        ...row,
+        lifecycle: createCanonicalSmartphoneResponse(row, getIndiaDateOnly()),
+      };
+    };
+
     return res.json({
       matched,
-      left,
-      right,
+      left: enrichCompareProduct(left),
+      right: enrichCompareProduct(right),
       compare_path: matched ? `/compare/${left.slug}-vs-${right.slug}` : null,
     });
   } catch (err) {
@@ -22808,6 +22825,8 @@ app.post("/api/public/compare/scores", async (req, res) => {
         b.name AS brand,
 
         s.launch_date,
+        s.launch_status_mode,
+        s.launch_status_override,
         s.build_design,
         s.connectivity,
         s.network,
@@ -22955,6 +22974,20 @@ app.post("/api/public/compare/scores", async (req, res) => {
       ranking,
     });
 
+    const comparisonDevices = (decision.devices || []).map((device) => {
+      const productId = Number(device?.product_id ?? device?.id);
+      const source = orderedRows.find(
+        (row) => Number(row?.product_id) === productId,
+      );
+      if (String(source?.product_type || "").toLowerCase() !== "smartphone") {
+        return device;
+      }
+      return {
+        ...device,
+        lifecycle: createCanonicalSmartphoneResponse(source),
+      };
+    });
+
     const compatibleCategoryWinners = {
       ...decision.categoryWinners,
       ...(decision.categoryWinners?.value
@@ -22973,7 +23006,7 @@ app.post("/api/public/compare/scores", async (req, res) => {
       generated_at: decision.generatedAt,
       product_type: decision.productType,
       scores: decision.scores,
-      devices: decision.devices,
+      devices: comparisonDevices,
       overall_winner: decision.overallWinner,
       overall_verdict: decision.overallVerdict,
       category_winners: compatibleCategoryWinners,
@@ -28680,10 +28713,11 @@ async function runGlobalSearch(queryText, { publishedOnly = true } = {}) {
     let minPrice = null;
     let variantTypes = [];
     let keyFeatures = [];
+    let smartphoneLifecycle = null;
 
     try {
       const variantsRes = await db.query(
-        `SELECT variant_key, attributes, base_price
+        `SELECT id, variant_key, attributes, base_price
          FROM product_variants
          WHERE product_id = $1
          ORDER BY id ASC`,
@@ -28737,19 +28771,47 @@ async function runGlobalSearch(queryText, { publishedOnly = true } = {}) {
     if (String(r.product_type).toLowerCase() === "smartphone") {
       try {
         const smRes = await db.query(
-          `SELECT display, battery, camera, performance
+          `SELECT display, battery, camera, performance,
+                  launch_date, launch_status_mode, launch_status_override
            FROM smartphones
            WHERE product_id = $1
            LIMIT 1`,
           [r.id],
         );
-        keyFeatures = extractSmartphoneHighlights(smRes.rows?.[0]);
+        const smartphone = smRes.rows?.[0] || null;
+        keyFeatures = extractSmartphoneHighlights(smartphone);
+        if (smartphone) {
+          const storeRes = await db.query(
+            `SELECT vsp.*
+             FROM variant_store_prices vsp
+             INNER JOIN product_variants pv ON pv.id = vsp.variant_id
+             WHERE pv.product_id = $1`,
+            [r.id],
+          );
+          const storesByVariantId = new Map();
+          for (const store of storeRes.rows || []) {
+            const stores =
+              storesByVariantId.get(Number(store.variant_id)) || [];
+            stores.push(store);
+            storesByVariantId.set(Number(store.variant_id), stores);
+          }
+          smartphoneLifecycle = createCanonicalSmartphoneResponse(
+            {
+              ...smartphone,
+              variants: variantsRes.rows.map((variant) => ({
+                ...variant,
+                store_prices: storesByVariantId.get(Number(variant.id)) || [],
+              })),
+            },
+            getIndiaDateOnly(),
+          );
+        }
       } catch (e) {
         // ignore highlight extraction errors
       }
     }
 
-    results.push({
+    const searchResult = {
       type: "product",
       id: r.id,
       name: r.name,
@@ -28759,7 +28821,14 @@ async function runGlobalSearch(queryText, { publishedOnly = true } = {}) {
       min_price: minPrice,
       variant_types: variantTypes,
       key_features: keyFeatures,
-    });
+    };
+    if (smartphoneLifecycle) {
+      searchResult.lifecycle = smartphoneLifecycle;
+      searchResult.launch_status = smartphoneLifecycle.launch.stage;
+      searchResult.sale_status = smartphoneLifecycle.sale.stage;
+      searchResult.store_stage = smartphoneLifecycle.store.stage;
+    }
+    results.push(searchResult);
   }
 
   // Add brands to results (avoid duplicates)
@@ -29053,6 +29122,8 @@ async function start() {
   });
 }
 
-start();
+if (require.main === module) {
+  start();
+}
 
 module.exports = app;
