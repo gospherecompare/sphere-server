@@ -57,6 +57,9 @@ const {
 } = require("./utils/competitorAnalysis");
 const { normalizeSmartphonePayload } = require("./schemas/smartphonePayload");
 const {
+  recordSmartphoneLifecycleEvents,
+} = require("./services/notifications/notificationEngine");
+const {
   ROLE_PRESETS: RBAC_ROLE_PRESETS,
   expandPermissionSet: expandRbacPermissionSet,
   getDefaultPermissionsForRole,
@@ -5588,6 +5591,86 @@ async function runMigrations() {
       published_by INT REFERENCES "user"(id),
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS product_follows (
+        id SERIAL PRIMARY KEY,
+        user_id INT NOT NULL REFERENCES Customers(id) ON DELETE CASCADE,
+        product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        follow_type TEXT NOT NULL DEFAULT 'smartphone',
+        is_active BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (user_id, product_id, follow_type)
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS notification_preferences (
+        id SERIAL PRIMARY KEY,
+        user_id INT NOT NULL UNIQUE REFERENCES Customers(id) ON DELETE CASCADE,
+        launch_alerts BOOLEAN NOT NULL DEFAULT true,
+        sale_alerts BOOLEAN NOT NULL DEFAULT true,
+        price_drop_alerts BOOLEAN NOT NULL DEFAULT true,
+        deal_alerts BOOLEAN NOT NULL DEFAULT false,
+        important_news_alerts BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id SERIAL PRIMARY KEY,
+        user_id INT NOT NULL REFERENCES Customers(id) ON DELETE CASCADE,
+        endpoint TEXT NOT NULL,
+        p256dh TEXT,
+        auth TEXT,
+        platform TEXT DEFAULT 'browser',
+        is_active BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (user_id, endpoint)
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS notification_events (
+        id SERIAL PRIMARY KEY,
+        product_id INT REFERENCES products(id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL,
+        occurrence_key TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        event_date DATE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS notification_deliveries (
+        id SERIAL PRIMARY KEY,
+        event_id INT NOT NULL REFERENCES notification_events(id) ON DELETE CASCADE,
+        user_id INT NOT NULL REFERENCES Customers(id) ON DELETE CASCADE,
+        channel TEXT NOT NULL DEFAULT 'push',
+        status TEXT NOT NULL DEFAULT 'queued',
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        sent_at TIMESTAMPTZ,
+        error_message TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (event_id, user_id, channel)
+      );
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_notification_events_product_id
+      ON notification_events (product_id, created_at DESC);
+    `);
+
+    await safeQuery(`
+      CREATE INDEX IF NOT EXISTS idx_notification_deliveries_user_status
+      ON notification_deliveries (user_id, status, created_at DESC);
     `);
 
     await safeQuery(`
@@ -14245,6 +14328,18 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
       }
     }
 
+    await recordSmartphoneLifecycleEvents({
+      db: client,
+      product: {
+        id: productId,
+        name: product.name,
+        launch_date: smartphone.launch_date || null,
+        sale_start_date: smartphone.sale_start_date || null,
+        current_price: null,
+      },
+      today: getIndiaDateOnly(),
+    });
+
     await client.query("COMMIT");
     scheduleSmartphoneCompetitorRefresh(`smartphone_created:${productId}`);
     if (createAiSummary !== false) {
@@ -17245,6 +17340,21 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       );
     }
 
+    await recordSmartphoneLifecycleEvents({
+      db: client,
+      product: {
+        id: productId,
+        name: name,
+        launch_date: req.body.launch_date || null,
+        sale_start_date: req.body.sale_start_date || req.body.saleStartDate || null,
+        current_price:
+          Number.isFinite(Number(req.body?.current_price))
+            ? Number(req.body.current_price)
+            : null,
+      },
+      today: getIndiaDateOnly(),
+    });
+
     await client.query("COMMIT");
     scheduleSmartphoneCompetitorRefresh(`smartphone_updated:${productId}`);
     if (req.body.create_ai_summary !== false) {
@@ -17498,6 +17608,19 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
         console.error("Failed to update publish status:", pubErr);
       }
     }
+
+    await recordSmartphoneLifecycleEvents({
+      db: client,
+      product: {
+        id: productId,
+        name: product_name || b.name || null,
+        launch_date: launch_date || null,
+        sale_start_date: b.sale_start_date || b.saleStartDate || null,
+        current_price:
+          Number.isFinite(Number(b.current_price)) ? Number(b.current_price) : null,
+      },
+      today: getIndiaDateOnly(),
+    });
 
     await client.query("COMMIT");
     scheduleSmartphoneCompetitorRefresh(`smartphone_updated:${productId}`);
