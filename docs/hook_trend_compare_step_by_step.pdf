@@ -1,0 +1,497 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R 10 0 R 12 0 R] /Count 5 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 2120 >>
+stream
+BT
+/F1 10 Tf
+48 800 Td
+14 TL
+(Step-by-Step Mathematical Calculation: Hook Score, Trending Score, Compare Score) Tj
+T*
+(Generated: 2026-02-24 10:24) Tj
+T*
+() Tj
+T*
+(A\) HOOK SCORE - FULL CALCULATION) Tj
+T*
+(Formula blocks from server/utils/hookScore.js) Tj
+T*
+() Tj
+T*
+(Given \(example product\):) Tj
+T*
+(views_recent=1200, views_previous=800, compares_recent=240, compares_previous=160, wishlist_recent=300,) Tj
+T*
+(age_days=90) Tj
+T*
+(smoothing s=5, freshness constant tau=365) Tj
+T*
+(cohort maxima: max_views_recent=1500, max_compares_recent=300, max_wishlist_recent=500,) Tj
+T*
+(max_views_velocity_raw=1.2, max_compares_velocity_raw=1.0) Tj
+T*
+() Tj
+T*
+(Step A1: velocity raw values) Tj
+T*
+(views_velocity_raw = max\(0, \(\(views_recent + s\)/\(views_previous + s\)\) - 1\)) Tj
+T*
+(= max\(0, \(\(1200+5\)/\(800+5\)\) - 1\)) Tj
+T*
+(= max\(0, \(1205/805\) - 1\)) Tj
+T*
+(= max\(0, 1.496894410 - 1\)) Tj
+T*
+(= 0.496894410) Tj
+T*
+() Tj
+T*
+(compares_velocity_raw = max\(0, \(\(compares_recent + s\)/\(compares_previous + s\)\) - 1\)) Tj
+T*
+(= max\(0, \(\(240+5\)/\(160+5\)\) - 1\)) Tj
+T*
+(= max\(0, 1.484848485 - 1\)) Tj
+T*
+(= 0.484848485) Tj
+T*
+() Tj
+T*
+(Step A2: normalize to 0..100) Tj
+T*
+(norm_views = 100*1200/1500 = 80.000000) Tj
+T*
+(norm_compares = 100*240/300 = 80.000000) Tj
+T*
+(norm_wishlist = 100*300/500 = 60.000000) Tj
+T*
+(norm_views_velocity = 100*0.496894410/1.2 = 41.407867) Tj
+T*
+(norm_compares_velocity = 100*0.484848485/1.0 = 48.484848) Tj
+T*
+() Tj
+T*
+(Step A3: buyer intent) Tj
+T*
+(buyer_intent = clamp\(0.55*norm_views + 0.30*norm_compares + 0.15*norm_wishlist, 0, 100\)) Tj
+T*
+(= clamp\(0.55*80.000000 + 0.30*80.000000 + 0.15*60.000000, 0, 100\)) Tj
+T*
+(= clamp\(44.000000 + 24.000000 + 9.000000, 0, 100\)) Tj
+T*
+(= 77.000000) Tj
+T*
+() Tj
+T*
+(Step A4: trend velocity) Tj
+T*
+(trend_velocity = clamp\(0.70*norm_views_velocity + 0.30*norm_compares_velocity, 0, 100\)) Tj
+T*
+(= clamp\(0.70*41.407867 + 0.30*48.484848, 0, 100\)) Tj
+T*
+(= clamp\(28.985507 + 14.545455, 0, 100\)) Tj
+T*
+(= 43.530962) Tj
+T*
+() Tj
+T*
+(Step A5: freshness) Tj
+T*
+(freshness = clamp\(100 * exp\(-age_days/tau\), 0, 100\)) Tj
+T*
+ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 2142 >>
+stream
+BT
+/F1 10 Tf
+48 800 Td
+14 TL
+(= clamp\(100 * exp\(-90/365\), 0, 100\)) Tj
+T*
+(= clamp\(100 * exp\(-0.246575\), 0, 100\)) Tj
+T*
+(= 78.147248) Tj
+T*
+() Tj
+T*
+(Step A6: final hook score) Tj
+T*
+(hook_score = clamp\(0.50*buyer_intent + 0.30*trend_velocity + 0.20*freshness, 0, 100\)) Tj
+T*
+(= clamp\(0.50*77.000000 + 0.30*43.530962 + 0.20*78.147248, 0, 100\)) Tj
+T*
+(= clamp\(38.500000 + 13.059289 + 15.629450, 0, 100\)) Tj
+T*
+(= 67.188738) Tj
+T*
+() Tj
+T*
+(B\) TRENDING SCORE - FULL CALCULATION) Tj
+T*
+(Formula blocks from server/utils/trendingScore.js) Tj
+T*
+() Tj
+T*
+(Given for same product \(7d windows\):) Tj
+T*
+(views_7d=1200, views_prev_7d=800, compares_7d=240, smoothing s=5) Tj
+T*
+(product_type partition maxima: max_views_7d=2000, max_compares_7d=400, max_velocity_raw=1.0) Tj
+T*
+() Tj
+T*
+(Step B1: velocity_raw) Tj
+T*
+(velocity_raw = max\(0, \(\(views_7d + s\)/\(views_prev_7d + s\)\) - 1\)) Tj
+T*
+(= max\(0, \(\(1200+5\)/\(800+5\)\) - 1\)) Tj
+T*
+(= 0.496894410) Tj
+T*
+() Tj
+T*
+(Step B2: normalize) Tj
+T*
+(norm_views = 100*1200/2000 = 60.000000) Tj
+T*
+(norm_compares = 100*240/400 = 60.000000) Tj
+T*
+(norm_velocity = 100*0.496894410/1.0 = 49.689441) Tj
+T*
+() Tj
+T*
+(Step B3: final trending score) Tj
+T*
+(trending_score = 0.40*norm_views + 0.40*norm_compares + 0.20*norm_velocity) Tj
+T*
+(= 0.40*60.000000 + 0.40*60.000000 + 0.20*49.689441) Tj
+T*
+(= 24.000000 + 24.000000 + 9.937888) Tj
+T*
+(= 57.937888) Tj
+T*
+() Tj
+T*
+(C\) COMPARE SCORE - FULL CALCULATION \(USING YOUR SMARTPHONES\)) Tj
+T*
+(Formula blocks from server/utils/compareScoring.js) Tj
+T*
+(Default final weights: perf=0.36, display=0.20, camera=0.20, battery=0.14, priceValue=0.10) Tj
+T*
+() Tj
+T*
+(Device: realme P4 5G) Tj
+T*
+(Given: perf=62.0, refresh=144Hz, panel=AMOLED, main_mp=50, sensors=2, battery=7000mAh, price=19999) Tj
+T*
+(Step C1: display) Tj
+T*
+(refresh_score = round\(20 + \(\(clamp\(refresh,60,165\)-60\)/\(165-60\)\)*40\)) Tj
+T*
+(= round\(20 + \(\(144-60\)/105\)*40\) = 52) Tj
+T*
+(panel_score\(AMOLED\) = 34) Tj
+T*
+(display_score = clamp\(52 + 34, 0, 100\) = 86.000000) Tj
+T*
+(Step C2: camera) Tj
+T*
+(megapixel_score = clamp\(\(main_mp/108\)*65,18,65\)) Tj
+T*
+ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 9 0 R >>
+endobj
+9 0 obj
+<< /Length 2221 >>
+stream
+BT
+/F1 10 Tf
+48 800 Td
+14 TL
+(= clamp\(\(50/108\)*65,18,65\) = 30.092593) Tj
+T*
+(sensor_score = clamp\(sensor_count*8.75,10,35\)) Tj
+T*
+(= clamp\(2*8.75,10,35\) = 17.500000) Tj
+T*
+(camera_score = clamp\(30.092593 + 17.500000,0,100\) = 47.592593) Tj
+T*
+(Step C3: battery) Tj
+T*
+(battery_score\(7000\) = 100) Tj
+T*
+(Step C4: base_spec) Tj
+T*
+(base_spec = 0.40*perf + 0.20*display + 0.25*camera + 0.15*battery) Tj
+T*
+(= 0.40*62.000000 + 0.20*86.000000 + 0.25*47.592593 + 0.15*100.000000) Tj
+T*
+(= 24.800000 + 17.200000 + 11.898148 + 15.000000) Tj
+T*
+(= 68.898148) Tj
+T*
+(Step C5: value_raw) Tj
+T*
+(value_raw = base_spec / price) Tj
+T*
+(= 68.898148/19999 = 0.003445079661) Tj
+T*
+() Tj
+T*
+(Device: moto g57 Power 5G) Tj
+T*
+(Given: perf=62.0, refresh=120Hz, panel=LCD, main_mp=50, sensors=3, battery=7000mAh, price=14999) Tj
+T*
+(Step C1: display) Tj
+T*
+(refresh_score = round\(20 + \(\(clamp\(refresh,60,165\)-60\)/\(165-60\)\)*40\)) Tj
+T*
+(= round\(20 + \(\(120-60\)/105\)*40\) = 43) Tj
+T*
+(panel_score\(LCD\) = 24) Tj
+T*
+(display_score = clamp\(43 + 24, 0, 100\) = 67.000000) Tj
+T*
+(Step C2: camera) Tj
+T*
+(megapixel_score = clamp\(\(main_mp/108\)*65,18,65\)) Tj
+T*
+(= clamp\(\(50/108\)*65,18,65\) = 30.092593) Tj
+T*
+(sensor_score = clamp\(sensor_count*8.75,10,35\)) Tj
+T*
+(= clamp\(3*8.75,10,35\) = 26.250000) Tj
+T*
+(camera_score = clamp\(30.092593 + 26.250000,0,100\) = 56.342593) Tj
+T*
+(Step C3: battery) Tj
+T*
+(battery_score\(7000\) = 100) Tj
+T*
+(Step C4: base_spec) Tj
+T*
+(base_spec = 0.40*perf + 0.20*display + 0.25*camera + 0.15*battery) Tj
+T*
+(= 0.40*62.000000 + 0.20*67.000000 + 0.25*56.342593 + 0.15*100.000000) Tj
+T*
+(= 24.800000 + 13.400000 + 14.085648 + 15.000000) Tj
+T*
+(= 67.285648) Tj
+T*
+(Step C5: value_raw) Tj
+T*
+(value_raw = base_spec / price) Tj
+T*
+(= 67.285648/14999 = 0.004486008944) Tj
+T*
+() Tj
+T*
+(Device: Redmi 15 5G) Tj
+T*
+(Given: perf=62.0, refresh=144Hz, panel=DotDisplay, main_mp=50, sensors=2, battery=7000mAh, price=15999) Tj
+T*
+(Step C1: display) Tj
+T*
+(refresh_score = round\(20 + \(\(clamp\(refresh,60,165\)-60\)/\(165-60\)\)*40\)) Tj
+T*
+(= round\(20 + \(\(144-60\)/105\)*40\) = 52) Tj
+T*
+(panel_score\(DotDisplay\) = 22) Tj
+T*
+(display_score = clamp\(52 + 22, 0, 100\) = 74.000000) Tj
+T*
+ET
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 11 0 R >>
+endobj
+11 0 obj
+<< /Length 2309 >>
+stream
+BT
+/F1 10 Tf
+48 800 Td
+14 TL
+(Step C2: camera) Tj
+T*
+(megapixel_score = clamp\(\(main_mp/108\)*65,18,65\)) Tj
+T*
+(= clamp\(\(50/108\)*65,18,65\) = 30.092593) Tj
+T*
+(sensor_score = clamp\(sensor_count*8.75,10,35\)) Tj
+T*
+(= clamp\(2*8.75,10,35\) = 17.500000) Tj
+T*
+(camera_score = clamp\(30.092593 + 17.500000,0,100\) = 47.592593) Tj
+T*
+(Step C3: battery) Tj
+T*
+(battery_score\(7000\) = 100) Tj
+T*
+(Step C4: base_spec) Tj
+T*
+(base_spec = 0.40*perf + 0.20*display + 0.25*camera + 0.15*battery) Tj
+T*
+(= 0.40*62.000000 + 0.20*74.000000 + 0.25*47.592593 + 0.15*100.000000) Tj
+T*
+(= 24.800000 + 14.800000 + 11.898148 + 15.000000) Tj
+T*
+(= 66.498148) Tj
+T*
+(Step C5: value_raw) Tj
+T*
+(value_raw = base_spec / price) Tj
+T*
+(= 66.498148/15999 = 0.004156394034) Tj
+T*
+() Tj
+T*
+(Step C6: normalize value to value_score) Tj
+T*
+(min_value_raw = 0.003445079661) Tj
+T*
+(max_value_raw = 0.004486008944) Tj
+T*
+(value_score = 35 + \(\(value_raw - min\)/\(max-min\)\)*65) Tj
+T*
+() Tj
+T*
+(realme P4 5G: value_score = 35 + \(\(0.003445079661 - 0.003445079661\)/\(0.004486008944 -) Tj
+T*
+(0.003445079661\)\)*65 = 35.000000) Tj
+T*
+(moto g57 Power 5G: value_score = 35 + \(\(0.004486008944 - 0.003445079661\)/\(0.004486008944 -) Tj
+T*
+(0.003445079661\)\)*65 = 100.000000) Tj
+T*
+(Redmi 15 5G: value_score = 35 + \(\(0.004156394034 - 0.003445079661\)/\(0.004486008944 -) Tj
+T*
+(0.003445079661\)\)*65 = 79.417459) Tj
+T*
+() Tj
+T*
+(Step C7: final overall score) Tj
+T*
+(overall = 0.36*perf + 0.20*display + 0.20*camera + 0.14*battery + 0.10*value_score) Tj
+T*
+() Tj
+T*
+(realme P4 5G: overall = 0.36*62.000000 + 0.20*86.000000 + 0.20*47.592593 + 0.14*100.000000 +) Tj
+T*
+(0.10*35.000000 = 66.538519) Tj
+T*
+(moto g57 Power 5G: overall = 0.36*62.000000 + 0.20*67.000000 + 0.20*56.342593 + 0.14*100.000000 +) Tj
+T*
+(0.10*100.000000 = 70.988519) Tj
+T*
+(Redmi 15 5G: overall = 0.36*62.000000 + 0.20*74.000000 + 0.20*47.592593 + 0.14*100.000000 +) Tj
+T*
+(0.10*79.417459 = 68.580264) Tj
+T*
+() Tj
+T*
+(Step C8: ranking rule) Tj
+T*
+(Sort by overall DESC. Tie-breaker 1: lower price first. Tie-breaker 2: alphabetical name.) Tj
+T*
+(Ranking result:) Tj
+T*
+(1. moto g57 Power 5G  \(overall=70.988519, price=14999\)) Tj
+T*
+(2. Redmi 15 5G  \(overall=68.580264, price=15999\)) Tj
+T*
+(3. realme P4 5G  \(overall=66.538519, price=19999\)) Tj
+T*
+() Tj
+T*
+ET
+endstream
+endobj
+12 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 13 0 R >>
+endobj
+13 0 obj
+<< /Length 1129 >>
+stream
+BT
+/F1 10 Tf
+48 800 Td
+14 TL
+(D\) CONNECTION BETWEEN THE 3 ALGORITHMS) Tj
+T*
+(1\) Hook and Trending are connected: both are behavior/engagement based and share views + comparisons +) Tj
+T*
+(velocity logic.) Tj
+T*
+(2\) Compare is different: it is spec+price based and computed on selected products only.) Tj
+T*
+(3\) In product pages, they can coexist: Hook/Trending for discovery rank, Compare for decision rank.) Tj
+T*
+() Tj
+T*
+(E\) API JSON BODIES \(EXACT SHAPES\)) Tj
+T*
+(POST /api/admin/hook-score/recompute  body: {}) Tj
+T*
+(POST /api/admin/trending/recompute   body: {}) Tj
+T*
+(POST /api/admin/trending/boost       body:) Tj
+T*
+({"product_id":124,"manual_boost":true,"manual_priority":5,"manual_badge":"editor_pick"}) Tj
+T*
+(PUT /api/admin/compare-scoring       body:) Tj
+T*
+({"weights":{"performance":36,"display":20,"camera":20,"battery":14,"priceValue":10},"chipset_rules":[{"keyword":"snapdragon) Tj
+T*
+(8 gen 3","score":95}]}) Tj
+T*
+(POST /api/public/compare/scores      body:) Tj
+T*
+({"devices":[{"product_id":166,"variant_id":1613},{"product_id":165,"variant_id":1605},{"product_id":159,"variant_id":1610}]}) Tj
+T*
+ET
+endstream
+endobj
+xref
+0 14
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000147 00000 n 
+0000000217 00000 n 
+0000000343 00000 n 
+0000002515 00000 n 
+0000002641 00000 n 
+0000004835 00000 n 
+0000004961 00000 n 
+0000007234 00000 n 
+0000007362 00000 n 
+0000009724 00000 n 
+0000009852 00000 n 
+trailer
+<< /Size 14 /Root 1 0 R >>
+startxref
+11034
+%%EOF

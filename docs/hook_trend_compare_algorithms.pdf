@@ -1,0 +1,412 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R 10 0 R] /Count 4 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 2555 >>
+stream
+BT
+/F1 10 Tf
+50 800 Td
+14 TL
+(Hook, Trending, and Compare Score Algorithms - Mathematical Explainer) Tj
+T*
+(Generated: 2026-02-24 10:11) Tj
+T*
+() Tj
+T*
+(1\) Purpose and Output) Tj
+T*
+(- Hook Score: long-horizon discovery ranking score in product_dynamic_score \(0 to 100\).) Tj
+T*
+(- Trending Score: short-horizon momentum score in product_trending_score \(0 to 100\).) Tj
+T*
+(- Compare Score: session-time ranking among selected devices \(2 to 4 devices\), returned by compare API.) Tj
+T*
+() Tj
+T*
+(2\) Data Signals Used) Tj
+T*
+(Hook Score uses: unique product views, comparisons, wishlist adds, launch age \(freshness decay\).) Tj
+T*
+(Trending Score uses: unique product views, comparisons, view velocity over two windows.) Tj
+T*
+(Compare Score uses: device specs + selected variant/base price, plus admin config weights and chipset) Tj
+T*
+(rules.) Tj
+T*
+() Tj
+T*
+(3\) Hook Score \(server/utils/hookScore.js\)) Tj
+T*
+(Window setup:) Tj
+T*
+(- days = 7 \(default\), lookbackDays = 14) Tj
+T*
+(- smoothing s = 5) Tj
+T*
+(- freshness parameter tau = 365 days \(variable name says half-life, but mathematically this is a decay) Tj
+T*
+(constant\)) Tj
+T*
+() Tj
+T*
+(Raw components per product:) Tj
+T*
+(views_velocity_raw = max\(0, \(\(views_recent + s\)/\(views_previous + s\)\) - 1\)) Tj
+T*
+(compares_velocity_raw = max\(0, \(\(compares_recent + s\)/\(compares_previous + s\)\) - 1\)) Tj
+T*
+() Tj
+T*
+(Normalization to 0..100 inside the evaluated product cohort:) Tj
+T*
+(norm_x = 100 * x / max\(x\)) Tj
+T*
+(Applied to views_recent, compares_recent, wishlist_recent, views_velocity_raw, compares_velocity_raw.) Tj
+T*
+() Tj
+T*
+(Freshness:) Tj
+T*
+(freshness = clamp\(100 * exp\(-age_days / tau\), 0, 100\)) Tj
+T*
+() Tj
+T*
+(Subscores \(default weights\):) Tj
+T*
+(buyer_intent = clamp\(\(0.55*norm_views + 0.30*norm_compares + 0.15*norm_wishlist\)/1.0, 0, 100\)) Tj
+T*
+(trend_velocity = clamp\(\(0.70*norm_views_velocity + 0.30*norm_compares_velocity\)/1.0, 0, 100\)) Tj
+T*
+() Tj
+T*
+(Final Hook score:) Tj
+T*
+(hook_score = clamp\(\(0.50*buyer_intent + 0.30*trend_velocity + 0.20*freshness\)/1.0, 0, 100\)) Tj
+T*
+() Tj
+T*
+(Worked example \(Phone A\):) Tj
+T*
+(- views_recent=1200, views_previous=800, compares_recent=240, compares_previous=160,) Tj
+T*
+(wishlist_recent=300, age_days=90) Tj
+T*
+(- views_velocity_raw=0.496894, compares_velocity_raw=0.484848) Tj
+T*
+(- norm_views=100.00, norm_compares=80.00, norm_wishlist=100.00) Tj
+T*
+(- norm_views_velocity=62.11, norm_compares_velocity=80.81) Tj
+T*
+(- buyer_intent=94.00, trend_velocity=67.72, freshness=78.15) Tj
+T*
+ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 2094 >>
+stream
+BT
+/F1 10 Tf
+50 800 Td
+14 TL
+(- hook_score=82.95) Tj
+T*
+() Tj
+T*
+(4\) Trending Score \(server/utils/trendingScore.js\)) Tj
+T*
+(Window setup:) Tj
+T*
+(- days = 7 \(default\), previous window = previous 7 days) Tj
+T*
+(- smoothing s = 5) Tj
+T*
+() Tj
+T*
+(Velocity term:) Tj
+T*
+(velocity_raw = max\(0, \(\(views_7d + s\)/\(views_prev_7d + s\)\) - 1\)) Tj
+T*
+() Tj
+T*
+(Normalization:) Tj
+T*
+(- norm_views, norm_compares, norm_velocity are scaled 0..100 using partition max values by product_type.) Tj
+T*
+() Tj
+T*
+(Final Trending score \(default weights\):) Tj
+T*
+(trending_score = \(0.40*norm_views + 0.40*norm_compares + 0.20*norm_velocity\)/1.0) Tj
+T*
+() Tj
+T*
+(Worked example \(Phone A values from above assumptions\):) Tj
+T*
+(- norm_views=100.00, norm_compares=80.00, norm_velocity=62.11) Tj
+T*
+(- trending_score=84.42) Tj
+T*
+() Tj
+T*
+(5\) Compare Score \(server/utils/compareScoring.js\)) Tj
+T*
+(This is computed only for the selected comparison set and selected variants/prices.) Tj
+T*
+() Tj
+T*
+(5.1 Performance score) Tj
+T*
+(- scoreChipset\(\) uses keyword rules first \(admin-managed\), then heuristic fallbacks for) Tj
+T*
+(Snapdragon/Dimensity/Apple/Tensor/Exynos.) Tj
+T*
+() Tj
+T*
+(5.2 Display score) Tj
+T*
+(refresh_rate_score = round\(20 + \(\(clamp\(refresh_rate,60,165\)-60\)/\(165-60\)\)*40\)) Tj
+T*
+(panel_score from panel text: LTPO=40, AMOLED=34, OLED=32, IPS/LCD=24, TFT=16, etc.) Tj
+T*
+(display_score = clamp\(refresh_rate_score + panel_score, 0, 100\)) Tj
+T*
+() Tj
+T*
+(5.3 Camera score) Tj
+T*
+(megapixel_score = clamp\(\(main_megapixel/108\)*65, 18, 65\)) Tj
+T*
+(sensor_score = clamp\(sensor_count*8.75, 10, 35\)) Tj
+T*
+(camera_score = clamp\(megapixel_score + sensor_score, 0, 100\)) Tj
+T*
+() Tj
+T*
+(5.4 Battery score) Tj
+T*
+(Piecewise map by capacity: <=3000:25, <=4000:45, <=4500:60, <=5000:75, <=5500:86, <=6000:94, >6000:100) Tj
+T*
+() Tj
+T*
+(5.5 Base spec score) Tj
+T*
+(base_spec_score = 0.40*performance + 0.20*display + 0.25*camera + 0.15*battery) Tj
+T*
+() Tj
+T*
+(5.6 Price value score) Tj
+T*
+(value_raw = base_spec_score / price) Tj
+T*
+(If no price: value_score=45) Tj
+T*
+ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 9 0 R >>
+endobj
+9 0 obj
+<< /Length 2172 >>
+stream
+BT
+/F1 10 Tf
+50 800 Td
+14 TL
+(If all compared devices have same value_raw: value_score=70) Tj
+T*
+(Else: value_score = 35 + \(\(value_raw - min_value\)/\(max_value - min_value\)\)*65) Tj
+T*
+() Tj
+T*
+(5.7 Final compare overall score) Tj
+T*
+(overall_score = w_perf*performance + w_disp*display + w_cam*camera + w_batt*battery +) Tj
+T*
+(w_price*value_score) Tj
+T*
+(Default weights: performance=0.36, display=0.20, camera=0.20, battery=0.14, priceValue=0.10) Tj
+T*
+(Then rank by overall_score DESC, tie-breaker: lower price first, then name.) Tj
+T*
+() Tj
+T*
+(Worked compare example \(3 phones\):) Tj
+T*
+(- Phone B: perf=75.00, display=77.00, camera=82.50, battery=86.00, value_score=100.00, overall=80.94,) Tj
+T*
+(price=30000) Tj
+T*
+(- Phone A: perf=95.00, display=77.00, camera=56.34, battery=75.00, value_score=66.17, overall=77.99,) Tj
+T*
+(price=39999) Tj
+T*
+(- Phone C: perf=100.00, display=92.00, camera=56.34, battery=60.00, value_score=35.00, overall=77.57,) Tj
+T*
+(price=60000) Tj
+T*
+(Ranking outcome for this example:) Tj
+T*
+(1. Phone B \(overall=80.94\)) Tj
+T*
+(2. Phone A \(overall=77.99\)) Tj
+T*
+(3. Phone C \(overall=77.57\)) Tj
+T*
+() Tj
+T*
+(6\) API JSON Bodies \(final look\)) Tj
+T*
+() Tj
+T*
+(6.1 Recompute Hook score \(admin\)) Tj
+T*
+(POST /api/admin/hook-score/recompute) Tj
+T*
+(Body: {}   \(no payload required\)) Tj
+T*
+() Tj
+T*
+(Sample response:) Tj
+T*
+({"ok":true,"updated":123,"results":{"smartphones":{"updated":80},"laptops":{"updated":30},"tvs":{"updated":13}}}) Tj
+T*
+() Tj
+T*
+(6.2 Recompute Trending score \(admin\)) Tj
+T*
+(POST /api/admin/trending/recompute) Tj
+T*
+(Body: {}   \(no payload required\)) Tj
+T*
+() Tj
+T*
+(Sample response:) Tj
+T*
+({"ok":true,"skipped":false,"updated":250,"days":7}) Tj
+T*
+() Tj
+T*
+(6.3 Manual Trending boost \(admin\)) Tj
+T*
+(POST /api/admin/trending/boost) Tj
+T*
+(Body:) Tj
+T*
+({"product_id":124,"manual_boost":true,"manual_priority":5,"manual_badge":"editor_pick"}) Tj
+T*
+() Tj
+T*
+(6.4 Update Compare scoring config \(admin\)) Tj
+T*
+(PUT /api/admin/compare-scoring) Tj
+T*
+(Body:) Tj
+T*
+({"weights":{"performance":36,"display":20,"camera":20,"battery":14,"priceValue":10},"chipset_rules":[{"keyword":"snapdragon) Tj
+T*
+ET
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 11 0 R >>
+endobj
+11 0 obj
+<< /Length 1779 >>
+stream
+BT
+/F1 10 Tf
+50 800 Td
+14 TL
+(8 gen 3","score":95},{"keyword":"tensor g5","score":90}]}) Tj
+T*
+() Tj
+T*
+(6.5 Get Compare scores for selected products \(public\)) Tj
+T*
+(POST /api/public/compare/scores) Tj
+T*
+(Body:) Tj
+T*
+({"devices":[{"product_id":124,"variant_id":1363},{"product_id":69,"variant_index":0},{"product_id":70}]}) Tj
+T*
+() Tj
+T*
+(Sample response:) Tj
+T*
+({"scores":[{"product_id":69,"overall_score":80.9},{"product_id":124,"overall_score":78.0},{"product_id":70,"overall_score":77.6}]}) Tj
+T*
+() Tj
+T*
+(7\) Is there a connection between the three algorithms?) Tj
+T*
+(Yes, but only partial:) Tj
+T*
+(- Hook Score and Trending Score are behavior-driven and share core engagement signals \(views +) Tj
+T*
+(compares\).) Tj
+T*
+(- Hook adds wishlist + freshness + a second-level weighted composition.) Tj
+T*
+(- Trending is short-horizon momentum and supports manual editorial boosts.) Tj
+T*
+(- Compare Score is different: it is spec + price driven for a selected comparison set, not a global) Tj
+T*
+(popularity rank.) Tj
+T*
+() Tj
+T*
+(Practical interpretation:) Tj
+T*
+(- Hook answers: What should rank well overall in discovery feeds?) Tj
+T*
+(- Trending answers: What is hot right now?) Tj
+T*
+(- Compare answers: Among selected devices, which is technically and value-wise better?) Tj
+T*
+() Tj
+T*
+(8\) One unified output example \(for understanding only\)) Tj
+T*
+({"product_id":124,"name":"Phone) Tj
+T*
+(A","hook_dynamic_score":{"buyer_intent":94.00,"trend_velocity":67.72,"freshness":78.15,"hook_score":82.95},"trending":{"views_7d":1200,"views_prev_7d":800,"compares_7d":240,"velocity":0.4969,"trending_score":84.42},"compare_session":{"overall_score":77.99,"rank":2,"breakdown":{"performance":95.0,"display":77.0,"camera":56.34,"battery":75.0,"value":66.17}}}) Tj
+T*
+ET
+endstream
+endobj
+xref
+0 12
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000140 00000 n 
+0000000210 00000 n 
+0000000336 00000 n 
+0000002943 00000 n 
+0000003069 00000 n 
+0000005215 00000 n 
+0000005341 00000 n 
+0000007565 00000 n 
+0000007693 00000 n 
+trailer
+<< /Size 12 /Root 1 0 R >>
+startxref
+9525
+%%EOF
