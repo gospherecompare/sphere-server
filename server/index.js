@@ -12641,16 +12641,18 @@ app.get("/api/public/blogs", async (req, res) => {
     )
       .trim()
       .toLowerCase();
-    const category = String(req.query.category || "")
-      .trim()
-      .toLowerCase();
+    const categories = String(req.query.category || "")
+      .split(",")
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean);
+    const category = categories.join(",");
     const whereClauses = ["bl.is_published = true"];
     const queryParams = [];
 
-    if (category) {
-      queryParams.push(category);
+    if (categories.length) {
+      queryParams.push(categories);
       const index = queryParams.length;
-      whereClauses.push(`LOWER(BTRIM(bl.category)) = $${index}`);
+      whereClauses.push(`LOWER(BTRIM(bl.category)) = ANY($${index}::text[])`);
     }
 
     if (hasProductFilter) {
