@@ -146,46 +146,54 @@ const hasStoreEntry = (storeEntry) => {
   return Boolean(storeName || logo || hasValidStorePriceSignal(storeEntry));
 };
 
-const extractSaleStartDate = (device) => {
-  const direct = normalizeDateOnlyInput(
-    device?.sale_start_date ??
-      device?.saleStartDate ??
-      device?.sale_date ??
-      device?.saleDate ??
+const getSaleDate = (value) =>
+  normalizeDateOnlyInput(
+    value?.sale_start_date ??
+      value?.saleStartDate ??
+      value?.sale_date ??
+      value?.saleDate ??
       null,
   );
+
+const extractSaleStartDate = (device) => {
+  const direct = getSaleDate(device);
   if (direct) return direct;
 
-  const stores = [
-    ...(Array.isArray(device?.store_prices) ? device.store_prices : []),
-    ...(Array.isArray(device?.storePrices) ? device.storePrices : []),
-    ...(Array.isArray(device?.variants)
-      ? device.variants.flatMap((variant) => [
-          ...(Array.isArray(variant?.store_prices) ? variant.store_prices : []),
-          ...(Array.isArray(variant?.storePrices) ? variant.storePrices : []),
-        ])
-      : []),
-  ];
-
-  for (const store of stores) {
-    const date = normalizeDateOnlyInput(
-      store?.sale_start_date ??
-        store?.saleStartDate ??
-        store?.sale_date ??
-        store?.saleDate ??
-        null,
-    );
+  for (const store of getStoreRows(device)) {
+    const date = getSaleDate(store);
     if (date) return date;
   }
 
   return null;
 };
 
+const getStoreRows = (device) => [
+  ...(Array.isArray(device?.store_prices) ? device.store_prices : []),
+  ...(Array.isArray(device?.storePrices) ? device.storePrices : []),
+  ...(Array.isArray(device?.variants)
+    ? device.variants.flatMap((variant) => [
+        ...(Array.isArray(variant?.store_prices) ? variant.store_prices : []),
+        ...(Array.isArray(variant?.storePrices) ? variant.storePrices : []),
+        ...(Array.isArray(variant?.stores) ? variant.stores : []),
+      ])
+    : []),
+];
+
+const getAutomaticReleaseDate = (device) => {
+  return normalizeDateOnlyInput(
+    device?.launch_date ??
+      device?.launchDate ??
+      device?.release_date ??
+      device?.releaseDate ??
+      null,
+  );
+};
+
 /**
  * RESOLVE LAUNCH STAGE — UNAMBIGUOUS PRECEDENCE
  *
- * Launch status is editorial. launch_date is metadata only and never changes
- * the stage automatically.
+ * Launch status is driven by launch_date. Sale dates are evaluated separately
+ * and never change whether the product is officially launched.
  */
 const resolveCanonicalLaunchStage = (device, todayIndia = null) => {
   if (!device || typeof device !== "object") return "upcoming";
@@ -193,7 +201,14 @@ const resolveCanonicalLaunchStage = (device, todayIndia = null) => {
   const override = normalizeLaunchStatusOverride(
     device.launch_status_override || device.launchStatusOverride,
   );
-  return override || "upcoming";
+  const releaseDate = getAutomaticReleaseDate(device);
+  const today = normalizeDateOnlyInput(todayIndia);
+
+  return releaseDate && today && releaseDate <= today
+    ? "released"
+    : releaseDate && today
+      ? "upcoming"
+      : override || "upcoming";
 };
 
 /**
@@ -212,18 +227,7 @@ const resolveCanonicalSaleStage = (device, todayIndia = null) => {
 
   // No sale date info
   if (!saleStartDate) {
-    const storeRows = [
-      ...(Array.isArray(device.store_prices) ? device.store_prices : []),
-      ...(Array.isArray(device.storePrices) ? device.storePrices : []),
-      ...(Array.isArray(device.variants)
-        ? device.variants.flatMap((variant) => [
-            ...(Array.isArray(variant?.store_prices)
-              ? variant.store_prices
-              : []),
-            ...(Array.isArray(variant?.storePrices) ? variant.storePrices : []),
-          ])
-        : []),
-    ];
+    const storeRows = getStoreRows(device);
     if (storeRows.some(hasValidStorePriceSignal)) {
       if (resolveCanonicalLaunchStage(device, today) === "released") {
         return "on_sale";
@@ -237,23 +241,10 @@ const resolveCanonicalSaleStage = (device, todayIndia = null) => {
     return "sale_scheduled";
   }
 
-  // Sale date has passed (or is today)
-  // Distinguish preorder (shippable when product launches) vs on_sale (shippable now)
-  const launchDate = normalizeDateOnlyInput(
-    device.launch_date ??
-      device.launchDate ??
-      device.release_date ??
-      device.releaseDate ??
-      null,
-  );
-
+  // Sale date has passed (or is today).
   const launchStage = resolveCanonicalLaunchStage(device, todayIndia);
-  if (launchStage !== "released") {
-    // Product not yet launched, but sale is open = preorder
-    return "preorder";
-  }
+  if (launchStage !== "released") return "preorder";
 
-  // Product launched (or no launch date) and sale open = can ship
   return "on_sale";
 };
 
@@ -267,7 +258,6 @@ const resolveCanonicalSaleStage = (device, todayIndia = null) => {
 const resolveCanonicalStoreStage = (device, todayIndia = null) => {
   if (!device || typeof device !== "object") return "none";
 
-  // Get device-level sale date for determining prebooking status
   const deviceSaleDate = normalizeDateOnlyInput(
     device.sale_start_date ??
       device.saleStartDate ??
@@ -275,32 +265,22 @@ const resolveCanonicalStoreStage = (device, todayIndia = null) => {
       device.saleDate ??
       null,
   );
-
-  // Collect all store entries
-  let storeRows = [
-    ...(Array.isArray(device.store_prices) ? device.store_prices : []),
-    ...(Array.isArray(device.storePrices) ? device.storePrices : []),
-  ];
-
-  // Extract store entries from variants
-  const variants = Array.isArray(device.variants) ? device.variants : [];
-  for (const variant of variants) {
-    if (variant && Array.isArray(variant.store_prices)) {
-      storeRows.push(...variant.store_prices);
-    }
-    if (variant && Array.isArray(variant.storePrices)) {
-      storeRows.push(...variant.storePrices);
-    }
-  }
+  let storeRows = getStoreRows(device);
 
   // Filter to only include stores with actual purchasing signal
-  // A store must have a valid price signal or an explicit positive price.
   storeRows = storeRows.filter((store) => {
     if (!store || typeof store !== "object") return false;
 
     const hasSignal = hasValidStorePriceSignal(store);
     const hasExplicitPrice = Boolean(
-      Number(store.price ?? store.current_price ?? store.sale_price ?? 0) > 0,
+      Number(
+        store.price ??
+          store.current_price ??
+          store.sale_price ??
+          store.offer_price ??
+          store.base_price ??
+          0,
+      ) > 0,
     );
 
     return hasSignal || hasExplicitPrice;
@@ -311,70 +291,45 @@ const resolveCanonicalStoreStage = (device, todayIndia = null) => {
     return "none";
   }
 
-  // Check if any store is live (has price + valid URL + not future sale date)
   const today = normalizeDateOnlyInput(todayIndia);
   const hasLiveStore = storeRows.some((store) => {
     if (!hasValidStorePriceSignal(store)) return false;
 
-    // Check if store or device has future availability date
-    const storeSaleDate = normalizeDateOnlyInput(
-      store.sale_start_date ??
-        store.saleStartDate ??
-        store.sale_date ??
-        store.saleDate ??
-        null,
-    );
+    const storeSaleDate = getSaleDate(store);
     const effectiveSaleDate = storeSaleDate || deviceSaleDate;
-
-    if (effectiveSaleDate && today && effectiveSaleDate > today) {
-      // Store sale date is future = not yet live
-      return false;
-    }
-
-    return true;
+    return !(effectiveSaleDate && today && effectiveSaleDate > today);
   });
 
-  if (hasLiveStore) {
-    return "live";
-  }
+  if (hasLiveStore) return "live";
 
-  // Stores exist but not live yet
-  // Check if any have future availability dates (prebooking period)
   const hasPrebookingStore = storeRows.some((store) => {
-    const storeSaleDate = normalizeDateOnlyInput(
-      store.sale_start_date ??
-        store.saleStartDate ??
-        store.sale_date ??
-        store.saleDate ??
-        null,
-    );
-    const effectiveSaleDate = storeSaleDate || deviceSaleDate;
-
+    const effectiveSaleDate = getSaleDate(store) || deviceSaleDate;
     return Boolean(effectiveSaleDate && today && effectiveSaleDate > today);
   });
 
-  if (hasPrebookingStore) {
-    return "prebooking";
-  }
-
-  // Stores exist, not live, no specific dates
-  return "listed";
+  return hasPrebookingStore ? "prebooking" : "listed";
 };
 
 /**
- * RESOLVE RENDER TYPE — BASED ON LAUNCH ONLY
+ * RESOLVE RENDER TYPE — BASED ON LAUNCH + SALE
  *
  * Determines how to display the product in UI.
- * Depends ONLY on launch stage, not on sale or store.
+ * A future scheduled sale is still customer-facing upcoming content even
+ * when the product has already launched.
  */
-const resolveCanonicalRenderType = (launchStage) => {
-  const isUpcomingLaunch = ["rumored", "announced", "upcoming"].includes(
+const resolveCanonicalRenderType = (launchStage, saleStage = "sale_tbd") => {
+  const isUnreleased = ["rumored", "announced", "upcoming"].includes(
     launchStage,
   );
+  const isSaleScheduled = saleStage === "sale_scheduled";
 
   return {
-    type: isUpcomingLaunch ? "upcoming" : "released",
-    display_status: isUpcomingLaunch ? "Upcoming" : "Released",
+    type: isUnreleased || isSaleScheduled ? "upcoming" : "released",
+    display_status: isUnreleased
+      ? "Expected"
+      : isSaleScheduled
+        ? "Upcoming"
+        : "Released",
   };
 };
 
@@ -446,7 +401,7 @@ const createCanonicalSmartphoneResponse = (
   const launchStage = resolveCanonicalLaunchStage(device, todayIndia);
   const saleStage = resolveCanonicalSaleStage(device, todayIndia);
   const storeStage = resolveCanonicalStoreStage(device, todayIndia);
-  const renderType = resolveCanonicalRenderType(launchStage);
+  const renderType = resolveCanonicalRenderType(launchStage, saleStage);
   const permissions = resolveCanonicalPermissions(
     launchStage,
     specScoreEligible,

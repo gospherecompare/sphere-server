@@ -230,6 +230,12 @@ const normalizeSmartphonePayload = (rawBody = {}) => {
     ),
     category: normalizeNullableText(merged.category ?? merged.segment),
     launch_date: normalizeNullableText(merged.launch_date ?? merged.launchDate),
+    sale_start_date: normalizeNullableText(
+      merged.sale_start_date ??
+        merged.saleStartDate ??
+        merged.sale_date ??
+        merged.saleDate,
+    ),
     launch_status_override: normalizeNullableText(
       merged.launch_status_override ??
         merged.launchStatusOverride ??

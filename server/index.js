@@ -17,7 +17,18 @@ const {
 } = require("@simplewebauthn/server");
 const ExcelJS = require("exceljs");
 const rateLimit = require("express-rate-limit");
-const { client, db } = require("./db");
+const { db } = require("./db");
+const { createAgentExecutor } = require("./services/agent/agentExecutor");
+const { createAgentToolExecutor } = require("./services/agent/toolExecutor");
+const { createChatRepository } = require("./services/agent/chatRepository");
+const { createNlpModelClient } = require("./services/agent/nlpModelClient");
+const { createLocalLlmClient } = require("./services/agent/localLlmClient");
+const {
+  createResponseGenerator,
+} = require("./services/agent/responseGenerator");
+const {
+  createMobilesCapabilities,
+} = require("./services/catalog/mobilesCapabilities");
 const multer = require("multer");
 const {
   sendRegistrationMail,
@@ -57,12 +68,17 @@ const {
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
+const {
+  createApiJsonCompressionMiddleware,
+} = require("./responseCompression");
+const { createBase64JsonMiddleware } = require("./base64Response");
 
 const SECRET = process.env.JWT_SECRET || "smartarena_secret_key_25";
 const PORT = process.env.PORT || 5000;
 const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || "2mb";
 const PROXY_EXTERNAL_BODY_LIMIT =
   process.env.PROXY_EXTERNAL_BODY_LIMIT || "50kb";
+const PUBLIC_API_BASE64 = process.env.PUBLIC_API_BASE64 === "true";
 const COMPARE_DATA_RETENTION_DAYS = 548;
 const PUBLIC_COMPARE_WINDOW_DAYS = 180;
 const FRESH_COMPARE_WIDGET_DAYS = 7;
@@ -133,6 +149,15 @@ const scheduleSmartphoneCompetitorRefresh = (reason = "smartphone_changed") => {
 };
 
 const app = express();
+const mobilesCapabilities = createMobilesCapabilities({ db });
+const agentExecutor = createAgentExecutor({
+  toolExecutor: createAgentToolExecutor({ capabilities: mobilesCapabilities }),
+  nlpClient: createNlpModelClient(),
+  responseGenerator: createResponseGenerator({
+    llmClient: createLocalLlmClient(),
+  }),
+});
+const chatRepository = createChatRepository({ db });
 
 const payloadTooLargeHandler = (limit) => (err, _req, res, next) => {
   if (err?.type === "entity.too.large") {
@@ -362,6 +387,28 @@ app.use((req, _res, next) => {
     // ignore alias rewrite failures
   }
   next();
+});
+
+const isPublicApiResponse = (req) => {
+  const path = String(req.path || "");
+  return path.startsWith("/api/public/") || path.startsWith("/api/gateway/");
+};
+
+const publicCompressionMiddleware = createApiJsonCompressionMiddleware();
+const publicBase64Middleware = createBase64JsonMiddleware({
+  enabled: PUBLIC_API_BASE64,
+  shouldEncode: isPublicApiResponse,
+});
+
+// Compression is installed first; Base64 wraps it so the envelope is what gets
+// compressed and sent over HTTP.
+app.use((req, res, next) => {
+  if (!isPublicApiResponse(req)) return next();
+  return publicCompressionMiddleware(req, res, next);
+});
+app.use((req, res, next) => {
+  if (!isPublicApiResponse(req)) return next();
+  return publicBase64Middleware(req, res, next);
 });
 // Apply XSS sanitization after body and query parsers. Use the underlying
 // `clean` function and avoid reassigning `req.query` if it's getter-only.
@@ -1508,13 +1555,12 @@ const isSmartphoneUpcomingFeedItem = (
   todayIndia = getIndiaDateOnly(),
 ) => {
   if (!device) return false;
-  const launchStage = createCanonicalSmartphoneResponse(device, todayIndia)
-    .launch.stage;
-  return (
-    launchStage === "upcoming" ||
-    launchStage === "rumored" ||
-    launchStage === "announced"
-  );
+  const canonical = createCanonicalSmartphoneResponse(device, todayIndia);
+  const isScheduledSale =
+    canonical.sale.stage === "sale_scheduled" &&
+    Boolean(canonical.sale.start_date) &&
+    canonical.sale.start_date > todayIndia;
+  return isScheduledSale;
 };
 
 const hasOwn = (obj, key) =>
@@ -4888,6 +4934,12 @@ async function runMigrations() {
         "utf8",
       ),
     );
+    await safeQuery(
+      fs.readFileSync(
+        path.join(__dirname, "migrations", "ai_chat_agent.sql"),
+        "utf8",
+      ),
+    );
 
     // Migrations - create tables in dependency order
 
@@ -5058,6 +5110,7 @@ async function runMigrations() {
         brand TEXT,
         model TEXT,
         launch_date DATE,
+        sale_start_date DATE,
         launch_status_mode TEXT NOT NULL DEFAULT 'auto',
         official_preorder_url TEXT,
         launch_status_override TEXT,
@@ -5097,6 +5150,9 @@ async function runMigrations() {
     );
     await safeQuery(
       `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS expected_price NUMERIC;`,
+    );
+    await safeQuery(
+      `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS sale_start_date DATE;`,
     );
 
     // If older `connectivity_network` column exists, copy its data into `connectivity` (preserve existing connectivity)
@@ -12502,8 +12558,17 @@ app.get("/api/public/blogs", async (req, res) => {
     )
       .trim()
       .toLowerCase();
+    const category = String(req.query.category || "")
+      .trim()
+      .toLowerCase();
     const whereClauses = ["bl.is_published = true"];
     const queryParams = [];
+
+    if (category) {
+      queryParams.push(category);
+      const index = queryParams.length;
+      whereClauses.push(`LOWER(BTRIM(bl.category)) = $${index}`);
+    }
 
     if (hasProductFilter) {
       queryParams.push(requestedProductId);
@@ -12645,6 +12710,7 @@ app.get("/api/public/blogs", async (req, res) => {
       limit,
       product_id: hasProductFilter ? requestedProductId : null,
       product_type: productType || null,
+      category: category || null,
       blogs: result.rows || [],
     });
   } catch (err) {
@@ -14009,6 +14075,7 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
       `
       INSERT INTO smartphones (
         product_id, category, brand, model, launch_date,
+        sale_start_date,
         launch_status_override,
         images, colors, build_design, display, performance,
         camera, battery, connectivity, network,
@@ -14017,8 +14084,9 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
       VALUES (
         $1,$2,$3,$4,$5,
         $6,
-        $7,$8,$9,$10,$11,
-        $12,$13,$14,$15,$16,$17,$18,$19,$20
+        $7,
+        $8,$9,$10,$11,$12,
+        $13,$14,$15,$16,$17,$18,$19,$20,$21
       )
       RETURNING id
       `,
@@ -14028,6 +14096,7 @@ app.post("/api/smartphones", authenticate, async (req, res) => {
         smartphone.brand || null,
         smartphone.model || null,
         smartphone.launch_date || null,
+        smartphone.sale_start_date || null,
         launchStatusOverride,
         JSON.stringify(images || []),
         JSON.stringify(smartphone.colors || []),
@@ -16784,12 +16853,13 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     const updatePhoneSQL = `
       UPDATE smartphones SET
         category=$1, brand=$2, model=$3, launch_date=$4,
-        launch_status_override=$5,
-        images=$6, colors=$7, build_design=$8, display=$9, performance=$10,
-        camera=$11, battery=$12, connectivity=$13, network=$14, ports=$15,
-        audio=$16, multimedia=$17, sensors=$18,
-        expected_price = CASE WHEN $20 THEN $19 ELSE expected_price END
-      WHERE id=$21
+        sale_start_date=$5,
+        launch_status_override=$6,
+        images=$7, colors=$8, build_design=$9, display=$10, performance=$11,
+        camera=$12, battery=$13, connectivity=$14, network=$15, ports=$16,
+        audio=$17, multimedia=$18, sensors=$19,
+        expected_price = CASE WHEN $21 THEN $20 ELSE expected_price END
+      WHERE id=$22
       RETURNING *;
     `;
 
@@ -16798,6 +16868,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       req.body.brand || null,
       req.body.model || null,
       parseDateForImport(req.body.launch_date),
+      parseDateForImport(req.body.sale_start_date || req.body.saleStartDate),
       launchStatusOverride,
       JSON.stringify(req.body.images || []),
       JSON.stringify(req.body.colors || []),
@@ -21296,6 +21367,7 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
         (to_jsonb(b)->>'website') AS brand_website,
         s.model AS model,
         s.launch_date,
+        s.sale_start_date,
         s.launch_status_mode,
         s.launch_status_override,
         s.display,
@@ -21402,7 +21474,10 @@ app.get("/api/public/upcoming/smartphones", async (req, res) => {
         item.price ?? null,
       );
       item.variants = variants;
-      item.sale_start_date = getEarliestSaleStartDateFromVariants(variants);
+      item.sale_start_date =
+        getEarliestSaleStartDateFromVariants(variants) ||
+        item.sale_start_date ||
+        null;
       item.price = effectivePrice;
       item.starting_price = effectivePrice;
       // No confirmed price yet (common for upcoming/unreleased phones):
@@ -28860,6 +28935,38 @@ app.get("/api/search", async (req, res) => {
   } catch (err) {
     console.error("GET /api/search error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/ai/chat", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const message = typeof body.message === "string" ? body.message.trim() : "";
+    if (!message)
+      return res.status(400).json({ message: "message is required" });
+    if (message.length > 4000)
+      return res.status(413).json({ message: "message is too long" });
+
+    const input = {
+      message,
+      context:
+        body.context && typeof body.context === "object" ? body.context : {},
+    };
+    const sessionId = await chatRepository.createSession({
+      sessionId: body.sessionId,
+      userId: req.user?.id || null,
+      context: input.context,
+    });
+    const response = await agentExecutor.execute(input);
+    await chatRepository.saveTurn({ sessionId, input, response });
+
+    return res.json({ sessionId, ...response });
+  } catch (err) {
+    console.error("POST /api/ai/chat error:", err);
+    return res.status(500).json({
+      type: "error",
+      message: "The MobilesX agent could not complete that request.",
+    });
   }
 });
 
