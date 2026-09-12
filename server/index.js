@@ -55,6 +55,13 @@ const { buildDecisionComparison } = require("./utils/compareDecisionEngine");
 const {
   recomputeSmartphoneCompetitorAnalysis,
 } = require("./utils/competitorAnalysis");
+const {
+  applyPhoneFilters,
+  buildFinderPreferences,
+  calculateMatchScore,
+  rankPhones,
+  buildRecommendationReasons,
+} = require("./services/phoneFinder");
 const { normalizeSmartphonePayload } = require("./schemas/smartphonePayload");
 const {
   recordSmartphoneLifecycleEvents,
@@ -71,9 +78,7 @@ const {
 const helmet = require("helmet");
 const xss = require("xss-clean");
 const { clean: xssClean } = require("xss-clean/lib/xss");
-const {
-  createApiJsonCompressionMiddleware,
-} = require("./responseCompression");
+const { createApiJsonCompressionMiddleware } = require("./responseCompression");
 const { createBase64JsonMiddleware } = require("./base64Response");
 
 const SECRET = process.env.JWT_SECRET || "smartarena_secret_key_25";
@@ -12641,18 +12646,16 @@ app.get("/api/public/blogs", async (req, res) => {
     )
       .trim()
       .toLowerCase();
-    const categories = String(req.query.category || "")
-      .split(",")
-      .map((value) => value.trim().toLowerCase())
-      .filter(Boolean);
-    const category = categories.join(",");
+    const category = String(req.query.category || "")
+      .trim()
+      .toLowerCase();
     const whereClauses = ["bl.is_published = true"];
     const queryParams = [];
 
-    if (categories.length) {
-      queryParams.push(categories);
+    if (category) {
+      queryParams.push(category);
       const index = queryParams.length;
-      whereClauses.push(`LOWER(BTRIM(bl.category)) = ANY($${index}::text[])`);
+      whereClauses.push(`LOWER(BTRIM(bl.category)) = $${index}`);
     }
 
     if (hasProductFilter) {
@@ -14903,6 +14906,210 @@ app.get("/api/smartphones", async (req, res) => {
   } catch (err) {
     console.error("GET /api/smartphones error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/smartphones/finder", async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const filters = payload.filters || {};
+    const preferences = Object.keys(payload.profile || {}).length
+      ? buildFinderPreferences(payload.profile)
+      : payload.preferences || {};
+    const limit = Math.max(1, Math.min(50, Number(payload.limit) || 20));
+
+    const result = await db.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name,
+        b.name AS brand_name,
+        s.model,
+        s.category,
+        s.display,
+        s.performance,
+        s.camera,
+        s.battery,
+        s.network,
+        s.expected_price,
+        COALESCE(
+          (
+            SELECT json_agg(pi.image_url ORDER BY pi.position, pi.id)
+            FROM product_images pi
+            WHERE pi.product_id = p.id
+          ),
+          '[]'::json
+        ) AS images,
+        COALESCE(
+          (
+            SELECT MIN(COALESCE(sp.price, v.base_price))
+            FROM product_variants v
+            LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
+            WHERE v.product_id = p.id
+          ),
+          0
+        ) AS numeric_price,
+        COALESCE(
+          (
+            SELECT json_agg(
+              jsonb_build_object(
+                'id', v.id,
+                'variant_key', v.variant_key,
+                'attributes', v.attributes,
+                'base_price', v.base_price
+              )
+              ORDER BY v.id
+            )
+            FROM product_variants v
+            WHERE v.product_id = p.id
+          ),
+          '[]'::json
+        ) AS variants
+      FROM products p
+      INNER JOIN smartphones s ON s.product_id = p.id
+      INNER JOIN product_publish pub ON pub.product_id = p.id AND pub.is_published = true
+      LEFT JOIN brands b ON b.id = p.brand_id
+      WHERE p.product_type = 'smartphone'
+      ORDER BY p.id DESC
+      LIMIT 300
+      `,
+    );
+
+    const normalizeVariantRamValues = (variants = []) => {
+      const values = [];
+      for (const variant of variants) {
+        const attrs = variant?.attributes || {};
+        const ramCandidates = [
+          attrs.ram,
+          attrs.RAM,
+          attrs.memory,
+          attrs.ram_gb,
+        ];
+        for (const candidate of ramCandidates) {
+          const parsed = Number(String(candidate || "").replace(/[^\d.]/g, ""));
+          if (Number.isFinite(parsed) && parsed > 0) values.push(parsed);
+        }
+      }
+      return [...new Set(values)].sort((a, b) => a - b);
+    };
+
+    const normalizePhone = (row) => {
+      const variants = Array.isArray(row.variants) ? row.variants : [];
+      const images = Array.isArray(row.images) ? row.images.filter(Boolean) : [];
+      const ramOptions = normalizeVariantRamValues(variants);
+      const expectedPrice =
+        Number(String(row?.expected_price ?? 0).replace(/[^\d.]/g, "")) || 0;
+      const numericPrice = Number(row?.numeric_price || 0) || expectedPrice;
+      const batterySource = row?.battery || {};
+      const batteryMah =
+        Number(
+          String(
+            batterySource?.mah ??
+              batterySource?.capacity ??
+              batterySource?.battery ??
+              batterySource?.batteryMah ??
+              0,
+          ).replace(/[^\d.]/g, ""),
+        ) || 0;
+
+      const normalizedNetwork =
+        row?.network && typeof row.network === "object"
+          ? row.network
+          : { values: [] };
+
+      const networkValues = Array.isArray(normalizedNetwork.values)
+        ? normalizedNetwork.values
+        : Array.isArray(row?.network)
+          ? row.network
+          : [row?.network];
+
+      const networkText = networkValues.join(" ");
+      const network5G =
+        /5g/i.test(networkText) || /5g/i.test(String(row?.display || ""));
+
+      return {
+        id: row.product_id,
+        name: row.name,
+        brand: row.brand_name,
+        model: row.model,
+        image: images[0] || null,
+        image_url: images[0] || null,
+        images,
+        price: numericPrice,
+        numericPrice,
+        batteryMah,
+        ramOptions,
+        network5G,
+        performanceScore: 85,
+        batteryScore: batteryMah >= 6000 ? 92 : batteryMah >= 5000 ? 82 : 70,
+        displayScore: 85,
+        cameraScore: 80,
+        softwareScore: 82,
+        valueScore: 85,
+        performance: row.performance || {},
+        battery: row.battery || {},
+        network: row.network || {},
+        specs: {
+          ram: ramOptions.length
+            ? `${ramOptions[ramOptions.length - 1]} GB`
+            : "",
+          battery: batteryMah ? `${batteryMah} mAh` : "",
+          network: networkText,
+        },
+      };
+    };
+
+    const eligiblePhones = applyPhoneFilters(
+      (result.rows || []).map(normalizePhone),
+      filters,
+    );
+
+    const scoredPhones = eligiblePhones
+      .map((phone) => ({
+        ...phone,
+        matchScore: calculateMatchScore(phone, preferences),
+        reasons: buildRecommendationReasons(phone),
+        tradeoffs: [
+          phone.batteryMah < 7000
+            ? "Battery is acceptable but not class-leading"
+            : "Battery is strong for the budget",
+        ],
+      }))
+      .sort((a, b) => (b.matchScore || 0) - (a.matchScore || 0));
+
+    const ranked = rankPhones(scoredPhones);
+    const top = ranked.slice(0, Math.min(limit, ranked.length));
+    const bestMatch = top[0] || null;
+    const alternative = top[1] || null;
+    const bestValue =
+      [...ranked].sort((a, b) => {
+        const aValue = (a.matchScore || 0) - (a.numericPrice || 0) / 10000;
+        const bValue = (b.matchScore || 0) - (b.numericPrice || 0) / 10000;
+        return bValue - aValue;
+      })[0] || null;
+
+    return res.json({
+      count: ranked.length,
+      results: top.map((phone) => ({
+        ...phone,
+        reasons: phone.reasons || buildRecommendationReasons(phone),
+        tradeoffs: phone.tradeoffs || [],
+      })),
+      bestMatch,
+      alternative,
+      bestValue,
+      meta: {
+        filters,
+        preferences,
+        source: "existing-smartphone-catalog",
+        logic: "hard-filter -> score -> rank -> explain",
+      },
+    });
+  } catch (error) {
+    console.error("POST /api/smartphones/finder error:", error);
+    return res
+      .status(500)
+      .json({ message: "Failed to build smartphone finder results" });
   }
 });
 
@@ -17348,11 +17555,11 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
         id: productId,
         name: name,
         launch_date: req.body.launch_date || null,
-        sale_start_date: req.body.sale_start_date || req.body.saleStartDate || null,
-        current_price:
-          Number.isFinite(Number(req.body?.current_price))
-            ? Number(req.body.current_price)
-            : null,
+        sale_start_date:
+          req.body.sale_start_date || req.body.saleStartDate || null,
+        current_price: Number.isFinite(Number(req.body?.current_price))
+          ? Number(req.body.current_price)
+          : null,
       },
       today: getIndiaDateOnly(),
     });
@@ -17618,8 +17825,9 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
         name: product_name || b.name || null,
         launch_date: launch_date || null,
         sale_start_date: b.sale_start_date || b.saleStartDate || null,
-        current_price:
-          Number.isFinite(Number(b.current_price)) ? Number(b.current_price) : null,
+        current_price: Number.isFinite(Number(b.current_price))
+          ? Number(b.current_price)
+          : null,
       },
       today: getIndiaDateOnly(),
     });
