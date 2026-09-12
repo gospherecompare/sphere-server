@@ -63,6 +63,12 @@ const {
   buildRecommendationReasons,
 } = require("./services/phoneFinder");
 const { normalizeSmartphonePayload } = require("./schemas/smartphonePayload");
+const { generateContent } = require("./services/ai/geminiClient");
+const { generateTvDraft } = require("./services/tvGeneration");
+const { verifyTvSourceEvidence } = require("./services/tvSourceVerifier");
+const { reserveTvGenerationCall } = require("./services/tvGenerationQuota");
+const { processOfficialTvImage } = require("./services/tvImagePipeline");
+const { recordSuccessfulTv } = require("./services/tvGenerationQuota");
 const {
   recordSmartphoneLifecycleEvents,
 } = require("./services/notifications/notificationEngine");
@@ -5266,6 +5272,24 @@ async function runMigrations() {
         warranty_json JSONB,
         images_json JSONB,
         variants_json JSONB,
+        created_at TIMESTAMP DEFAULT now()
+      );
+    `);
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS tv_generation_usage (
+        usage_date DATE PRIMARY KEY,
+        gemini_calls INTEGER NOT NULL DEFAULT 0,
+        successful_tvs INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT now()
+      );
+    `);
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS tv_generation_drafts (
+        generation_id UUID PRIMARY KEY,
+        product_name TEXT NOT NULL,
+        model TEXT NOT NULL,
+        draft_json JSONB NOT NULL,
+        consumed_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT now()
       );
     `);
@@ -14995,7 +15019,9 @@ app.post("/api/smartphones/finder", async (req, res) => {
 
     const normalizePhone = (row) => {
       const variants = Array.isArray(row.variants) ? row.variants : [];
-      const images = Array.isArray(row.images) ? row.images.filter(Boolean) : [];
+      const images = Array.isArray(row.images)
+        ? row.images.filter(Boolean)
+        : [];
       const ramOptions = normalizeVariantRamValues(variants);
       const expectedPrice =
         Number(String(row?.expected_price ?? 0).replace(/[^\d.]/g, "")) || 0;
@@ -29407,6 +29433,258 @@ const smartphonesReqRouter = require("./routes/smartphonesReq");
 app.use("/api/import", authenticate, importSmartphonesRouter);
 app.use("/api/import", authenticate, importLaptopsRouter);
 app.use("/api/smartphones", authenticate, smartphonesReqRouter);
+
+const persistGeneratedTv = async (payload) => {
+  const client = await db.connect();
+  const toJSON = (value) =>
+    value === undefined ? null : JSON.stringify(value);
+
+  try {
+    const normalized = normalizeTvPayloadInput(payload);
+    const productName = normalizeNullableText(
+      normalized.product_name || normalized.name || normalized.model,
+    );
+    const basicInfo = toPlainObject(normalized.basic_info_json);
+    const model = normalizeNullableText(
+      normalized.model || basicInfo.model_number || basicInfo.model,
+    );
+    const brandName = normalizeNullableText(
+      normalized.brand_name ||
+        normalized.brand ||
+        basicInfo.brand_name ||
+        basicInfo.brand,
+    );
+    const brandId = await resolveExistingBrandId(
+      client,
+      normalized.brand_id,
+      brandName,
+    );
+    if (!productName || !model || !brandId)
+      throw new Error("Generated TV identity or brand is invalid");
+
+    const imagesJson = Array.isArray(normalized.images_json)
+      ? normalized.images_json
+      : [];
+    const variantsJson = normalizeTvVariantsInput(
+      normalized.variants_json || [],
+    );
+    await client.query("BEGIN");
+
+    const productRes = await client.query(
+      `INSERT INTO products (name, brand_id, product_type) VALUES ($1, $2, 'tv') RETURNING id`,
+      [productName, brandId],
+    );
+    const productId = productRes.rows[0].id;
+    const sections = Object.fromEntries(
+      TV_JSON_OBJECT_SECTIONS.map((key) => [
+        key,
+        toPlainObject(normalized[key]),
+      ]),
+    );
+
+    await client.query(
+      `INSERT INTO tvs (product_id, category, model, key_specs_json, basic_info_json, display_json, video_engine_json, audio_json, smart_tv_json, gaming_json, ports_json, connectivity_json, power_json, physical_json, product_details_json, in_the_box_json, warranty_json, images_json, variants_json)
+       VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17::jsonb,$18::jsonb,$19::jsonb)`,
+      [
+        productId,
+        normalized.category || "television",
+        model,
+        ...TV_JSON_OBJECT_SECTIONS.map((key) => toJSON(sections[key])),
+        toJSON(imagesJson),
+        toJSON(
+          variantsJson.map((variant) => ({
+            ...variant.attributes,
+            variant_key: variant.variant_key,
+            screen_size: variant.screen_size,
+            screen_size_value: variant.screen_size_value,
+            base_price: variant.base_price,
+            store_prices: variant.store_prices,
+            images: variant.images,
+          })),
+        ),
+      ],
+    );
+
+    for (const [index, imageUrl] of imagesJson.entries()) {
+      if (normalizeNullableText(imageUrl))
+        await client.query(
+          "INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)",
+          [productId, imageUrl, index + 1],
+        );
+    }
+    for (const variant of variantsJson) {
+      const variantRes = await client.query(
+        "INSERT INTO product_variants (product_id, variant_key, attributes, base_price) VALUES ($1,$2,$3::jsonb,$4) RETURNING id",
+        [
+          productId,
+          variant.variant_key,
+          JSON.stringify(variant.attributes),
+          variant.base_price,
+        ],
+      );
+      for (const store of variant.store_prices || []) {
+        if (!store.store_name || !store.url) continue;
+        await client.query(
+          "INSERT INTO variant_store_prices (variant_id, store_name, price, url, offer_text, delivery_info) VALUES ($1,$2,$3,$4,$5,$6)",
+          [
+            variantRes.rows[0].id,
+            store.store_name,
+            store.price,
+            store.url,
+            store.offer_text,
+            store.delivery_info,
+          ],
+        );
+      }
+      for (const [index, imageUrl] of (variant.images || []).entries()) {
+        await client.query(
+          "INSERT INTO product_variant_images (variant_id, image_url, position) VALUES ($1,$2,$3)",
+          [variantRes.rows[0].id, imageUrl, index + 1],
+        );
+      }
+    }
+    await client.query(
+      "INSERT INTO product_publish (product_id, is_published) VALUES ($1, false)",
+      [productId],
+    );
+    const quota = await recordSuccessfulTv(client);
+    await client.query("COMMIT");
+    return { product_id: productId, quota };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
+app.post("/api/admin/tvs/generate", authenticate, async (req, res) => {
+  const generationRequestId = crypto.randomUUID();
+  const startedAt = Date.now();
+  let productName = "";
+  let brandName = "";
+  let model = "";
+
+  try {
+    if (!requireAdminAccess(req, res)) return;
+
+    const body = req.body || {};
+    productName = String(body.product_name || "").trim();
+    brandName = String(body.brand_name || "").trim();
+    model = String(body.model || "").trim();
+    const screenSizes = Array.isArray(body.screen_sizes)
+      ? body.screen_sizes
+          .map((value) => String(value || "").trim())
+          .filter(Boolean)
+      : [];
+
+    console.info("TV generation started", {
+      request_id: generationRequestId,
+      product_name: productName,
+      brand_name: brandName,
+      model,
+      screen_sizes: screenSizes,
+    });
+
+    if (!productName || !brandName || !model) {
+      console.warn("TV generation rejected: missing identity", {
+        request_id: generationRequestId,
+        duration_ms: Date.now() - startedAt,
+      });
+      return res.status(400).json({
+        message: "product_name, brand_name, and model are required",
+      });
+    }
+
+    const result = await generateTvDraft({
+      db,
+      generateContent,
+      verifyEvidence: verifyTvSourceEvidence,
+      reserveCall: () => reserveTvGenerationCall(db),
+      identity: { productName, brandName, model, screenSizes },
+    });
+
+    if (result.duplicate) {
+      console.info("TV generation skipped: duplicate", {
+        request_id: generationRequestId,
+        product_id: result.duplicate.product_id,
+        duration_ms: Date.now() - startedAt,
+      });
+      return res.status(409).json({
+        message: "TV already exists",
+        duplicate: result.duplicate,
+        gemini_called: false,
+      });
+    }
+
+    if (result.validation_errors?.length) {
+      console.warn("TV generation failed: validation", {
+        request_id: generationRequestId,
+        errors: result.validation_errors,
+        duration_ms: Date.now() - startedAt,
+      });
+      return res.status(422).json({
+        message: "Generated TV draft failed validation",
+        validation_errors: result.validation_errors,
+        draft: result.draft,
+        usage: result.usage,
+      });
+    }
+
+    const imageResult = await processOfficialTvImage({
+      candidates: result.draft.image_candidates,
+      brandName,
+      model,
+    });
+    if (imageResult.status !== "uploaded") {
+      console.warn("TV generation failed: image", {
+        request_id: generationRequestId,
+        image_status: imageResult.status,
+        reason: imageResult.reason,
+        duration_ms: Date.now() - startedAt,
+      });
+      return res.status(422).json({
+        message: "An official TV image could not be verified and uploaded",
+        image_status: imageResult.status,
+        reason: imageResult.reason,
+        draft: result.draft,
+        usage: result.usage,
+      });
+    }
+
+    result.draft.images_json = imageResult.images_json;
+    const saved = await persistGeneratedTv(result.draft);
+
+    console.info("TV generation completed and saved", {
+      request_id: generationRequestId,
+      product_id: saved.product_id,
+      successful_tvs: saved.quota?.successful_tvs,
+      duration_ms: Date.now() - startedAt,
+    });
+
+    return res.json({
+      ok: true,
+      image_status: imageResult.status,
+      saved: true,
+      product_id: saved.product_id,
+      quota: saved.quota,
+      usage: result.usage,
+    });
+  } catch (error) {
+    console.error("TV generation failed: exception", {
+      request_id: generationRequestId,
+      product_name: productName,
+      brand_name: brandName,
+      model,
+      error: error.message,
+      code: error.code,
+      duration_ms: Date.now() - startedAt,
+    });
+    return res.status(500).json({
+      message: error.message || "Failed to generate TV draft",
+    });
+  }
+});
 
 async function start() {
   try {

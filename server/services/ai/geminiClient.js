@@ -31,7 +31,13 @@ const waitForGeminiSlot = async () => {
   nextRequestAt = Date.now() + MIN_REQUEST_INTERVAL_MS;
 };
 
-const generateContent = async ({ systemInstruction, prompt, requestId }) => {
+const generateContent = async ({
+  systemInstruction,
+  prompt,
+  requestId,
+  tools = [],
+  responseFormat,
+}) => {
   let response;
   let activeModel;
   try {
@@ -41,7 +47,10 @@ const generateContent = async ({ systemInstruction, prompt, requestId }) => {
     await waitForGeminiSlot();
     const providerRequest = ai.interactions.create({
       model,
-      input: `${systemInstruction}\n\n${prompt}`,
+      system_instruction: systemInstruction,
+      input: prompt,
+      ...(tools.length ? { tools } : {}),
+      ...(responseFormat ? { response_format: responseFormat } : {}),
     });
     response = await Promise.race([
       providerRequest,
@@ -89,6 +98,8 @@ const generateContent = async ({ systemInstruction, prompt, requestId }) => {
     model: activeModel,
     inputTokens: response.usage?.input_tokens ?? null,
     outputTokens: response.usage?.output_tokens ?? null,
+    grounding:
+      response.grounding_metadata || response.groundingMetadata || null,
   };
 };
 
