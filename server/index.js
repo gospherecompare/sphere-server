@@ -70,8 +70,18 @@ const { normalizeSmartphonePayload } = require("./schemas/smartphonePayload");
 const { generateContent } = require("./services/ai/geminiClient");
 const { generateTvDraft } = require("./services/tvGeneration");
 const { verifyTvSourceEvidence } = require("./services/tvSourceVerifier");
-const { reserveTvGenerationCall } = require("./services/tvGenerationQuota");
+const {
+  dateKey,
+  reserveTvGenerationCall,
+} = require("./services/tvGenerationQuota");
 const { processOfficialTvImage } = require("./services/tvImagePipeline");
+const { computeTvRawSpecScoreV2 } = require("./utils/tvSpecScore");
+const {
+  toCanonicalTvPayload,
+  createTvCatalogRecord,
+  persistTvUpdate,
+  validateTvImageUrl,
+} = require("./services/tvCatalogService");
 const { recordSuccessfulTv } = require("./services/tvGenerationQuota");
 const {
   recordSmartphoneLifecycleEvents,
@@ -97,6 +107,7 @@ const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || "2mb";
 const PROXY_EXTERNAL_BODY_LIMIT =
   process.env.PROXY_EXTERNAL_BODY_LIMIT || "50kb";
 const PUBLIC_API_BASE64 = process.env.PUBLIC_API_BASE64 === "true";
+const TV_GENERATION_CRON_ENABLED = false;
 const COMPARE_DATA_RETENTION_DAYS = 548;
 const PUBLIC_COMPARE_WINDOW_DAYS = 180;
 const FRESH_COMPARE_WIDGET_DAYS = 7;
@@ -16489,51 +16500,24 @@ const resolveExistingBrandId = async (client, brandIdInput, brandNameInput) => {
 
 app.post("/api/tvs", authenticate, async (req, res) => {
   const client = await db.connect();
-  const toJSON = (v) => (v === undefined ? null : JSON.stringify(v));
 
   try {
     if (req.user.role !== "admin") {
       return res.status(403).json({ message: "Admin access required" });
     }
 
-    const payload = normalizeTvPayloadInput(req.body || {});
-    const productName = normalizeNullableText(
-      payload.product_name ||
-        payload.name ||
-        toPlainObject(payload.basic_info_json).title ||
-        payload.model,
-    );
-
-    if (!productName) {
+    const preliminary = toCanonicalTvPayload(req.body || {});
+    if (!preliminary.product_name) {
       return res.status(400).json({ message: "product_name is required" });
     }
-
-    const basicInfo = toPlainObject(payload.basic_info_json);
-    const product = toPlainObject(payload.product);
-    const model = normalizeNullableText(
-      payload.model || basicInfo.model_number || basicInfo.model,
-    );
-    if (!model) {
+    if (!preliminary.model) {
       return res.status(400).json({ message: "model is required" });
     }
 
-    const category = normalizeNullableText(payload.category);
-    const publish = hasOwn(payload, "publish")
-      ? Boolean(payload.publish)
-      : false;
-
-    const brandName = normalizeNullableText(
-      payload.brand_name ||
-        payload.brand ||
-        product.brand_name ||
-        product.brand ||
-        basicInfo.brand_name ||
-        basicInfo.brand,
-    );
     const brandId = await resolveExistingBrandId(
       client,
-      payload.brand_id,
-      brandName,
+      preliminary.brand_id,
+      preliminary.brand_name,
     );
     if (!brandId) {
       return res.status(400).json({
@@ -16541,52 +16525,30 @@ app.post("/api/tvs", authenticate, async (req, res) => {
           "brand is required and must reference an existing brand using brand_id or brand_name",
       });
     }
+
     const officialImageDomains = (
       await client.query(
         "SELECT domain FROM official_brand_domains WHERE brand_id = $1 AND is_active = true",
         [brandId],
       )
-    ).rows.map((row) =>
-      String(row.domain || "")
-        .toLowerCase()
-        .replace(/^www\./, ""),
-    );
+    ).rows
+      .map((row) =>
+        String(row.domain || "")
+          .toLowerCase()
+          .replace(/^www\./, ""),
+      )
+      .filter(Boolean);
 
-    const imagesJson = Array.isArray(payload.images_json)
-      ? payload.images_json
-      : [];
-
-    // Accept both 'variants' and 'variants_json' field names
-    const variantsInput = Array.isArray(payload?.variants)
-      ? payload.variants
-      : Array.isArray(payload?.variants_json)
-        ? payload.variants_json
-        : [];
-
-    const variantsJson = normalizeTvVariantsInput(variantsInput);
-    const variantsJsonForRow = variantsJson.map((variant) => ({
-      variant_key: variant.variant_key,
-      screen_size: variant.screen_size,
-      screen_size_value: variant.screen_size_value,
-      base_price: variant.base_price,
-      store_prices: variant.store_prices,
-      images: variant.images,
-      ...toPlainObject(variant.attributes),
-    }));
+    const canonical = toCanonicalTvPayload(req.body || {}, {
+      imageDomains: officialImageDomains,
+    });
 
     await client.query("BEGIN");
-    const { productId: catalogProductId } = await createTvCatalogRecord(
+    const { productId } = await createTvCatalogRecord(
       client,
       {
-        ...payload,
-        product_name: productName,
+        ...canonical,
         brand_id: brandId,
-        brand_name: brandName,
-        model,
-        category,
-        images_json: imagesJson,
-        variants: variantsJson,
-        publish,
       },
       {
         resolveBrandId: async (_client, id) => id,
@@ -16594,192 +16556,6 @@ app.post("/api/tvs", authenticate, async (req, res) => {
         imageDomains: officialImageDomains,
       },
     );
-    await client.query("COMMIT");
-    return res.status(201).json({
-      message: "TV created successfully",
-      product_id: catalogProductId,
-    });
-
-    await client.query("BEGIN");
-
-    const productRes = await client.query(
-      `
-      INSERT INTO products (name, brand_id, product_type)
-      VALUES ($1,$2,'tv')
-      RETURNING id
-      `,
-      [productName, brandId],
-    );
-    const productId = productRes.rows[0].id;
-
-    const sectionValues = {};
-    for (const key of TV_JSON_OBJECT_SECTIONS) {
-      sectionValues[key] = toPlainObject(payload[key]);
-    }
-
-    await client.query(
-      `
-      INSERT INTO tvs (
-        product_id,
-        category,
-        model,
-        manufacturer_model,
-        launch_date,
-        key_specs_json,
-        basic_info_json,
-        display_json,
-        video_engine_json,
-        audio_json,
-        smart_tv_json,
-        gaming_json,
-        ports_json,
-        connectivity_json,
-        power_json,
-        physical_json,
-        product_details_json,
-        in_the_box_json,
-        warranty_json,
-        images_json,
-        variants_json
-      )
-      VALUES (
-        $1,$2,$3,$4,$5,
-        $6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12::jsonb,
-        $13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17::jsonb,$18::jsonb,$19::jsonb,
-        $20::jsonb,$21::jsonb
-      )
-      `,
-      [
-        productId,
-        category,
-        model,
-        normalizeNullableText(payload.manufacturer_model || model),
-        parseDateForImport(payload.launch_date),
-        toJSON(sectionValues.key_specs_json),
-        toJSON(sectionValues.basic_info_json),
-        toJSON(sectionValues.display_json),
-        toJSON(sectionValues.video_engine_json),
-        toJSON(sectionValues.audio_json),
-        toJSON(sectionValues.smart_tv_json),
-        toJSON(sectionValues.gaming_json),
-        toJSON(sectionValues.ports_json),
-        toJSON(sectionValues.connectivity_json),
-        toJSON(sectionValues.power_json),
-        toJSON(sectionValues.physical_json),
-        toJSON(sectionValues.product_details_json),
-        toJSON(sectionValues.in_the_box_json),
-        toJSON(sectionValues.warranty_json),
-        toJSON(imagesJson),
-        toJSON(variantsJsonForRow),
-      ],
-    );
-
-    for (let i = 0; i < imagesJson.length; i++) {
-      const imageUrl = normalizeNullableText(imagesJson[i]);
-      if (!imageUrl) continue;
-      await client.query(
-        `INSERT INTO product_images (product_id, image_url, position)
-         VALUES ($1,$2,$3)`,
-        [productId, imageUrl, i + 1],
-      );
-    }
-
-    for (let i = 0; i < variantsJson.length; i++) {
-      const variant = variantsJson[i];
-      const variantRes = await client.query(
-        `
-        INSERT INTO product_variants (product_id, variant_key, attributes, base_price)
-        VALUES ($1,$2,$3::jsonb,$4)
-        RETURNING id
-        `,
-        [
-          productId,
-          variant.variant_key,
-          JSON.stringify(variant.attributes),
-          variant.base_price,
-        ],
-      );
-
-      const variantId = variantRes.rows[0].id;
-
-      // Accept both 'stores' and 'store_prices' field names
-      const storePrices = Array.isArray(variant?.stores)
-        ? variant.stores
-        : Array.isArray(variant?.store_prices)
-          ? variant.store_prices
-          : [];
-
-      for (const store of storePrices) {
-        // Normalize field names and aliases
-        const storeName =
-          store?.store_name ||
-          store?.store ||
-          store?.storeName ||
-          store?.display_store_name ||
-          null;
-
-        const price =
-          store?.price ?? store?.current_price ?? store?.sale_price ?? null;
-
-        const url =
-          store?.url ||
-          store?.link ||
-          store?.affiliate_url ||
-          store?.affiliateUrl ||
-          null;
-
-        // Skip rows without required fields
-        if (!storeName || !url) continue;
-
-        await client.query(
-          `
-          INSERT INTO variant_store_prices
-            (variant_id, store_name, price, url, offer_text, delivery_info)
-          VALUES ($1,$2,$3,$4,$5,$6)
-          ON CONFLICT (variant_id, store_name)
-          DO UPDATE SET
-            price = EXCLUDED.price,
-            url = EXCLUDED.url,
-            offer_text = EXCLUDED.offer_text,
-            delivery_info = EXCLUDED.delivery_info
-          `,
-          [
-            variantId,
-            storeName,
-            price,
-            url,
-            store?.offer_text || store?.offerText || null,
-            store?.delivery_info || store?.deliveryInfo || null,
-          ],
-        );
-      }
-
-      for (
-        let imageIndex = 0;
-        imageIndex < variant.images.length;
-        imageIndex++
-      ) {
-        const imageUrl = variant.images[imageIndex];
-        await client.query(
-          `
-          INSERT INTO product_variant_images (variant_id, image_url, position)
-          VALUES ($1,$2,$3)
-          ON CONFLICT (variant_id, image_url)
-          DO UPDATE SET position = EXCLUDED.position
-          `,
-          [variantId, imageUrl, imageIndex + 1],
-        );
-      }
-    }
-
-    await client.query(
-      `
-      INSERT INTO product_publish (product_id, is_published)
-      VALUES ($1,$2)
-      `,
-      [productId, publish],
-    );
-
     await client.query("COMMIT");
 
     return res.status(201).json({
@@ -17251,13 +17027,6 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     }
 
     const sid = findRes.rows[0].id; // internal smartphone id
-    const existingImageRes = await client.query(
-      "SELECT images FROM smartphones WHERE id = $1",
-      [sid],
-    );
-    const existingImages = Array.isArray(existingImageRes.rows[0]?.images)
-      ? existingImageRes.rows[0].images
-      : [];
 
     const n = normalizeBodyKeys(req.body || {});
     // Accept several name aliases: `name`, `product_name`, `productName`, normalized variants,
@@ -17320,11 +17089,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       parseDateForImport(req.body.launch_date),
       parseDateForImport(req.body.sale_start_date || req.body.saleStartDate),
       launchStatusOverride,
-      JSON.stringify(
-        Array.isArray(req.body.images) && req.body.images.length
-          ? req.body.images
-          : existingImages,
-      ),
+      JSON.stringify(req.body.images || []),
       JSON.stringify(req.body.colors || []),
       JSON.stringify(req.body.build_design || {}),
       JSON.stringify(req.body.display || {}),
@@ -17359,17 +17124,15 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     // Replace product_images to reflect new images array (if provided)
     try {
       if (productId) {
+        await client.query("DELETE FROM product_images WHERE product_id = $1", [
+          productId,
+        ]);
         const imgs = Array.isArray(req.body.images) ? req.body.images : [];
-        if (imgs.length) {
-          await client.query("DELETE FROM product_images WHERE product_id = $1", [
-            productId,
-          ]);
-          for (let i = 0; i < imgs.length; i++) {
-            await client.query(
-              "INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)",
-              [productId, imgs[i], i + 1],
-            );
-          }
+        for (let i = 0; i < imgs.length; i++) {
+          await client.query(
+            "INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)",
+            [productId, imgs[i], i + 1],
+          );
         }
       }
     } catch (piErr) {
@@ -17748,10 +17511,7 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 
 // Update smartphone (simplified API for ApiTester) - POST /api/smartphone/:id/update
 // Payload format similar to /api/smartphones/req but for updating existing device
-app.post(
-  ["/api/smartphone/:id/update", "/api/smartphone/:id"],
-  authenticate,
-  async (req, res) => {
+app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
   const client = await db.connect();
   const canonicalBody = normalizeSmartphonePayload(req.body || {});
   req.body = {
@@ -17795,13 +17555,6 @@ app.post(
 
     const sid = findRes.rows[0].id;
     const productId = findRes.rows[0].product_id;
-    const existingImageRes = await client.query(
-      "SELECT images FROM smartphones WHERE id = $1",
-      [sid],
-    );
-    const existingImages = Array.isArray(existingImageRes.rows[0]?.images)
-      ? existingImageRes.rows[0].images
-      : [];
     const b = mergeSmartphoneUpdateBody(req.body || {});
 
     // Prepare simplified payload fields (similar to /req endpoint)
@@ -17864,8 +17617,6 @@ app.post(
 
     const images =
       safeJSONParse(b.images_json) || safeJSONParse(b.images) || [];
-    const imagesForUpdate =
-      Array.isArray(images) && images.length ? images : existingImages;
     const colors =
       safeJSONParse(b.colors_json) || safeJSONParse(b.colors) || [];
     const build_design =
@@ -17923,7 +17674,7 @@ app.post(
       model,
       parseDateForImport(launch_date),
       launchStatusOverride,
-      JSON.stringify(imagesForUpdate),
+      JSON.stringify(images),
       JSON.stringify(colors),
       JSON.stringify(build_design),
       JSON.stringify(display),
@@ -17953,113 +17704,6 @@ app.post(
         product_name,
         productId,
       ]);
-    }
-
-    // Replace variants and their nested stores when supplied by ApiTester.
-    if (Array.isArray(b.variants)) {
-      const variantIds = [];
-      const variantIdMap = [];
-
-      for (let index = 0; index < b.variants.length; index += 1) {
-        const variant = b.variants[index] || {};
-        const ram = variant.ram || null;
-        const storage = variant.storage || variant.storage_size || null;
-        const variantKey =
-          String(variant.variant_key || `${ram || "na"}_${storage || "na"}`).trim();
-        const attributes = {
-          ...(variant.attributes || {}),
-          ...(ram ? { ram } : {}),
-          ...(storage ? { storage } : {}),
-        };
-        const result = await client.query(
-          `INSERT INTO product_variants
-             (product_id, variant_key, attributes, base_price)
-           VALUES ($1, $2, $3, $4)
-           ON CONFLICT (product_id, variant_key)
-           DO UPDATE SET attributes = EXCLUDED.attributes,
-                         base_price = EXCLUDED.base_price
-           RETURNING id`,
-          [
-            productId,
-            variantKey,
-            JSON.stringify(attributes),
-            variant.base_price ?? null,
-          ],
-        );
-        const variantId = result.rows[0].id;
-        variantIds.push(variantId);
-        variantIdMap[index] = variantId;
-      }
-
-      if (variantIds.length) {
-        await client.query(
-          "DELETE FROM product_variants WHERE product_id = $1 AND NOT (id = ANY($2::int[]))",
-          [productId, variantIds],
-        );
-      } else {
-        await client.query("DELETE FROM product_variants WHERE product_id = $1", [
-          productId,
-        ]);
-      }
-
-      const storePrices = Array.isArray(b.variant_store_prices)
-        ? b.variant_store_prices
-        : [];
-      const variantIdSet = new Set(variantIds.map((id) => Number(id)));
-      const submittedStoreIds = new Set();
-
-      for (const store of storePrices) {
-        const index = Number(store.variant_index);
-        const variantId = variantIdMap[index];
-        if (!variantId || !store.store_name) continue;
-
-        const price =
-          store.price === undefined || store.price === null || store.price === ""
-            ? null
-            : Number(store.price);
-        const parsedPrice = Number.isFinite(price) ? price : null;
-        const saleStartDate = normalizeDateOnlyInput(
-          store.sale_start_date ?? store.sale_date ?? store.saleStartDate ?? null,
-        );
-
-        const result = await client.query(
-          `INSERT INTO variant_store_prices
-             (variant_id, store_name, price, url, offer_text, sale_start_date)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (variant_id, store_name)
-           DO UPDATE SET price = EXCLUDED.price,
-                         url = EXCLUDED.url,
-                         offer_text = EXCLUDED.offer_text,
-                         sale_start_date = EXCLUDED.sale_start_date
-           RETURNING id`,
-          [
-            variantId,
-            store.store_name,
-            parsedPrice,
-            store.url || null,
-            store.offer_text || null,
-            saleStartDate,
-          ],
-        );
-        submittedStoreIds.add(Number(result.rows[0].id));
-      }
-
-      // Nested stores use replacement semantics, matching the PUT endpoint.
-      for (const variantId of variantIds) {
-        const keepIds = Array.from(submittedStoreIds);
-        if (keepIds.length && variantIdSet.has(Number(variantId))) {
-          await client.query(
-            `DELETE FROM variant_store_prices
-             WHERE variant_id = $1 AND NOT (id = ANY($2::int[]))`,
-            [variantId, keepIds],
-          );
-        } else {
-          await client.query(
-            "DELETE FROM variant_store_prices WHERE variant_id = $1",
-            [variantId],
-          );
-        }
-      }
     }
 
     // Handle published flag if provided
@@ -18116,8 +17760,7 @@ app.post(
   } finally {
     client.release();
   }
-  },
-);
+});
 
 // Delete smartphone
 app.delete(
@@ -18654,7 +18297,6 @@ app.get("/api/tvs/:id", authenticate, async (req, res) => {
 
 app.put("/api/tvs/:id", authenticate, async (req, res) => {
   const client = await db.connect();
-  const toJSON = (v) => (v === undefined ? null : JSON.stringify(v));
 
   try {
     if (req.user.role !== "admin") {
@@ -18662,136 +18304,123 @@ app.put("/api/tvs/:id", authenticate, async (req, res) => {
     }
 
     const rawId = req.params.id;
-    const pid = Number(rawId);
-    if (!rawId || rawId.trim() === "") {
+    const productId = Number(rawId);
+    if (
+      !rawId ||
+      rawId.trim() === "" ||
+      !Number.isInteger(productId) ||
+      productId <= 0
+    ) {
       return res.status(400).json({ message: "Invalid id" });
     }
 
-    const tvLookup = await db.query(
+    const tvLookup = await client.query(
       "SELECT * FROM tvs WHERE product_id = $1 LIMIT 1",
-      [pid],
+      [productId],
     );
     if (!tvLookup.rows.length) {
       return res.status(404).json({ message: "Not found" });
     }
 
     const tvRow = tvLookup.rows[0];
-    const productId = tvRow.product_id;
-
-    const payload = normalizeTvPayloadInput(req.body || {});
-    const product = toPlainObject(payload.product);
-
-    let productName = normalizeNullableText(
-      payload.product_name || payload.name || product.name,
-    );
-
-    let brandId =
-      payload.brand_id !== undefined && payload.brand_id !== null
-        ? Number(payload.brand_id)
-        : product.brand_id !== undefined && product.brand_id !== null
-          ? Number(product.brand_id)
-          : null;
-
-    if ((!Number.isInteger(brandId) || brandId <= 0) && payload.brand_name) {
-      brandId = await resolveBrandIdByName(client, payload.brand_name);
-    }
-
-    const category = hasOwn(payload, "category")
-      ? normalizeNullableText(payload.category)
-      : tvRow.category;
-    const model = hasOwn(payload, "model")
-      ? normalizeNullableText(payload.model)
-      : tvRow.model;
-
-    const sectionValues = {};
-    for (const key of TV_JSON_OBJECT_SECTIONS) {
-      sectionValues[key] = hasOwn(payload, key)
-        ? toPlainObject(payload[key])
-        : toPlainObject(tvRow[key]);
-    }
-
-    const imagesJson = hasOwn(payload, "images_json")
-      ? Array.isArray(payload.images_json)
-        ? payload.images_json
-        : []
-      : hasOwn(payload, "images")
-        ? Array.isArray(payload.images)
-          ? payload.images
-          : []
-        : Array.isArray(tvRow.images_json)
-          ? tvRow.images_json
-          : [];
-
-    const variantsJson = normalizeTvVariantsInput(
-      hasOwn(payload, "variants_json")
-        ? Array.isArray(payload.variants_json)
-          ? payload.variants_json
-          : []
-        : hasOwn(payload, "variants")
-          ? Array.isArray(payload.variants)
-            ? payload.variants
-            : []
-          : Array.isArray(tvRow.variants_json)
-            ? tvRow.variants_json
-            : [],
-    );
-    const variantsJsonForRow = variantsJson.map((variant) => ({
-      variant_key: variant.variant_key,
-      screen_size: variant.screen_size,
-      screen_size_value: variant.screen_size_value,
-      base_price: variant.base_price,
-      store_prices: variant.store_prices,
-      images: variant.images,
-      ...toPlainObject(variant.attributes),
-    }));
-
-    const publish = hasOwn(payload, "publish")
-      ? Boolean(payload.publish)
-      : hasOwn(payload, "published")
-        ? Boolean(payload.published)
-        : undefined;
-
-    const currentProduct = await db.query(
-      "SELECT name, brand_id FROM products WHERE id = $1 LIMIT 1",
+    const productLookup = await client.query(
+      `SELECT p.name, p.brand_id, b.name AS brand_name
+       FROM products p
+       LEFT JOIN brands b ON b.id = p.brand_id
+       WHERE p.id = $1
+       LIMIT 1`,
       [productId],
     );
-    const currentProductRow = currentProduct.rows[0] || {};
-    const updateProductName = productName || currentProductRow.name;
+    const currentProduct = productLookup.rows[0] || {};
+
+    const body = req.body || {};
+    const preliminary = toCanonicalTvPayload(body);
+
+    const requestedBrandId = Number(preliminary.brand_id);
     const updateBrandId =
-      Number.isInteger(brandId) && brandId > 0
-        ? brandId
-        : currentProductRow.brand_id;
+      Number.isInteger(requestedBrandId) && requestedBrandId > 0
+        ? await resolveExistingBrandId(
+            client,
+            requestedBrandId,
+            preliminary.brand_name,
+          )
+        : currentProduct.brand_id;
+
+    if (!updateBrandId) {
+      return res.status(400).json({
+        message:
+          "brand is required and must reference an existing brand using brand_id or brand_name",
+      });
+    }
+
     const officialImageDomains = (
       await client.query(
         "SELECT domain FROM official_brand_domains WHERE brand_id = $1 AND is_active = true",
         [updateBrandId],
       )
-    ).rows.map((row) =>
-      String(row.domain || "")
-        .toLowerCase()
-        .replace(/^www\./, ""),
-    );
+    ).rows
+      .map((row) =>
+        String(row.domain || "")
+          .toLowerCase()
+          .replace(/^www\./, ""),
+      )
+      .filter(Boolean);
+
+    const hasAny = (...keys) =>
+      keys.some((key) => Object.prototype.hasOwnProperty.call(body, key));
+    const currentImages = Array.isArray(tvRow.images_json)
+      ? tvRow.images_json
+      : [];
+    const currentVariants = Array.isArray(tvRow.variants_json)
+      ? tvRow.variants_json
+      : [];
+
+    const updateInput = {
+      ...preliminary,
+      product_name: preliminary.product_name || currentProduct.name,
+      brand_id: updateBrandId,
+      brand_name: preliminary.brand_name || currentProduct.brand_name || null,
+      model: preliminary.model || tvRow.model,
+      manufacturer_model: hasAny("manufacturer_model")
+        ? preliminary.manufacturer_model
+        : tvRow.manufacturer_model || tvRow.model,
+      category: hasAny("category") ? preliminary.category : tvRow.category,
+      launch_date: hasAny("launch_date") ? body.launch_date : tvRow.launch_date,
+      images_json: hasAny("images_json", "images")
+        ? preliminary.images_json
+        : currentImages,
+      variants: hasAny("variants", "variants_json")
+        ? preliminary.variants
+        : currentVariants,
+      ...Object.fromEntries(
+        TV_JSON_OBJECT_SECTIONS.map((key) => [
+          key,
+          hasAny(key) ? preliminary.sections[key] : toPlainObject(tvRow[key]),
+        ]),
+      ),
+    };
+
+    const publishProvided = hasAny("publish", "published");
+    const publish = publishProvided
+      ? Boolean(
+          Object.prototype.hasOwnProperty.call(body, "publish")
+            ? body.publish
+            : body.published,
+        )
+      : undefined;
+
+    const canonical = toCanonicalTvPayload(updateInput, {
+      imageDomains: officialImageDomains,
+    });
 
     await client.query("BEGIN");
     await persistTvUpdate(
       client,
       productId,
       {
-        product_name: updateProductName,
+        ...canonical,
         brand_id: updateBrandId,
-        brand_name: payload.brand_name,
-        model,
-        manufacturer_model: hasOwn(payload, "manufacturer_model")
-          ? normalizeNullableText(payload.manufacturer_model)
-          : tvRow.manufacturer_model || model,
-        category,
-        launch_date: hasOwn(payload, "launch_date")
-          ? parseDateForImport(payload.launch_date)
-          : tvRow.launch_date,
-        publish: publish === undefined ? false : publish,
-        images_json: imagesJson,
-        variants: variantsJson,
-        ...sectionValues,
+        publish: publish ?? false,
       },
       {
         resolveBrandId: async (_client, id) => id,
@@ -18800,186 +18429,6 @@ app.put("/api/tvs/:id", authenticate, async (req, res) => {
         imageDomains: officialImageDomains,
       },
     );
-    await client.query("COMMIT");
-    return res.json({
-      message: "TV updated",
-      product_id: productId,
-    });
-
-    await client.query("BEGIN");
-
-    if (productName || Number.isInteger(brandId)) {
-      const existingProduct = await client.query(
-        "SELECT name, brand_id FROM products WHERE id = $1 LIMIT 1",
-        [productId],
-      );
-
-      const currentProduct = existingProduct.rows[0] || {};
-      if (!productName) productName = currentProduct.name || null;
-      const brandToSave = Number.isInteger(brandId)
-        ? brandId
-        : currentProduct.brand_id;
-
-      await client.query(
-        "UPDATE products SET name = $1, brand_id = $2 WHERE id = $3",
-        [productName, brandToSave || null, productId],
-      );
-    }
-
-    await client.query(
-      `
-      UPDATE tvs SET
-        category = $1,
-        model = $2,
-        manufacturer_model = $3,
-        launch_date = $4,
-        key_specs_json = $5::jsonb,
-        basic_info_json = $6::jsonb,
-        display_json = $7::jsonb,
-        video_engine_json = $8::jsonb,
-        audio_json = $9::jsonb,
-        smart_tv_json = $10::jsonb,
-        gaming_json = $11::jsonb,
-        ports_json = $12::jsonb,
-        connectivity_json = $13::jsonb,
-        power_json = $14::jsonb,
-        physical_json = $15::jsonb,
-        product_details_json = $16::jsonb,
-        in_the_box_json = $17::jsonb,
-        warranty_json = $18::jsonb,
-        images_json = $19::jsonb,
-        variants_json = $20::jsonb
-      WHERE product_id = $21
-      `,
-      [
-        category,
-        model,
-        hasOwn(payload, "manufacturer_model")
-          ? normalizeNullableText(payload.manufacturer_model)
-          : tvRow.manufacturer_model || model,
-        hasOwn(payload, "launch_date")
-          ? parseDateForImport(payload.launch_date)
-          : tvRow.launch_date,
-        toJSON(sectionValues.key_specs_json),
-        toJSON(sectionValues.basic_info_json),
-        toJSON(sectionValues.display_json),
-        toJSON(sectionValues.video_engine_json),
-        toJSON(sectionValues.audio_json),
-        toJSON(sectionValues.smart_tv_json),
-        toJSON(sectionValues.gaming_json),
-        toJSON(sectionValues.ports_json),
-        toJSON(sectionValues.connectivity_json),
-        toJSON(sectionValues.power_json),
-        toJSON(sectionValues.physical_json),
-        toJSON(sectionValues.product_details_json),
-        toJSON(sectionValues.in_the_box_json),
-        toJSON(sectionValues.warranty_json),
-        toJSON(imagesJson),
-        toJSON(variantsJsonForRow),
-        productId,
-      ],
-    );
-
-    await client.query("DELETE FROM product_images WHERE product_id = $1", [
-      productId,
-    ]);
-    for (let i = 0; i < imagesJson.length; i++) {
-      const imageUrl = normalizeNullableText(imagesJson[i]);
-      if (!imageUrl) continue;
-      await client.query(
-        "INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)",
-        [productId, imageUrl, i + 1],
-      );
-    }
-
-    const oldVariantRes = await client.query(
-      "SELECT id FROM product_variants WHERE product_id = $1",
-      [productId],
-    );
-    for (const row of oldVariantRes.rows) {
-      await client.query(
-        "DELETE FROM variant_store_prices WHERE variant_id = $1",
-        [row.id],
-      );
-    }
-    await client.query("DELETE FROM product_variants WHERE product_id = $1", [
-      productId,
-    ]);
-
-    for (let i = 0; i < variantsJson.length; i++) {
-      const variant = variantsJson[i];
-      const variantRes = await client.query(
-        `
-        INSERT INTO product_variants (product_id, variant_key, attributes, base_price)
-        VALUES ($1,$2,$3::jsonb,$4)
-        RETURNING id
-        `,
-        [
-          productId,
-          variant.variant_key,
-          JSON.stringify(variant.attributes),
-          variant.base_price,
-        ],
-      );
-
-      const variantId = variantRes.rows[0].id;
-      for (const store of variant.store_prices) {
-        if (!store.store_name) continue;
-
-        await client.query(
-          `
-          INSERT INTO variant_store_prices
-            (variant_id, store_name, price, url, offer_text, delivery_info)
-          VALUES ($1,$2,$3,$4,$5,$6)
-          ON CONFLICT (variant_id, store_name)
-          DO UPDATE SET
-            price = EXCLUDED.price,
-            url = EXCLUDED.url,
-            offer_text = EXCLUDED.offer_text,
-            delivery_info = EXCLUDED.delivery_info
-          `,
-          [
-            variantId,
-            store.store_name,
-            store.price,
-            store.url,
-            store.offer_text,
-            store.delivery_info,
-          ],
-        );
-      }
-
-      for (
-        let imageIndex = 0;
-        imageIndex < variant.images.length;
-        imageIndex++
-      ) {
-        const imageUrl = variant.images[imageIndex];
-        await client.query(
-          `
-          INSERT INTO product_variant_images (variant_id, image_url, position)
-          VALUES ($1,$2,$3)
-          ON CONFLICT (variant_id, image_url)
-          DO UPDATE SET position = EXCLUDED.position
-          `,
-          [variantId, imageUrl, imageIndex + 1],
-        );
-      }
-    }
-
-    if (publish !== undefined) {
-      const updatePublish = await client.query(
-        "UPDATE product_publish SET is_published = $1 WHERE product_id = $2",
-        [publish, productId],
-      );
-      if (updatePublish.rowCount === 0) {
-        await client.query(
-          "INSERT INTO product_publish (product_id, is_published) VALUES ($1,$2)",
-          [productId, publish],
-        );
-      }
-    }
-
     await client.query("COMMIT");
 
     return res.json({
@@ -18994,6 +18443,7 @@ app.put("/api/tvs/:id", authenticate, async (req, res) => {
     client.release();
   }
 });
+
 /* -----------------------
   Ram/Storage/Long API
 ------------------------*/
@@ -29219,6 +28669,64 @@ app.get("/api/public/product/:id", async (req, res) => {
       });
     }
 
+    // Fetch complete TV details for direct public TV-detail fallback.
+    let tvDetails = null;
+    let tvVariants = variants;
+    if (product.product_type === "tv") {
+      const tvRes = await db.query(
+        `SELECT * FROM tvs WHERE product_id = $1 LIMIT 1`,
+        [id],
+      );
+      if (tvRes.rows.length) {
+        tvDetails = tvRes.rows[0];
+      }
+
+      const tvVariantRes = await db.query(
+        `SELECT * FROM product_variants WHERE product_id = $1 ORDER BY id ASC`,
+        [id],
+      );
+      tvVariants = [];
+      for (const variant of tvVariantRes.rows) {
+        const storesRes = await db.query(
+          "SELECT * FROM variant_store_prices WHERE variant_id = $1 ORDER BY price ASC NULLS LAST, id ASC",
+          [variant.id],
+        );
+        const imagesRes = await db.query(
+          "SELECT image_url FROM product_variant_images WHERE variant_id = $1 ORDER BY position ASC NULLS LAST, id ASC",
+          [variant.id],
+        );
+        const attributes =
+          variant.attributes && typeof variant.attributes === "object"
+            ? variant.attributes
+            : {};
+        const variantImages = imagesRes.rows
+          .map((row) => row.image_url)
+          .filter(Boolean);
+        tvVariants.push({
+          ...attributes,
+          variant_id: variant.id,
+          variant_key: variant.variant_key,
+          screen_size:
+            attributes.screen_size ||
+            attributes.size ||
+            variant.variant_key ||
+            null,
+          screen_size_value: Number.isFinite(
+            Number(attributes.screen_size_value),
+          )
+            ? Number(attributes.screen_size_value)
+            : parseFirstNumeric(
+                attributes.screen_size ||
+                  attributes.size ||
+                  variant.variant_key,
+              ),
+          base_price: variant.base_price,
+          images: variantImages,
+          store_prices: decorateStorePriceList(storesRes.rows, todayIndia),
+        });
+      }
+    }
+
     // For smartphones, fetch smartphone details
     let smartphoneDetails = null;
     if (product.product_type === "smartphone") {
@@ -29249,7 +28757,8 @@ app.get("/api/public/product/:id", async (req, res) => {
       brand_logo: product.brand_logo || null,
       brand_website: product.brand_website || null,
       images: imgRes.rows.map((r) => r.image_url),
-      variants,
+      variants: product.product_type === "tv" ? tvVariants : variants,
+      ...(product.product_type === "tv" ? tvDetails || {} : {}),
       ...(product.product_type === "smartphone"
         ? {
             hook_score: score?.hook_score ?? null,
@@ -29308,7 +28817,9 @@ app.get("/api/public/product/:id", async (req, res) => {
     const publicResponse =
       product.product_type === "smartphone"
         ? { ...toPublicSmartphoneResponse(scoredResponse), aiSummary }
-        : scoredResponse;
+        : product.product_type === "tv"
+          ? toPublicTvResponse(scoredResponse)
+          : scoredResponse;
 
     res.json(publicResponse);
   } catch (err) {
@@ -30133,7 +29644,7 @@ async function start() {
       apiKeyConfigured: Boolean(geminiConfig?.configured),
     });
 
-    if (process.env.TV_GENERATION_CRON_ENABLED !== "false") {
+    if (TV_GENERATION_CRON_ENABLED) {
       const defaultMs = 12 * 60 * 60 * 1000;
       const intervalRaw = Number(process.env.TV_GENERATION_CRON_INTERVAL_MS);
       const intervalMs = Number.isFinite(intervalRaw)
