@@ -9,6 +9,18 @@ const normalizeHost = (value) =>
     .split("/")[0];
 const hostMatches = (host, domains = []) =>
   domains.some((domain) => host === domain || host.endsWith(`.${domain}`));
+const isOfficialImageCdn = (url, brandName) => {
+  try {
+    const host = normalizeHost(new URL(url).hostname);
+    return (
+      String(brandName || "").toLowerCase().replace(/[^a-z0-9]/g, "") ===
+        "xiaomi" &&
+      hostMatches(host, ["appmifile.com"])
+    );
+  } catch {
+    return false;
+  }
+};
 
 const resolveOfficialDomains = (brandName) => {
   const key = String(brandName || "")
@@ -48,12 +60,15 @@ const findOfficialImageCandidate = (candidates = [], brandName, model) => {
             candidate?.sourceUrl,
             candidate?.page_url,
             candidate?.pageUrl,
+            candidate?.product_name,
+            candidate?.productName,
             imageUrl,
           ]
             .filter(Boolean)
             .join(" "),
         );
         return (
+          isOfficialImageCdn(imageUrl, brandName) ||
           identityText.includes(modelIdentity) ||
           identityText.replace(/\s+/g, "").includes(modelCompact)
         );
@@ -101,7 +116,13 @@ const verifyOfficialImageSourcePage = async (
   { brandName, model, fetchImpl = globalThis.fetch } = {},
 ) => {
   const pageUrl = candidate?.source_page_url || candidate?.sourcePageUrl;
-  if (!pageUrl) throw new Error("Official image source page is required");
+  if (!pageUrl) {
+    const imageUrl = candidate?.image_url || candidate?.imageUri || candidate?.url;
+    if (isOfficialImageCdn(imageUrl, brandName)) {
+      return { pageUrl: null, finalHost: normalizeHost(new URL(imageUrl).hostname), mode: "official_cdn" };
+    }
+    throw new Error("Official image source page is required");
+  }
   const domains = resolveOfficialDomains(brandName);
   const parsed = new URL(pageUrl);
   if (!hostMatches(normalizeHost(parsed.hostname), domains))

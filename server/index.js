@@ -39,7 +39,11 @@ const {
   sendCareerHrEmail,
   sendCareerOfferEmail,
 } = require("./utils/mailer");
-const { authenticateCustomer, authenticate } = require("./middleware/auth");
+const {
+  authenticateCustomer,
+  authenticate,
+  requireAdminAccess: requireAdminMiddleware,
+} = require("./middleware/auth");
 const {
   recomputeProductDynamicScoreSmartphones,
   recomputeProductDynamicScoreLaptops,
@@ -2388,9 +2392,10 @@ const stripPublicTvBusinessFields = (value) => {
 
 const toPublicTvResponse = (value) => {
   const withoutBusinessFields = stripPublicTvBusinessFields(value);
-  const resolvedSpecScore = resolvePublicSmartphoneSpecScore(
-    withoutBusinessFields,
-    { allowLegacySpecScore: true },
+  const resolvedSpecScore = toPublicAlgorithmScore(
+    withoutBusinessFields.spec_score_v2 ?? withoutBusinessFields.spec_score,
+    withoutBusinessFields.spec_score_v2_source ??
+      withoutBusinessFields.spec_score_source,
   );
   const publicRow = stripPublicSpecScoreDecorations(withoutBusinessFields);
 
@@ -4130,6 +4135,31 @@ const applySpecScoreToRow = (type, row, profiles) => {
       cameraScoreV2Raw != null
         ? mapScoreToDisplayBand(cameraScoreV2Raw, 80, 99)
         : null;
+  } else if (normalizedType === "tv") {
+    const v2 = computeTvRawSpecScoreV2(source);
+    specScoreV2 = toFiniteScore100(v2.rawScore);
+    specScoreV2Raw = specScoreV2;
+    specScoreV2Source = v2.source;
+    overallScoreV2 = specScoreV2;
+    overallScoreV2Source =
+      specScoreV2 != null ? "model_v2_raw" : "model_v2_unavailable";
+
+    specScore = providedSpecScore ?? specScoreV2;
+    specScoreSource =
+      providedSpecScore != null ? "provided" : specScoreV2Source;
+    overallScore = providedOverallScore ?? specScore;
+    overallScoreSource =
+      providedOverallScore != null
+        ? "provided"
+        : specScore != null
+          ? "derived_from_spec_score"
+          : "model_v2_unavailable";
+
+    specScorePrice = toFiniteNumberOrNull(v2.price);
+    specScorePriceBand = v2.priceBand || "unknown";
+    specFeatureCoverage = toFiniteNumberOrNull(v2.featureCoverage);
+    specScoreV2Display8098 = mapScoreToDisplayBand(specScoreV2);
+    overallScoreV2Display8098 = specScoreV2Display8098;
   }
 
   const cameraWithScore =
@@ -5150,6 +5180,42 @@ async function runMigrations() {
     await safeQuery(
       `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS connectivity JSONB;`,
     );
+
+    await safeQuery(`
+      CREATE TABLE IF NOT EXISTS official_brand_domains (
+        id SERIAL PRIMARY KEY,
+        brand_id INT NOT NULL REFERENCES brands(id) ON DELETE CASCADE,
+        domain TEXT NOT NULL,
+        domain_type TEXT NOT NULL DEFAULT 'website',
+        is_active BOOLEAN NOT NULL DEFAULT true,
+        UNIQUE (brand_id, domain)
+      );
+    `);
+    await safeQuery(`
+      INSERT INTO official_brand_domains (brand_id, domain, domain_type)
+      SELECT b.id, seed.domain, seed.domain_type
+      FROM brands b
+      CROSS JOIN (VALUES
+        ('samsung.com', 'website'), ('lg.com', 'website'),
+        ('sony.com', 'website'), ('sony.co.in', 'website'),
+        ('mi.com', 'website'), ('appmifile.com', 'cdn'),
+        ('oneplus.com', 'website'), ('oneplus.in', 'website'),
+        ('tcl.com', 'website'), ('hisense.com', 'website'),
+        ('hisense-india.com', 'website'), ('panasonic.com', 'website')
+      ) AS seed(domain, domain_type)
+      WHERE LOWER(REGEXP_REPLACE(b.name, '[^a-zA-Z0-9]', '', 'g')) =
+        CASE
+          WHEN seed.domain LIKE 'samsung%' THEN 'samsung'
+          WHEN seed.domain LIKE 'lg.%' THEN 'lg'
+          WHEN seed.domain LIKE 'sony%' THEN 'sony'
+          WHEN seed.domain IN ('mi.com', 'appmifile.com') THEN 'xiaomi'
+          WHEN seed.domain LIKE 'oneplus%' THEN 'oneplus'
+          WHEN seed.domain LIKE 'tcl%' THEN 'tcl'
+          WHEN seed.domain LIKE 'hisense%' THEN 'hisense'
+          WHEN seed.domain LIKE 'panasonic%' THEN 'panasonic'
+        END
+      ON CONFLICT (brand_id, domain) DO NOTHING;
+    `);
     await safeQuery(
       `ALTER TABLE smartphones ADD COLUMN IF NOT EXISTS network JSONB;`,
     );
@@ -5256,6 +5322,8 @@ async function runMigrations() {
         product_id INT PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
         category TEXT,
         model TEXT,
+        manufacturer_model TEXT,
+        launch_date DATE,
         key_specs_json JSONB,
         basic_info_json JSONB,
         display_json JSONB,
@@ -5275,6 +5343,12 @@ async function runMigrations() {
         created_at TIMESTAMP DEFAULT now()
       );
     `);
+    await safeQuery(
+      `ALTER TABLE tvs ADD COLUMN IF NOT EXISTS launch_date DATE;`,
+    );
+    await safeQuery(
+      `ALTER TABLE tvs ADD COLUMN IF NOT EXISTS manufacturer_model TEXT;`,
+    );
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS tv_generation_usage (
         usage_date DATE PRIMARY KEY,
@@ -14966,9 +15040,8 @@ app.post("/api/smartphones/finder", async (req, res) => {
         ) AS images,
         COALESCE(
           (
-            SELECT MIN(COALESCE(sp.price, v.base_price))
+            SELECT MIN(v.base_price)
             FROM product_variants v
-            LEFT JOIN variant_store_prices sp ON sp.variant_id = v.id
             WHERE v.product_id = p.id
           ),
           0
@@ -15025,7 +15098,7 @@ app.post("/api/smartphones/finder", async (req, res) => {
       const ramOptions = normalizeVariantRamValues(variants);
       const expectedPrice =
         Number(String(row?.expected_price ?? 0).replace(/[^\d.]/g, "")) || 0;
-      const numericPrice = Number(row?.numeric_price || 0) || expectedPrice;
+      const numericPrice = Number(row?.numeric_price || 0);
       const batterySource = row?.battery || {};
       const batteryMah =
         Number(
@@ -16468,6 +16541,16 @@ app.post("/api/tvs", authenticate, async (req, res) => {
           "brand is required and must reference an existing brand using brand_id or brand_name",
       });
     }
+    const officialImageDomains = (
+      await client.query(
+        "SELECT domain FROM official_brand_domains WHERE brand_id = $1 AND is_active = true",
+        [brandId],
+      )
+    ).rows.map((row) =>
+      String(row.domain || "")
+        .toLowerCase()
+        .replace(/^www\./, ""),
+    );
 
     const imagesJson = Array.isArray(payload.images_json)
       ? payload.images_json
@@ -16492,6 +16575,32 @@ app.post("/api/tvs", authenticate, async (req, res) => {
     }));
 
     await client.query("BEGIN");
+    const { productId: catalogProductId } = await createTvCatalogRecord(
+      client,
+      {
+        ...payload,
+        product_name: productName,
+        brand_id: brandId,
+        brand_name: brandName,
+        model,
+        category,
+        images_json: imagesJson,
+        variants: variantsJson,
+        publish,
+      },
+      {
+        resolveBrandId: async (_client, id) => id,
+        parseDate: parseDateForImport,
+        imageDomains: officialImageDomains,
+      },
+    );
+    await client.query("COMMIT");
+    return res.status(201).json({
+      message: "TV created successfully",
+      product_id: catalogProductId,
+    });
+
+    await client.query("BEGIN");
 
     const productRes = await client.query(
       `
@@ -16514,6 +16623,8 @@ app.post("/api/tvs", authenticate, async (req, res) => {
         product_id,
         category,
         model,
+        manufacturer_model,
+        launch_date,
         key_specs_json,
         basic_info_json,
         display_json,
@@ -16532,16 +16643,18 @@ app.post("/api/tvs", authenticate, async (req, res) => {
         variants_json
       )
       VALUES (
-        $1,$2,$3,
-        $4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,
-        $11::jsonb,$12::jsonb,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17::jsonb,
-        $18::jsonb,$19::jsonb
+        $1,$2,$3,$4,$5,
+        $6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12::jsonb,
+        $13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17::jsonb,$18::jsonb,$19::jsonb,
+        $20::jsonb,$21::jsonb
       )
       `,
       [
         productId,
         category,
         model,
+        normalizeNullableText(payload.manufacturer_model || model),
+        parseDateForImport(payload.launch_date),
         toJSON(sectionValues.key_specs_json),
         toJSON(sectionValues.basic_info_json),
         toJSON(sectionValues.display_json),
@@ -17138,6 +17251,13 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     }
 
     const sid = findRes.rows[0].id; // internal smartphone id
+    const existingImageRes = await client.query(
+      "SELECT images FROM smartphones WHERE id = $1",
+      [sid],
+    );
+    const existingImages = Array.isArray(existingImageRes.rows[0]?.images)
+      ? existingImageRes.rows[0].images
+      : [];
 
     const n = normalizeBodyKeys(req.body || {});
     // Accept several name aliases: `name`, `product_name`, `productName`, normalized variants,
@@ -17200,7 +17320,11 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
       parseDateForImport(req.body.launch_date),
       parseDateForImport(req.body.sale_start_date || req.body.saleStartDate),
       launchStatusOverride,
-      JSON.stringify(req.body.images || []),
+      JSON.stringify(
+        Array.isArray(req.body.images) && req.body.images.length
+          ? req.body.images
+          : existingImages,
+      ),
       JSON.stringify(req.body.colors || []),
       JSON.stringify(req.body.build_design || {}),
       JSON.stringify(req.body.display || {}),
@@ -17235,15 +17359,17 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
     // Replace product_images to reflect new images array (if provided)
     try {
       if (productId) {
-        await client.query("DELETE FROM product_images WHERE product_id = $1", [
-          productId,
-        ]);
         const imgs = Array.isArray(req.body.images) ? req.body.images : [];
-        for (let i = 0; i < imgs.length; i++) {
-          await client.query(
-            "INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)",
-            [productId, imgs[i], i + 1],
-          );
+        if (imgs.length) {
+          await client.query("DELETE FROM product_images WHERE product_id = $1", [
+            productId,
+          ]);
+          for (let i = 0; i < imgs.length; i++) {
+            await client.query(
+              "INSERT INTO product_images (product_id, image_url, position) VALUES ($1,$2,$3)",
+              [productId, imgs[i], i + 1],
+            );
+          }
         }
       }
     } catch (piErr) {
@@ -17622,7 +17748,10 @@ app.put("/api/smartphone/:id", authenticate, async (req, res) => {
 
 // Update smartphone (simplified API for ApiTester) - POST /api/smartphone/:id/update
 // Payload format similar to /api/smartphones/req but for updating existing device
-app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
+app.post(
+  ["/api/smartphone/:id/update", "/api/smartphone/:id"],
+  authenticate,
+  async (req, res) => {
   const client = await db.connect();
   const canonicalBody = normalizeSmartphonePayload(req.body || {});
   req.body = {
@@ -17666,6 +17795,13 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
 
     const sid = findRes.rows[0].id;
     const productId = findRes.rows[0].product_id;
+    const existingImageRes = await client.query(
+      "SELECT images FROM smartphones WHERE id = $1",
+      [sid],
+    );
+    const existingImages = Array.isArray(existingImageRes.rows[0]?.images)
+      ? existingImageRes.rows[0].images
+      : [];
     const b = mergeSmartphoneUpdateBody(req.body || {});
 
     // Prepare simplified payload fields (similar to /req endpoint)
@@ -17728,6 +17864,8 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
 
     const images =
       safeJSONParse(b.images_json) || safeJSONParse(b.images) || [];
+    const imagesForUpdate =
+      Array.isArray(images) && images.length ? images : existingImages;
     const colors =
       safeJSONParse(b.colors_json) || safeJSONParse(b.colors) || [];
     const build_design =
@@ -17785,7 +17923,7 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
       model,
       parseDateForImport(launch_date),
       launchStatusOverride,
-      JSON.stringify(images),
+      JSON.stringify(imagesForUpdate),
       JSON.stringify(colors),
       JSON.stringify(build_design),
       JSON.stringify(display),
@@ -17815,6 +17953,113 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
         product_name,
         productId,
       ]);
+    }
+
+    // Replace variants and their nested stores when supplied by ApiTester.
+    if (Array.isArray(b.variants)) {
+      const variantIds = [];
+      const variantIdMap = [];
+
+      for (let index = 0; index < b.variants.length; index += 1) {
+        const variant = b.variants[index] || {};
+        const ram = variant.ram || null;
+        const storage = variant.storage || variant.storage_size || null;
+        const variantKey =
+          String(variant.variant_key || `${ram || "na"}_${storage || "na"}`).trim();
+        const attributes = {
+          ...(variant.attributes || {}),
+          ...(ram ? { ram } : {}),
+          ...(storage ? { storage } : {}),
+        };
+        const result = await client.query(
+          `INSERT INTO product_variants
+             (product_id, variant_key, attributes, base_price)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (product_id, variant_key)
+           DO UPDATE SET attributes = EXCLUDED.attributes,
+                         base_price = EXCLUDED.base_price
+           RETURNING id`,
+          [
+            productId,
+            variantKey,
+            JSON.stringify(attributes),
+            variant.base_price ?? null,
+          ],
+        );
+        const variantId = result.rows[0].id;
+        variantIds.push(variantId);
+        variantIdMap[index] = variantId;
+      }
+
+      if (variantIds.length) {
+        await client.query(
+          "DELETE FROM product_variants WHERE product_id = $1 AND NOT (id = ANY($2::int[]))",
+          [productId, variantIds],
+        );
+      } else {
+        await client.query("DELETE FROM product_variants WHERE product_id = $1", [
+          productId,
+        ]);
+      }
+
+      const storePrices = Array.isArray(b.variant_store_prices)
+        ? b.variant_store_prices
+        : [];
+      const variantIdSet = new Set(variantIds.map((id) => Number(id)));
+      const submittedStoreIds = new Set();
+
+      for (const store of storePrices) {
+        const index = Number(store.variant_index);
+        const variantId = variantIdMap[index];
+        if (!variantId || !store.store_name) continue;
+
+        const price =
+          store.price === undefined || store.price === null || store.price === ""
+            ? null
+            : Number(store.price);
+        const parsedPrice = Number.isFinite(price) ? price : null;
+        const saleStartDate = normalizeDateOnlyInput(
+          store.sale_start_date ?? store.sale_date ?? store.saleStartDate ?? null,
+        );
+
+        const result = await client.query(
+          `INSERT INTO variant_store_prices
+             (variant_id, store_name, price, url, offer_text, sale_start_date)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (variant_id, store_name)
+           DO UPDATE SET price = EXCLUDED.price,
+                         url = EXCLUDED.url,
+                         offer_text = EXCLUDED.offer_text,
+                         sale_start_date = EXCLUDED.sale_start_date
+           RETURNING id`,
+          [
+            variantId,
+            store.store_name,
+            parsedPrice,
+            store.url || null,
+            store.offer_text || null,
+            saleStartDate,
+          ],
+        );
+        submittedStoreIds.add(Number(result.rows[0].id));
+      }
+
+      // Nested stores use replacement semantics, matching the PUT endpoint.
+      for (const variantId of variantIds) {
+        const keepIds = Array.from(submittedStoreIds);
+        if (keepIds.length && variantIdSet.has(Number(variantId))) {
+          await client.query(
+            `DELETE FROM variant_store_prices
+             WHERE variant_id = $1 AND NOT (id = ANY($2::int[]))`,
+            [variantId, keepIds],
+          );
+        } else {
+          await client.query(
+            "DELETE FROM variant_store_prices WHERE variant_id = $1",
+            [variantId],
+          );
+        }
+      }
     }
 
     // Handle published flag if provided
@@ -17871,7 +18116,8 @@ app.post("/api/smartphone/:id/update", authenticate, async (req, res) => {
   } finally {
     client.release();
   }
-});
+  },
+);
 
 // Delete smartphone
 app.delete(
@@ -18505,6 +18751,61 @@ app.put("/api/tvs/:id", authenticate, async (req, res) => {
         ? Boolean(payload.published)
         : undefined;
 
+    const currentProduct = await db.query(
+      "SELECT name, brand_id FROM products WHERE id = $1 LIMIT 1",
+      [productId],
+    );
+    const currentProductRow = currentProduct.rows[0] || {};
+    const updateProductName = productName || currentProductRow.name;
+    const updateBrandId =
+      Number.isInteger(brandId) && brandId > 0
+        ? brandId
+        : currentProductRow.brand_id;
+    const officialImageDomains = (
+      await client.query(
+        "SELECT domain FROM official_brand_domains WHERE brand_id = $1 AND is_active = true",
+        [updateBrandId],
+      )
+    ).rows.map((row) =>
+      String(row.domain || "")
+        .toLowerCase()
+        .replace(/^www\./, ""),
+    );
+
+    await client.query("BEGIN");
+    await persistTvUpdate(
+      client,
+      productId,
+      {
+        product_name: updateProductName,
+        brand_id: updateBrandId,
+        brand_name: payload.brand_name,
+        model,
+        manufacturer_model: hasOwn(payload, "manufacturer_model")
+          ? normalizeNullableText(payload.manufacturer_model)
+          : tvRow.manufacturer_model || model,
+        category,
+        launch_date: hasOwn(payload, "launch_date")
+          ? parseDateForImport(payload.launch_date)
+          : tvRow.launch_date,
+        publish: publish === undefined ? false : publish,
+        images_json: imagesJson,
+        variants: variantsJson,
+        ...sectionValues,
+      },
+      {
+        resolveBrandId: async (_client, id) => id,
+        parseDate: parseDateForImport,
+        publish,
+        imageDomains: officialImageDomains,
+      },
+    );
+    await client.query("COMMIT");
+    return res.json({
+      message: "TV updated",
+      product_id: productId,
+    });
+
     await client.query("BEGIN");
 
     if (productName || Number.isInteger(brandId)) {
@@ -18530,27 +18831,35 @@ app.put("/api/tvs/:id", authenticate, async (req, res) => {
       UPDATE tvs SET
         category = $1,
         model = $2,
-        key_specs_json = $3::jsonb,
-        basic_info_json = $4::jsonb,
-        display_json = $5::jsonb,
-        video_engine_json = $6::jsonb,
-        audio_json = $7::jsonb,
-        smart_tv_json = $8::jsonb,
-        gaming_json = $9::jsonb,
-        ports_json = $10::jsonb,
-        connectivity_json = $11::jsonb,
-        power_json = $12::jsonb,
-        physical_json = $13::jsonb,
-        product_details_json = $14::jsonb,
-        in_the_box_json = $15::jsonb,
-        warranty_json = $16::jsonb,
-        images_json = $17::jsonb,
-        variants_json = $18::jsonb
-      WHERE product_id = $19
+        manufacturer_model = $3,
+        launch_date = $4,
+        key_specs_json = $5::jsonb,
+        basic_info_json = $6::jsonb,
+        display_json = $7::jsonb,
+        video_engine_json = $8::jsonb,
+        audio_json = $9::jsonb,
+        smart_tv_json = $10::jsonb,
+        gaming_json = $11::jsonb,
+        ports_json = $12::jsonb,
+        connectivity_json = $13::jsonb,
+        power_json = $14::jsonb,
+        physical_json = $15::jsonb,
+        product_details_json = $16::jsonb,
+        in_the_box_json = $17::jsonb,
+        warranty_json = $18::jsonb,
+        images_json = $19::jsonb,
+        variants_json = $20::jsonb
+      WHERE product_id = $21
       `,
       [
         category,
         model,
+        hasOwn(payload, "manufacturer_model")
+          ? normalizeNullableText(payload.manufacturer_model)
+          : tvRow.manufacturer_model || model,
+        hasOwn(payload, "launch_date")
+          ? parseDateForImport(payload.launch_date)
+          : tvRow.launch_date,
         toJSON(sectionValues.key_specs_json),
         toJSON(sectionValues.basic_info_json),
         toJSON(sectionValues.display_json),
@@ -29429,12 +29738,14 @@ app.delete(
 
 const importSmartphonesRouter = require("./routes/importSmartphones");
 const importLaptopsRouter = require("./routes/importLaptop");
+const importTvsRouter = require("./routes/importTvs");
 const smartphonesReqRouter = require("./routes/smartphonesReq");
 app.use("/api/import", authenticate, importSmartphonesRouter);
 app.use("/api/import", authenticate, importLaptopsRouter);
+app.use("/api/import", authenticate, requireAdminMiddleware, importTvsRouter);
 app.use("/api/smartphones", authenticate, smartphonesReqRouter);
 
-const persistGeneratedTv = async (payload) => {
+const persistGeneratedTv = async (payload, { maxSuccessfulTvs = 5 } = {}) => {
   const client = await db.connect();
   const toJSON = (value) =>
     value === undefined ? null : JSON.stringify(value);
@@ -29547,7 +29858,7 @@ const persistGeneratedTv = async (payload) => {
       "INSERT INTO product_publish (product_id, is_published) VALUES ($1, false)",
       [productId],
     );
-    const quota = await recordSuccessfulTv(client);
+    const quota = await recordSuccessfulTv(client, { maxSuccessfulTvs });
     await client.query("COMMIT");
     return { product_id: productId, quota };
   } catch (error) {
@@ -29555,6 +29866,114 @@ const persistGeneratedTv = async (payload) => {
     throw error;
   } finally {
     client.release();
+  }
+};
+
+let automaticTvGenerationRunning = false;
+
+const runAutomaticTvGeneration = async () => {
+  if (automaticTvGenerationRunning) {
+    return { skipped: true, reason: "previous generation still running" };
+  }
+
+  automaticTvGenerationRunning = true;
+  const lockKey = 740219;
+  const maxGeminiCalls = Math.max(
+    1,
+    Number(process.env.TV_GENERATION_MAX_GEMINI_CALLS) || 12,
+  );
+  const maxSuccessfulTvs = Math.max(
+    1,
+    Number(process.env.TV_GENERATION_MAX_SUCCESSFUL_TVS) || 5,
+  );
+  let lockClient = null;
+  let locked = false;
+
+  try {
+    lockClient = await db.connect();
+    await lockClient.query("BEGIN");
+    const lockResult = await lockClient.query(
+      "SELECT pg_try_advisory_xact_lock($1) AS locked",
+      [lockKey],
+    );
+    locked = Boolean(lockResult.rows[0]?.locked);
+    if (!locked) {
+      return { skipped: true, reason: "another server is generating a TV" };
+    }
+
+    const usageResult = await db.query(
+      `SELECT gemini_calls, successful_tvs
+       FROM tv_generation_usage
+       WHERE usage_date = $1::date
+       LIMIT 1`,
+      [dateKey()],
+    );
+    const usage = usageResult.rows[0];
+    if (usage?.gemini_calls >= maxGeminiCalls) {
+      return { skipped: true, reason: "daily Gemini call limit reached" };
+    }
+    if (usage?.successful_tvs >= maxSuccessfulTvs) {
+      return { skipped: true, reason: "daily successful TV limit reached" };
+    }
+
+    const result = await generateTvDraft({
+      db,
+      generateContent,
+      verifyEvidence: verifyTvSourceEvidence,
+      reserveCall: () => reserveTvGenerationCall(db, { maxGeminiCalls }),
+      identity: null,
+    });
+
+    if (result.duplicate) {
+      console.info("Automatic TV generation skipped: duplicate", {
+        product_id: result.duplicate.product_id,
+        model: result.identity?.model,
+      });
+      return { skipped: true, reason: "duplicate", identity: result.identity };
+    }
+    if (result.validation_errors?.length) {
+      throw new Error(
+        `Generated TV draft failed validation: ${result.validation_errors.join("; ")}`,
+      );
+    }
+
+    const imageResult = await processOfficialTvImage({
+      candidates: result.draft.image_candidates,
+      brandName: result.identity.brandName,
+      model: result.identity.model,
+    });
+    if (imageResult.status !== "uploaded") {
+      throw new Error(
+        `Official TV image unavailable: ${imageResult.reason || imageResult.status}`,
+      );
+    }
+
+    result.draft.images_json = imageResult.images_json;
+    const saved = await persistGeneratedTv(result.draft, {
+      maxSuccessfulTvs,
+    });
+    const completed = {
+      ok: true,
+      product_id: saved.product_id,
+      model: result.identity.model,
+      quota: saved.quota,
+    };
+    console.info("Automatic TV generation completed:", completed);
+    return completed;
+  } catch (error) {
+    console.error("Automatic TV generation failed:", {
+      message: error.message,
+      code: error.code,
+    });
+    return { ok: false, error: error.message, code: error.code };
+  } finally {
+    if (lockClient) {
+      await lockClient.query("ROLLBACK").catch((error) => {
+        console.error("Automatic TV generation lock release failed:", error);
+      });
+      lockClient.release();
+    }
+    automaticTvGenerationRunning = false;
   }
 };
 
@@ -29713,6 +30132,31 @@ async function start() {
       model: geminiConfig?.model || "gemini-3.6-flash",
       apiKeyConfigured: Boolean(geminiConfig?.configured),
     });
+
+    if (process.env.TV_GENERATION_CRON_ENABLED !== "false") {
+      const defaultMs = 12 * 60 * 60 * 1000;
+      const intervalRaw = Number(process.env.TV_GENERATION_CRON_INTERVAL_MS);
+      const intervalMs = Number.isFinite(intervalRaw)
+        ? Math.max(15 * 60 * 1000, Math.floor(intervalRaw))
+        : defaultMs;
+
+      void runAutomaticTvGeneration();
+      const timer = setInterval(() => {
+        void runAutomaticTvGeneration();
+      }, intervalMs);
+      if (typeof timer.unref === "function") timer.unref();
+      console.log("Automatic TV generation cron enabled:", {
+        intervalMs,
+        maxGeminiCalls: Math.max(
+          1,
+          Number(process.env.TV_GENERATION_MAX_GEMINI_CALLS) || 12,
+        ),
+        maxSuccessfulTvs: Math.max(
+          1,
+          Number(process.env.TV_GENERATION_MAX_SUCCESSFUL_TVS) || 5,
+        ),
+      });
+    }
 
     const aiSummaryIntervalMs = 15 * 60 * 1000;
     void runAutomaticAiSummarySweep().catch((error) => {

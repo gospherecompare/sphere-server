@@ -32,7 +32,7 @@ const reserveTvGenerationCall = async (
 
 const recordSuccessfulTv = async (
   db,
-  { date = new Date(), maxSuccessfulTvs = 8 } = {},
+  { date = new Date(), maxSuccessfulTvs = 5 } = {},
 ) => {
   const result = await db.query(
     `UPDATE tv_generation_usage

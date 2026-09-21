@@ -4,7 +4,7 @@ const OFFICIAL_DOMAINS = {
   samsung: ["samsung.com", "samsung.com/in"],
   lg: ["lg.com", "lg.com/in"],
   sony: ["sony.com", "sony.co.in"],
-  xiaomi: ["mi.com", "mi.com/in"],
+  xiaomi: ["mi.com", "mi.com/in", "appmifile.com"],
   oneplus: ["oneplus.com", "oneplus.in"],
   tcl: ["tcl.com", "tcl.com/in"],
   hisense: ["hisense.com", "hisense-india.com"],

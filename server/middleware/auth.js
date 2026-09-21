@@ -37,4 +37,11 @@ function authenticate(req, res, next) {
   }
 }
 
-module.exports = { authenticateCustomer, authenticate };
+function requireAdminAccess(req, res, next) {
+  if (req.user?.role !== "admin" && req.user?.role !== "ceo") {
+    return res.status(403).json({ message: "Admin access required" });
+  }
+  next();
+}
+
+module.exports = { authenticateCustomer, authenticate, requireAdminAccess };

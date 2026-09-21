@@ -67,37 +67,20 @@ const imageCandidateSchema = {
 };
 
 const TV_GENERATION_RESPONSE_FORMAT = {
-  type: "json_schema",
-  name: "mobilesx_tv_generation",
-  schema: {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      product_name: { type: "string" },
-      brand_name: { type: "string" },
-      category: { type: "string" },
-      model: { type: "string" },
-      publish: { type: "boolean" },
-      source_evidence: { type: "array", items: sourceEvidenceSchema },
-      conflicts: { type: "array", items: conflictSchema },
-      image_candidates: { type: "array", items: imageCandidateSchema },
-      ...Object.fromEntries(
-        TV_SECTIONS.map((key) => [key, { type: "object" }]),
-      ),
-      variants_json: { type: "array", items: { type: "object" } },
-    },
-    required: [
-      "product_name",
-      "brand_name",
-      "category",
-      "model",
-      "publish",
-      "source_evidence",
-      "conflicts",
-      "variants_json",
-    ],
-  },
+  type: "object",
 };
+
+const SUPPORTED_TV_BRANDS = [
+  "Samsung",
+  "LG",
+  "Sony",
+  "Xiaomi",
+  "OnePlus",
+  "TCL",
+  "Hisense",
+  "Panasonic",
+  "Vu",
+];
 
 const buildTvGenerationPrompt = ({
   productName,
@@ -132,6 +115,21 @@ Source rules:
 13. Return image_candidates from official manufacturer domains only; do not invent image URLs. Each candidate must include image_url, source_page_url, title, and model for the exact requested TV.
 
 The JSON sections must match the existing MobilesX tvs table fields. Use variants_json as an array of objects containing variant_key, screen_size, screen_size_value, base_price, images, and store_prices where known.
+`;
+
+const buildAutomaticTvGenerationPrompt = () => `
+You are the MobilesX TV data ingestion engine.
+
+Find one currently relevant TV model sold or announced in India that is not already in the MobilesX catalog.
+Choose exactly one manufacturer from this allowed list: ${SUPPORTED_TV_BRANDS.join(", ")}.
+In the same response, research that exact TV and create its complete factual specification draft.
+
+${buildTvGenerationPrompt({
+  productName: "the discovered TV",
+  brandName: "the discovered brand",
+  model: "the discovered exact model number",
+  screenSizes: [],
+})}
 `;
 
 const parseJsonOutput = (text) => {
@@ -260,15 +258,18 @@ const generateTvDraft = async ({
   reserveCall,
   identity,
 }) => {
-  const duplicate = await findExistingTv(db, identity);
-  if (duplicate)
+  const duplicate = identity ? await findExistingTv(db, identity) : null;
+  if (duplicate) {
     return { duplicate, draft: null, usage: { gemini_called: false } };
+  }
   if (reserveCall) await reserveCall();
 
   const response = await generateContent({
     systemInstruction:
       "Return only a factual JSON object. Never invent unavailable TV specifications. Use Google Search grounding and cite the sources consulted in source_evidence.",
-    prompt: buildTvGenerationPrompt(identity),
+    prompt: identity
+      ? buildTvGenerationPrompt(identity)
+      : buildAutomaticTvGenerationPrompt(),
     requestId: `tv-generation-${Date.now()}`,
     tools: [
       { type: "google_search", search_types: ["web_search", "image_search"] },
@@ -277,11 +278,33 @@ const generateTvDraft = async ({
   });
   const draft = normalizeGeneratedTv(
     parseJsonOutput(response.summary),
-    identity,
+    identity || {},
   );
+  const resolvedIdentity = {
+    productName: draft.product_name,
+    brandName: draft.brand_name,
+    model: draft.model,
+    screenSizes: draft.variants_json
+      .map((variant) => normalizeIdentityValue(variant?.screen_size))
+      .filter(Boolean),
+  };
+  const generatedDuplicate = identity
+    ? null
+    : await findExistingTv(db, resolvedIdentity);
+  if (generatedDuplicate) {
+    return {
+      duplicate: generatedDuplicate,
+      draft: null,
+      identity: resolvedIdentity,
+      usage: { gemini_called: true },
+    };
+  }
   const validationErrors = validateGeneratedTv(draft);
   const sourceVerification = verifyEvidence
-    ? await verifyEvidence({ evidence: draft.source_evidence, identity })
+    ? await verifyEvidence({
+        evidence: draft.source_evidence,
+        identity: identity || resolvedIdentity,
+      })
     : null;
   if (sourceVerification && !sourceVerification.ok) {
     validationErrors.push(...sourceVerification.errors);
@@ -289,6 +312,7 @@ const generateTvDraft = async ({
   return {
     duplicate: null,
     draft,
+    identity: resolvedIdentity,
     validation_errors: validationErrors,
     source_verification: sourceVerification,
     usage: {
@@ -304,7 +328,9 @@ const generateTvDraft = async ({
 module.exports = {
   TV_SECTIONS,
   TV_GENERATION_RESPONSE_FORMAT,
+  SUPPORTED_TV_BRANDS,
   buildTvGenerationPrompt,
+  buildAutomaticTvGenerationPrompt,
   findExistingTv,
   normalizeGeneratedTv,
   parseJsonOutput,
