@@ -15,6 +15,7 @@ const TV_SECTIONS = [
   "product_details_json",
   "in_the_box_json",
   "warranty_json",
+  "storage_json",
 ];
 
 const asObject = (value) => {
@@ -434,13 +435,14 @@ const toCanonicalTvPayload = (input = {}, { imageDomains = [] } = {}) => {
 
 const buildVariantsJson = (variants) =>
   variants.map((variant) => ({
+    ...variant,
     variant_key: variant.variant_key,
     screen_size: variant.screen_size,
     screen_size_value: variant.screen_size_value,
     base_price: variant.base_price,
     store_prices: variant.store_prices,
     images: variant.images,
-    ...variant.attributes,
+    attributes: variant.attributes,
   }));
 
 async function createTvCatalogRecord(
@@ -471,10 +473,10 @@ async function createTvCatalogRecord(
     `INSERT INTO tvs (product_id, category, model, manufacturer_model, launch_date,
       key_specs_json, basic_info_json, display_json, video_engine_json, audio_json,
       smart_tv_json, gaming_json, ports_json, connectivity_json, power_json, physical_json,
-      product_details_json, in_the_box_json, warranty_json, images_json, variants_json)
+      product_details_json, in_the_box_json, warranty_json, storage_json, images_json, variants_json)
      VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,
       $12::jsonb,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17::jsonb,$18::jsonb,$19::jsonb,
-      $20::jsonb,$21::jsonb)`,
+      $20::jsonb,$21::jsonb,$22::jsonb)`,
     [
       productId,
       payload.category,
@@ -582,8 +584,8 @@ async function persistTvUpdate(
       video_engine_json=$8::jsonb, audio_json=$9::jsonb, smart_tv_json=$10::jsonb,
       gaming_json=$11::jsonb, ports_json=$12::jsonb, connectivity_json=$13::jsonb,
       power_json=$14::jsonb, physical_json=$15::jsonb, product_details_json=$16::jsonb,
-      in_the_box_json=$17::jsonb, warranty_json=$18::jsonb, images_json=$19::jsonb,
-      variants_json=$20::jsonb WHERE product_id=$21`,
+      in_the_box_json=$17::jsonb, warranty_json=$18::jsonb, storage_json=$19::jsonb,
+      images_json=$20::jsonb, variants_json=$21::jsonb WHERE product_id=$22`,
     [
       payload.category,
       payload.model,

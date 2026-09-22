@@ -5349,6 +5349,7 @@ async function runMigrations() {
         product_details_json JSONB,
         in_the_box_json JSONB,
         warranty_json JSONB,
+        storage_json JSONB,
         images_json JSONB,
         variants_json JSONB,
         created_at TIMESTAMP DEFAULT now()
@@ -5359,6 +5360,9 @@ async function runMigrations() {
     );
     await safeQuery(
       `ALTER TABLE tvs ADD COLUMN IF NOT EXISTS manufacturer_model TEXT;`,
+    );
+    await safeQuery(
+      `ALTER TABLE tvs ADD COLUMN IF NOT EXISTS storage_json JSONB;`,
     );
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS tv_generation_usage (
@@ -16215,6 +16219,7 @@ const TV_JSON_OBJECT_SECTIONS = [
   "product_details_json",
   "in_the_box_json",
   "warranty_json",
+  "storage_json",
 ];
 
 const toNumericPrice = (value) => {
@@ -16598,6 +16603,7 @@ app.get("/api/tvs", async (req, res) => {
         t.product_details_json,
         t.in_the_box_json,
         t.warranty_json,
+        t.storage_json,
 
         COALESCE(
           (
@@ -18139,6 +18145,7 @@ app.get("/api/tv", authenticate, async (req, res) => {
         t.product_details_json,
         t.in_the_box_json,
         t.warranty_json,
+        t.storage_json,
         t.images_json,
         t.variants_json,
         t.created_at,
@@ -22148,6 +22155,7 @@ app.get("/api/public/trending/tvs", async (req, res) => {
         t.product_details_json,
         t.in_the_box_json,
         t.warranty_json,
+        t.storage_json,
 
         MAX(ts.trending_score) AS trending_score,
         MAX(ts.views_7d) AS views_7d,
