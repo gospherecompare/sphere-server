@@ -16631,6 +16631,7 @@ app.get("/api/tvs", async (req, res) => {
                 )::numeric,
                 'base_price', v.base_price,
                 'variant_id', v.id,
+                'attributes', v.attributes,
                 'images', (
                   CASE
                     WHEN EXISTS (
