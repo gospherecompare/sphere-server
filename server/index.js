@@ -70,6 +70,9 @@ const { normalizeSmartphonePayload } = require("./schemas/smartphonePayload");
 const { generateContent } = require("./services/ai/geminiClient");
 const { computeTvRawSpecScoreV2 } = require("./utils/tvSpecScore");
 const {
+  resolveProductIdByEntityOrProductId,
+} = require("./utils/productDeleteLookup");
+const {
   toCanonicalTvPayload,
   createTvCatalogRecord,
   persistTvUpdate,
@@ -17972,6 +17975,10 @@ app.delete(
   async (req, res) => {
     const client = await db.connect();
     try {
+      if (req.user?.role !== "admin" && req.user?.role !== "ceo") {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
       const tid = Number(req.params.id);
       if (Number.isNaN(tid) || tid <= 0) {
         return res.status(400).json({ message: "Invalid id" });
@@ -17979,16 +17986,14 @@ app.delete(
 
       await client.query("BEGIN");
 
-      const tvRes = await client.query(
-        "SELECT product_id FROM tvs WHERE product_id = $1 LIMIT 1",
-        [tid],
-      );
-      if (!tvRes.rows.length) {
+      const productId = await resolveProductIdByEntityOrProductId(client, {
+        tableName: "tvs",
+        targetId: tid,
+      });
+      if (!productId) {
         await client.query("ROLLBACK");
         return res.status(404).json({ message: "TV not found" });
       }
-
-      const productId = tvRes.rows[0].product_id;
       const productMetaRes = await client.query(
         `SELECT
          p.id,
@@ -18109,7 +18114,7 @@ app.get("/api/laptop", authenticate, async (req, res) => {
   }
 });
 
-app.get("/api/tv", authenticate, async (req, res) => {
+app.get("/api/tv", async (req, res) => {
   try {
     const profileConfig = await readDeviceFieldProfilesConfig();
     const result = await db.query(`
@@ -18165,7 +18170,7 @@ app.get("/api/tv", authenticate, async (req, res) => {
   }
 });
 
-app.get("/api/tvs/:id", authenticate, async (req, res) => {
+app.get("/api/tvs/:id", async (req, res) => {
   try {
     const profileConfig = await readDeviceFieldProfilesConfig();
     const rawId = req.params.id;
