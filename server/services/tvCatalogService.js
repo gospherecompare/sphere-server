@@ -60,7 +60,7 @@ const normalizeDomain = (value) =>
     .toLowerCase()
     .replace(/^www\./, "");
 
-const validateTvImageUrl = (value, domains = []) => {
+const validateTvImageUrl = (value) => {
   let parsed;
   try {
     parsed = new URL(String(value || "").trim());
@@ -68,20 +68,6 @@ const validateTvImageUrl = (value, domains = []) => {
     throw new Error("Image URL must be a valid HTTPS URL");
   }
   if (parsed.protocol !== "https:") throw new Error("Image URL must use HTTPS");
-  const host = normalizeDomain(parsed.hostname);
-  const approved = (Array.isArray(domains) ? domains : [])
-    .map(normalizeDomain)
-    .filter(Boolean);
-  if (!approved.length) {
-    throw new Error(
-      "No approved official image domains configured for this brand",
-    );
-  }
-  if (
-    !approved.some((domain) => host === domain || host.endsWith(`.${domain}`))
-  ) {
-    throw new Error("Image URL must use an approved official brand domain");
-  }
   return parsed.href;
 };
 
