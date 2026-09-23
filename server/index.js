@@ -68,13 +68,6 @@ const {
 } = require("./services/phoneFinder");
 const { normalizeSmartphonePayload } = require("./schemas/smartphonePayload");
 const { generateContent } = require("./services/ai/geminiClient");
-const { generateTvDraft } = require("./services/tvGeneration");
-const { verifyTvSourceEvidence } = require("./services/tvSourceVerifier");
-const {
-  dateKey,
-  reserveTvGenerationCall,
-} = require("./services/tvGenerationQuota");
-const { processOfficialTvImage } = require("./services/tvImagePipeline");
 const { computeTvRawSpecScoreV2 } = require("./utils/tvSpecScore");
 const {
   toCanonicalTvPayload,
@@ -82,7 +75,6 @@ const {
   persistTvUpdate,
   validateTvImageUrl,
 } = require("./services/tvCatalogService");
-const { recordSuccessfulTv } = require("./services/tvGenerationQuota");
 const {
   recordSmartphoneLifecycleEvents,
 } = require("./services/notifications/notificationEngine");
@@ -107,7 +99,6 @@ const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || "2mb";
 const PROXY_EXTERNAL_BODY_LIMIT =
   process.env.PROXY_EXTERNAL_BODY_LIMIT || "50kb";
 const PUBLIC_API_BASE64 = process.env.PUBLIC_API_BASE64 === "true";
-const TV_GENERATION_CRON_ENABLED = false;
 const COMPARE_DATA_RETENTION_DAYS = 548;
 const PUBLIC_COMPARE_WINDOW_DAYS = 180;
 const FRESH_COMPARE_WIDGET_DAYS = 7;
@@ -29257,13 +29248,12 @@ app.delete(
 
 const importSmartphonesRouter = require("./routes/importSmartphones");
 const importLaptopsRouter = require("./routes/importLaptop");
-const importTvsRouter = require("./routes/importTvs");
 const smartphonesReqRouter = require("./routes/smartphonesReq");
 app.use("/api/import", authenticate, importSmartphonesRouter);
 app.use("/api/import", authenticate, importLaptopsRouter);
-app.use("/api/import", authenticate, requireAdminMiddleware, importTvsRouter);
 app.use("/api/smartphones", authenticate, smartphonesReqRouter);
 
+/*
 const persistGeneratedTv = async (payload, { maxSuccessfulTvs = 5 } = {}) => {
   const client = await db.connect();
   const toJSON = (value) =>
@@ -29623,6 +29613,7 @@ app.post("/api/admin/tvs/generate", authenticate, async (req, res) => {
     });
   }
 });
+*/
 
 async function start() {
   try {
@@ -29651,31 +29642,6 @@ async function start() {
       model: geminiConfig?.model || "gemini-3.6-flash",
       apiKeyConfigured: Boolean(geminiConfig?.configured),
     });
-
-    if (TV_GENERATION_CRON_ENABLED) {
-      const defaultMs = 12 * 60 * 60 * 1000;
-      const intervalRaw = Number(process.env.TV_GENERATION_CRON_INTERVAL_MS);
-      const intervalMs = Number.isFinite(intervalRaw)
-        ? Math.max(15 * 60 * 1000, Math.floor(intervalRaw))
-        : defaultMs;
-
-      void runAutomaticTvGeneration();
-      const timer = setInterval(() => {
-        void runAutomaticTvGeneration();
-      }, intervalMs);
-      if (typeof timer.unref === "function") timer.unref();
-      console.log("Automatic TV generation cron enabled:", {
-        intervalMs,
-        maxGeminiCalls: Math.max(
-          1,
-          Number(process.env.TV_GENERATION_MAX_GEMINI_CALLS) || 12,
-        ),
-        maxSuccessfulTvs: Math.max(
-          1,
-          Number(process.env.TV_GENERATION_MAX_SUCCESSFUL_TVS) || 5,
-        ),
-      });
-    }
 
     const aiSummaryIntervalMs = 15 * 60 * 1000;
     void runAutomaticAiSummarySweep().catch((error) => {
