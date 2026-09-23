@@ -16678,9 +16678,8 @@ app.get("/api/tvs", async (req, res) => {
       FROM products p
       INNER JOIN tvs t
         ON t.product_id = p.id
-      INNER JOIN product_publish pub
+      LEFT JOIN product_publish pub
         ON pub.product_id = p.id
-       AND pub.is_published = true
       LEFT JOIN brands b
         ON b.id = p.brand_id
       LEFT JOIN product_dynamic_score ds
