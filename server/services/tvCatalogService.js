@@ -18,14 +18,61 @@ const TV_SECTIONS = [
   "storage_json",
 ];
 
+const isMeaningfulValue = (value) => {
+  if (value === null || value === undefined) return false;
+  if (typeof value === "string") return value.trim() !== "";
+  if (Array.isArray(value))
+    return value.some((item) => isMeaningfulValue(item));
+  if (typeof value === "object") {
+    return Object.values(value).some((item) => isMeaningfulValue(item));
+  }
+  return true;
+};
+
+const sanitizeForStorage = (value) => {
+  if (value === null || value === undefined) return null;
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed === "" ? null : trimmed;
+  }
+
+  if (Array.isArray(value)) {
+    const cleaned = value
+      .map((item) => sanitizeForStorage(item))
+      .filter((item) => item !== null && item !== undefined && item !== "");
+    return cleaned;
+  }
+
+  if (typeof value === "object") {
+    const output = {};
+    for (const [key, entry] of Object.entries(value)) {
+      const cleanedEntry = sanitizeForStorage(entry);
+      if (cleanedEntry === null || cleanedEntry === undefined) continue;
+      if (Array.isArray(cleanedEntry) && cleanedEntry.length === 0) continue;
+      if (typeof cleanedEntry === "object" && !Array.isArray(cleanedEntry)) {
+        const nestedKeys = Object.keys(cleanedEntry);
+        if (nestedKeys.length === 0) continue;
+      }
+      output[key] = cleanedEntry;
+    }
+    return output;
+  }
+
+  return value;
+};
+
 const asObject = (value) => {
   if (!value) return {};
-  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return sanitizeForStorage(value);
+  }
   if (typeof value !== "string") return {};
   try {
     const parsed = JSON.parse(value);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed
+    const cleaned = sanitizeForStorage(parsed);
+    return cleaned && typeof cleaned === "object" && !Array.isArray(cleaned)
+      ? cleaned
       : {};
   } catch {
     return {};
@@ -336,7 +383,26 @@ const normalizeTvRequestInput = (input = {}) => {
   const product = asObject(merged.product);
   const basic = asObject(merged.basic_info_json);
 
+  const nestedSections = asObject(
+    merged.sections ||
+      (merged.tv && asObject(merged.tv).sections) ||
+      asObject(merged.source_payload_json)?.sections ||
+      {},
+  );
+  const sourcePayload = asObject(merged.source_payload_json);
+  const sourceSections = asObject(sourcePayload.sections);
+
   const normalized = { ...merged };
+
+  for (const key of TV_SECTIONS) {
+    if (!hasOwn(normalized, key) && hasOwn(nestedSections, key)) {
+      normalized[key] = nestedSections[key];
+    }
+    if (!hasOwn(normalized, key) && hasOwn(sourceSections, key)) {
+      normalized[key] = sourceSections[key];
+    }
+  }
+
   if (!hasOwn(normalized, "product_name") && product.name)
     normalized.product_name = product.name;
   if (!hasOwn(normalized, "brand_id") && product.brand_id)
@@ -358,6 +424,26 @@ const normalizeTvRequestInput = (input = {}) => {
   }
 
   return normalized;
+};
+
+const mergeCustomTvSectionsIntoStorage = (normalized, sections) => {
+  const storage = asObject(sections.storage_json);
+  for (const [key, value] of Object.entries(normalized)) {
+    if (!key.endsWith("_json")) continue;
+    if (TV_SECTIONS.includes(key)) continue;
+    if (["images_json", "variants_json", "source_payload_json"].includes(key))
+      continue;
+
+    const cleaned = sanitizeForStorage(asObject(value));
+    if (!cleaned || typeof cleaned !== "object" || Array.isArray(cleaned))
+      continue;
+    if (!Object.keys(cleaned).length) continue;
+
+    storage[key] = cleaned;
+  }
+
+  sections.storage_json = sanitizeForStorage(storage);
+  return sections;
 };
 
 const toCanonicalTvPayload = (input = {}, { imageDomains = [] } = {}) => {
@@ -401,8 +487,18 @@ const toCanonicalTvPayload = (input = {}, { imageDomains = [] } = {}) => {
   const variantsInput = normalized.variants_json ?? normalized.variants ?? [];
 
   const sections = Object.fromEntries(
-    TV_SECTIONS.map((key) => [key, asObject(normalized[key])]),
+    TV_SECTIONS.map((key) => [
+      key,
+      sanitizeForStorage(asObject(normalized[key])),
+    ]),
   );
+
+  mergeCustomTvSectionsIntoStorage(normalized, sections);
+
+  // Keep a complete sanitized copy of the incoming TV payload so fields that
+  // are not represented by a dedicated relational column cannot be silently lost.
+  // The normalized columns above remain the source of truth for scoring/querying.
+  const sourcePayload = sanitizeForStorage(normalized);
 
   return {
     product_name: productName,
@@ -415,6 +511,7 @@ const toCanonicalTvPayload = (input = {}, { imageDomains = [] } = {}) => {
     publish: Boolean(normalized.publish),
     images_json: normalizeImages(imagesInput, imageDomains),
     variants: normalizeVariants(variantsInput, imageDomains),
+    source_payload_json: sourcePayload,
     sections,
   };
 };
@@ -459,10 +556,11 @@ async function createTvCatalogRecord(
     `INSERT INTO tvs (product_id, category, model, manufacturer_model, launch_date,
       key_specs_json, basic_info_json, display_json, video_engine_json, audio_json,
       smart_tv_json, gaming_json, ports_json, connectivity_json, power_json, physical_json,
-      product_details_json, in_the_box_json, warranty_json, storage_json, images_json, variants_json)
+      product_details_json, in_the_box_json, warranty_json, storage_json, images_json, variants_json,
+      source_payload_json)
      VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,
       $12::jsonb,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17::jsonb,$18::jsonb,$19::jsonb,
-      $20::jsonb,$21::jsonb,$22::jsonb)`,
+      $20::jsonb,$21::jsonb,$22::jsonb,$23::jsonb)`,
     [
       productId,
       payload.category,
@@ -472,6 +570,7 @@ async function createTvCatalogRecord(
       ...TV_SECTIONS.map((key) => json(payload.sections[key])),
       json(payload.images_json),
       json(variantsJson),
+      json(payload.source_payload_json),
     ],
   );
 
@@ -571,7 +670,8 @@ async function persistTvUpdate(
       gaming_json=$11::jsonb, ports_json=$12::jsonb, connectivity_json=$13::jsonb,
       power_json=$14::jsonb, physical_json=$15::jsonb, product_details_json=$16::jsonb,
       in_the_box_json=$17::jsonb, warranty_json=$18::jsonb, storage_json=$19::jsonb,
-      images_json=$20::jsonb, variants_json=$21::jsonb WHERE product_id=$22`,
+      images_json=$20::jsonb, variants_json=$21::jsonb, source_payload_json=$22::jsonb
+      WHERE product_id=$23`,
     [
       payload.category,
       payload.model,
@@ -580,6 +680,7 @@ async function persistTvUpdate(
       ...TV_SECTIONS.map((key) => json(payload.sections[key])),
       json(payload.images_json),
       json(variantsJson),
+      json(payload.source_payload_json),
       productId,
     ],
   );

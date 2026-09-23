@@ -5346,6 +5346,7 @@ async function runMigrations() {
         storage_json JSONB,
         images_json JSONB,
         variants_json JSONB,
+        source_payload_json JSONB,
         created_at TIMESTAMP DEFAULT now()
       );
     `);
@@ -5357,6 +5358,9 @@ async function runMigrations() {
     );
     await safeQuery(
       `ALTER TABLE tvs ADD COLUMN IF NOT EXISTS storage_json JSONB;`,
+    );
+    await safeQuery(
+      `ALTER TABLE tvs ADD COLUMN IF NOT EXISTS source_payload_json JSONB;`,
     );
     await safeQuery(`
       CREATE TABLE IF NOT EXISTS tv_generation_usage (
@@ -16543,7 +16547,7 @@ app.post("/api/tvs", authenticate, async (req, res) => {
     });
 
     await client.query("BEGIN");
-    const { productId } = await createTvCatalogRecord(
+    const { productId, payload: storedPayload } = await createTvCatalogRecord(
       client,
       {
         ...canonical,
@@ -16557,9 +16561,24 @@ app.post("/api/tvs", authenticate, async (req, res) => {
     );
     await client.query("COMMIT");
 
+    const storedSections = Object.fromEntries(
+      TV_JSON_OBJECT_SECTIONS.map((key) => [
+        key,
+        storedPayload.sections?.[key] &&
+        typeof storedPayload.sections[key] === "object" &&
+        !Array.isArray(storedPayload.sections[key])
+          ? Object.keys(storedPayload.sections[key]).length
+          : 0,
+      ]),
+    );
+
     return res.status(201).json({
       message: "TV created successfully",
       product_id: productId,
+      stored_sections: storedSections,
+      source_payload_stored: true,
+      image_count: storedPayload.images_json?.length || 0,
+      variant_count: storedPayload.variants?.length || 0,
     });
   } catch (err) {
     await client.query("ROLLBACK");
